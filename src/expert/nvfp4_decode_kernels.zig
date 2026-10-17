@@ -193,7 +193,7 @@ pub fn KernelsOf(comptime C: type) type {
             else => 0,
         };
         const has_limit = activation == .swiglu_clamped;
-        pub const max_pairs: u32 = max_tokens * top_k;
+        pub const max_pairs: u32 = nvfp4_decode.max_tokens * top_k;
         /// A wave from this many pairs takes the union geometry (one token's pairs name distinct slots).
         pub const union_min_pairs: u32 = top_k + 1;
 
@@ -205,7 +205,7 @@ pub fn KernelsOf(comptime C: type) type {
             if (n_kernels != 2) @compileError(prefix ++ ": a set is one gate/up and one down text");
             if (n_headers > max_headers) @compileError(prefix ++ ": more headers than a kernel takes");
             if (hidden % 512 != 0 or inter % 512 != 0) @compileError(prefix ++ ": K and I must be multiples of 512 (16 values x 32 lanes)");
-            if (512 % group_size != 0 or group_size != 16) @compileError(prefix ++ ": a lane's 16 codes are one E4M3 group");
+            if (512 % nvfp4_decode.group_size != 0 or nvfp4_decode.group_size != 16) @compileError(prefix ++ ": a lane's 16 codes are one E4M3 group");
             if (max_pairs > 64) @compileError(prefix ++ ": the union vote takes at most 64 pairs per wave");
             switch (activation) {
                 .swiglu_clamped => |l| if (l != @as(f64, @floatFromInt(@as(u32, @intFromFloat(l))))) @compileError(prefix ++ ": LIMIT is an integer template parameter"),
@@ -220,7 +220,7 @@ pub fn KernelsOf(comptime C: type) type {
             };
         }
 
-        pub fn familyOf(k: Kernel) Family {
+        pub fn familyOf(k: Kernel) nvfp4_decode.Family {
             return if (k == gate_up_kernel) .gate_up else .down;
         }
 
@@ -245,16 +245,16 @@ pub fn KernelsOf(comptime C: type) type {
 
         /// The instantiations this build serves, which the manifest must register as they are: `plan`'s geometries at
         /// the case's shapes.
-        pub const gate_up_instances = [_]Instance{
-            .{ .rows = plan.serial_gate_up.rows, .maxm = plan.serial_gate_up.maxm, .k = hidden, .n = inter, .gs = group_size, .limit = limit },
-            .{ .rows = plan.union_gate_up.rows, .maxm = plan.union_gate_up.maxm, .k = hidden, .n = inter, .gs = group_size, .limit = limit },
+        pub const gate_up_instances = [_]nvfp4_decode.Instance{
+            .{ .rows = plan.serial_gate_up.rows, .maxm = plan.serial_gate_up.maxm, .k = hidden, .n = inter, .gs = nvfp4_decode.group_size, .limit = limit },
+            .{ .rows = plan.union_gate_up.rows, .maxm = plan.union_gate_up.maxm, .k = hidden, .n = inter, .gs = nvfp4_decode.group_size, .limit = limit },
         };
-        pub const down_instances = [_]Instance{
-            .{ .rows = plan.serial_down.rows, .maxm = plan.serial_down.maxm, .k = inter, .n = hidden, .gs = group_size, .limit = 0 },
-            .{ .rows = plan.union_down.rows, .maxm = plan.union_down.maxm, .k = inter, .n = hidden, .gs = group_size, .limit = 0 },
+        pub const down_instances = [_]nvfp4_decode.Instance{
+            .{ .rows = plan.serial_down.rows, .maxm = plan.serial_down.maxm, .k = inter, .n = hidden, .gs = nvfp4_decode.group_size, .limit = 0 },
+            .{ .rows = plan.union_down.rows, .maxm = plan.union_down.maxm, .k = inter, .n = hidden, .gs = nvfp4_decode.group_size, .limit = 0 },
         };
 
-        pub fn instancesOf(k: Kernel) []const Instance {
+        pub fn instancesOf(k: Kernel) []const nvfp4_decode.Instance {
             return switch (familyOf(k)) {
                 .gate_up => &gate_up_instances,
                 .down => &down_instances,
@@ -262,7 +262,7 @@ pub fn KernelsOf(comptime C: type) type {
         }
 
         /// The instantiation a wave of `pairs` launches of `k` (`plan`).
-        pub fn instanceFor(k: Kernel, pairs: u32) Instance {
+        pub fn instanceFor(k: Kernel, pairs: u32) nvfp4_decode.Instance {
             const set = instancesOf(k);
             const g = switch (familyOf(k)) {
                 .gate_up => plan.gateUp(pairs),
@@ -273,7 +273,7 @@ pub fn KernelsOf(comptime C: type) type {
         }
 
         /// The model geometry the set serves, refused by name otherwise (the module does not install the set then).
-        pub fn checkModel(hidden_size: u32, moe_intermediate_size: u32, experts_per_token: u32, act: Activation, diag: ?*Diag) Refusal!void {
+        pub fn checkModel(hidden_size: u32, moe_intermediate_size: u32, experts_per_token: u32, act: Activation, diag: ?*nvfp4_decode.Diag) nvfp4_decode.Refusal!void {
             if (hidden_size == hidden and moe_intermediate_size == inter and experts_per_token == top_k and std.meta.eql(act, activation)) return;
             var b0: [48]u8 = undefined;
             var b1: [48]u8 = undefined;
@@ -282,7 +282,7 @@ pub fn KernelsOf(comptime C: type) type {
 
         /// The template parameters in the texts' order (after T: the ints `LaunchConfig.ints` carries at the same
         /// positions); gate/up's LIMIT only under a clamped SwiGLU.
-        pub fn templateNames(f: Family) []const []const u8 {
+        pub fn templateNames(f: nvfp4_decode.Family) []const []const u8 {
             return switch (f) {
                 .gate_up => if (has_limit) &.{ "T", "ROWS", "K", "N", "GS", "MAXM", "LIMIT" } else &.{ "T", "ROWS", "K", "N", "GS", "MAXM" },
                 .down => &.{ "T", "ROWS", "I", "H", "GS", "MAXM" },
@@ -317,7 +317,7 @@ pub fn KernelsOf(comptime C: type) type {
 
         pub const Entry = struct {
             kernel: Kernel,
-            family: Family,
+            family: nvfp4_decode.Family,
             source: [:0]const u8,
             headers: []const Header,
             /// the headers' texts in order, concatenated: the one header mlx compiles before `source`
@@ -327,10 +327,10 @@ pub fn KernelsOf(comptime C: type) type {
             outputs: []const Arg,
             template: []const [:0]const u8,
             threadgroup: [3]u32,
-            instances: []const Instance,
-            checks: std.EnumSet(Check),
+            instances: []const nvfp4_decode.Instance,
+            checks: std.EnumSet(nvfp4_decode.Check),
 
-            pub fn registered(e: *const Entry, inst: Instance) bool {
+            pub fn registered(e: *const Entry, inst: nvfp4_decode.Instance) bool {
                 for (e.instances) |i| if (std.meta.eql(i, inst)) return true;
                 return false;
             }
@@ -343,7 +343,7 @@ pub fn KernelsOf(comptime C: type) type {
             manifest_hex: [64]u8,
 
             /// Parses the manifest, checks it against `pin` (hex sha256) and every text against it, once.
-            pub fn init(gpa: Allocator, texts: *const Texts, pin: []const u8, diag: ?*Diag) (Refusal || Allocator.Error)!Registry {
+            pub fn init(gpa: Allocator, texts: *const Texts, pin: []const u8, diag: ?*nvfp4_decode.Diag) (nvfp4_decode.Refusal || Allocator.Error)!Registry {
                 const got = try kset.checkPin(texts.manifest, pin, prefix, diag);
                 var reg: Registry = .{ .arena = .init(gpa), .entries = undefined, .headers = texts.headers, .manifest_hex = got };
                 errdefer reg.arena.deinit();
@@ -377,19 +377,19 @@ pub fn KernelsOf(comptime C: type) type {
             }
 
             /// `inst` of `k`, refused by name when the manifest does not register it.
-            pub fn instance(self: *const Registry, k: Kernel, inst: Instance, diag: ?*Diag) Refusal!Instance {
+            pub fn instance(self: *const Registry, k: Kernel, inst: nvfp4_decode.Instance, diag: ?*nvfp4_decode.Diag) nvfp4_decode.Refusal!nvfp4_decode.Instance {
                 if (!self.get(k).registered(inst)) return refuse(diag, error.InstanceNotRegistered, prefix ++ ": {t} is not registered at ROWS {d}, MAXM {d}, {d} x {d}, GS {d}, LIMIT {d}", .{ k, inst.rows, inst.maxm, inst.n, inst.k, inst.gs, inst.limit });
                 return inst;
             }
 
             /// Builds every kernel's mlx object on `stream`, once; the objects reach Metal at their first launch.
-            pub fn bind(self: *const Registry, stream: mlx.mlx_stream, diag: ?*Diag) Refusal!Bound {
+            pub fn bind(self: *const Registry, stream: mlx.mlx_stream, diag: ?*nvfp4_decode.Diag) nvfp4_decode.Refusal!Bound {
                 if (!mlx.streamIsGpu(stream)) return refuse(diag, error.NotGpuStream, prefix ++ ": bind needs a GPU stream", .{});
                 var b: Bound = .{ .reg = self, .stream = stream, .kernels = @splat(.{}) };
                 errdefer b.deinit();
                 for (&self.entries, 0..) |*e, i| {
-                    var in_names: [max_inputs][*:0]const u8 = undefined;
-                    var out_names: [max_outputs][*:0]const u8 = undefined;
+                    var in_names: [nvfp4_decode.max_inputs][*:0]const u8 = undefined;
+                    var out_names: [nvfp4_decode.max_outputs][*:0]const u8 = undefined;
                     for (e.inputs, 0..) |arg, n| in_names[n] = arg.name.ptr;
                     for (e.outputs, 0..) |arg, n| out_names[n] = arg.name.ptr;
                     b.kernels[i] = kset.newKernel(@tagName(e.kernel), in_names[0..e.inputs.len], out_names[0..e.outputs.len], e.source.ptr, e.header_text.ptr, true) orelse
@@ -404,9 +404,9 @@ pub fn KernelsOf(comptime C: type) type {
         /// The launch of `k` over a wave of `pairs` routed pairs at instantiation `inst`: grid (32, n / ROWS, P),
         /// threadgroup (32, simdgroups, 1), the template `T` = `dt`, then ROWS, K|I, N|H, GS, MAXM (and gate/up's LIMIT
         /// under a clamped SwiGLU); the output [P, n] in `dt`.
-        pub fn waveLaunch(k: Kernel, pairs: u32, inst: Instance, dt: mlx.mlx_dtype) LaunchConfig {
-            std.debug.assert(pairs >= 1 and pairs <= max_pairs and inst.n % (inst.rows * simdgroups) == 0);
-            var c: LaunchConfig = .{ .grid = .{ 32, inst.n / inst.rows, pairs }, .threadgroup = .{ 32, simdgroups, 1 }, .dtype = dt };
+        pub fn waveLaunch(k: Kernel, pairs: u32, inst: nvfp4_decode.Instance, dt: mlx.mlx_dtype) nvfp4_decode.LaunchConfig {
+            std.debug.assert(pairs >= 1 and pairs <= max_pairs and inst.n % (inst.rows * nvfp4_decode.simdgroups) == 0);
+            var c: nvfp4_decode.LaunchConfig = .{ .grid = .{ 32, inst.n / inst.rows, pairs }, .threadgroup = .{ 32, nvfp4_decode.simdgroups, 1 }, .dtype = dt };
             c.ints[1] = @intCast(inst.rows);
             c.ints[2] = @intCast(inst.k);
             c.ints[3] = @intCast(inst.n);
@@ -425,7 +425,7 @@ pub fn KernelsOf(comptime C: type) type {
         pub const Bound = kset.BoundOf(Self);
 
         /// `cfg` as the mlx launch (`Bound.prepare`): the entry's template parameters in its order, `T` the config's dtype.
-        pub fn launchOf(reg: *const Registry, k: Kernel, cfg: *const LaunchConfig, shapes: *[max_outputs][]const c_int, template: *[16]kset.TemplateArg) kset.Launch {
+        pub fn launchOf(reg: *const Registry, k: Kernel, cfg: *const nvfp4_decode.LaunchConfig, shapes: *[nvfp4_decode.max_outputs][]const c_int, template: *[16]kset.TemplateArg) kset.Launch {
             const e = reg.get(k);
             for (e.template, template[0..e.template.len], 0..) |name, *t, i| t.* = .{ .name = name, .value = if (std.mem.eql(u8, name, "T")) .{ .dtype = cfg.dtype } else .{ .int = cfg.ints[i] } };
             for (0..cfg.n_out) |i| shapes[i] = cfg.out_shapes[i][0..cfg.out_ranks[i]];
@@ -437,7 +437,7 @@ pub fn KernelsOf(comptime C: type) type {
 
         /// Device tests: the set on GPU stream `s` (a refusal printed by name).
         pub fn openForTest(a: Allocator, s: mlx.mlx_stream) !*Set {
-            var diag: Diag = .{};
+            var diag: nvfp4_decode.Diag = .{};
             return Set.init(a, .{ .device = .{ .stream = s } }, &diag) catch |e| {
                 std.debug.print(prefix ++ " refused: {s}\n", .{diag.message()});
                 return e;
@@ -456,7 +456,7 @@ pub fn KernelsOf(comptime C: type) type {
 
             /// Every wave width's two launches (bf16 rows), each at the instantiation `plan` names for it, which the
             /// registry must register (refused by name otherwise).
-            pub fn init(bound: *const Bound, diag: ?*Diag) !Fused {
+            pub fn init(bound: *const Bound, diag: ?*nvfp4_decode.Diag) !Fused {
                 var f: Fused = .{ .bound = bound };
                 errdefer f.deinit();
                 for (1..max_pairs + 1) |p| {
@@ -485,9 +485,9 @@ pub fn KernelsOf(comptime C: type) type {
 
             /// `x` bf16 [P, hidden] (each pair's token row), `ids` u32 [P] packed `bank << 24 | slot row`; returns bf16
             /// [P, inter] (the SwiGLU rows; a new array, the caller frees it).
-            pub fn gateUp(f: *const Fused, x: mlx.mlx_array, ids: mlx.mlx_array, banks: *const [n_banks]BankArrays) !mlx.mlx_array {
+            pub fn gateUp(f: *const Fused, x: mlx.mlx_array, ids: mlx.mlx_array, banks: *const [nvfp4_decode.n_banks]nvfp4_decode.BankArrays) !mlx.mlx_array {
                 const p = pairsOf(ids) orelse return error.Nvfp4WaveWidth;
-                var in: [2 + 6 * n_banks]mlx.mlx_array = undefined;
+                var in: [2 + 6 * nvfp4_decode.n_banks]mlx.mlx_array = undefined;
                 in[0] = x;
                 for (banks, 0..) |b, i| {
                     in[1 + 6 * i ..][0..6].* = .{ b.gate.w, b.gate.scales, b.gate.global_scale, b.up.w, b.up.scales, b.up.global_scale };
@@ -500,9 +500,9 @@ pub fn KernelsOf(comptime C: type) type {
 
             /// `h` bf16 [P, inter], `ids` as `gateUp`; returns bf16 [P, hidden]: each pair's down row (a new array, the
             /// caller frees it).
-            pub fn down(f: *const Fused, h: mlx.mlx_array, ids: mlx.mlx_array, banks: *const [n_banks]BankArrays) !mlx.mlx_array {
+            pub fn down(f: *const Fused, h: mlx.mlx_array, ids: mlx.mlx_array, banks: *const [nvfp4_decode.n_banks]nvfp4_decode.BankArrays) !mlx.mlx_array {
                 const p = pairsOf(ids) orelse return error.Nvfp4WaveWidth;
-                var in: [2 + 3 * n_banks]mlx.mlx_array = undefined;
+                var in: [2 + 3 * nvfp4_decode.n_banks]mlx.mlx_array = undefined;
                 in[0] = h;
                 for (banks, 0..) |b, i| {
                     in[1 + 3 * i ..][0..3].* = .{ b.down.w, b.down.scales, b.down.global_scale };
@@ -537,7 +537,7 @@ pub fn KernelsOf(comptime C: type) type {
         /// construction's self-check (`.compile`: one launch over zeros of each kernel at each registered instantiation,
         /// its ids in both of MLX's passings), and `Fused`. Refused by name (`diag`): a registry refusal, NotGpuStream /
         /// KernelCreateFailed at bind, error.SelfCheckFailed naming the first failing kernel.
-        pub fn install(a: Allocator, s: mlx.mlx_stream, diag: *Diag) !Installed {
+        pub fn install(a: Allocator, s: mlx.mlx_stream, diag: *nvfp4_decode.Diag) !Installed {
             const set = try Set.init(a, .{ .device = .{ .stream = s } }, diag);
             errdefer set.deinit();
             var report: selfcheck.Report = .{};
@@ -565,12 +565,12 @@ pub fn KernelsOf(comptime C: type) type {
         };
         const JManifest = struct { format: []const u8, headers: []const JText, kernels: []const JKernel };
 
-        fn parseDtype(s: []const u8, k: Kernel, diag: ?*Diag) Refusal!?mlx.mlx_dtype {
+        fn parseDtype(s: []const u8, k: Kernel, diag: ?*nvfp4_decode.Diag) nvfp4_decode.Refusal!?mlx.mlx_dtype {
             if (std.mem.eql(u8, s, "T")) return null;
             return std.meta.stringToEnum(mlx.mlx_dtype, s) orelse refuse(diag, error.SchemaInvalid, prefix ++ ": {t}: unknown dtype \"{s}\"", .{ k, s });
         }
 
-        fn adoptArgs(a: Allocator, js: []const JArg, max: usize, k: Kernel, diag: ?*Diag) (Refusal || Allocator.Error)![]const Arg {
+        fn adoptArgs(a: Allocator, js: []const JArg, max: usize, k: Kernel, diag: ?*nvfp4_decode.Diag) (nvfp4_decode.Refusal || Allocator.Error)![]const Arg {
             if (js.len == 0 or js.len > max) return refuse(diag, error.SchemaInvalid, prefix ++ ": {t}: {d} arguments", .{ k, js.len });
             const out = try a.alloc(Arg, js.len);
             for (js, out, 0..) |j, *o, i| {
@@ -582,7 +582,7 @@ pub fn KernelsOf(comptime C: type) type {
 
         /// The manifest's inputs, outputs and template against the signature `Fused` binds (by position, so a renamed or
         /// reordered input is refused by name here, never bound to the wrong buffer).
-        fn checkSignature(k: Kernel, inputs: []const Arg, outputs: []const Arg, template: []const [:0]const u8, diag: ?*Diag) Refusal!void {
+        fn checkSignature(k: Kernel, inputs: []const Arg, outputs: []const Arg, template: []const [:0]const u8, diag: ?*nvfp4_decode.Diag) nvfp4_decode.Refusal!void {
             switch (familyOf(k)) {
                 inline else => |f| {
                     const want = comptime signature(f);
@@ -599,7 +599,7 @@ pub fn KernelsOf(comptime C: type) type {
                 return refuse(diag, error.SignatureMismatch, prefix ++ ": {t}: template parameter {s} where the launch sets {s}", .{ k, got, w });
         }
 
-        fn adoptKernel(a: Allocator, texts: *const Texts, k: Kernel, j: JKernel, diag: ?*Diag) (Refusal || Allocator.Error)!Entry {
+        fn adoptKernel(a: Allocator, texts: *const Texts, k: Kernel, j: JKernel, diag: ?*nvfp4_decode.Diag) (nvfp4_decode.Refusal || Allocator.Error)!Entry {
             const source = texts.sources[@backingInt(k)];
             try kset.checkText(source, j.source.sha256, j.source.bytes, prefix, @tagName(k), diag);
             if (j.headers.len > max_headers) return refuse(diag, error.SchemaInvalid, prefix ++ ": {t}: {d} headers", .{ k, j.headers.len });
@@ -616,25 +616,25 @@ pub fn KernelsOf(comptime C: type) type {
                 @memcpy(htext[at..][0..t.len], t);
                 at += t.len;
             }
-            const family = std.meta.stringToEnum(Family, j.family) orelse return refuse(diag, error.SchemaInvalid, prefix ++ ": {t}: family \"{s}\"", .{ k, j.family });
+            const family = std.meta.stringToEnum(nvfp4_decode.Family, j.family) orelse return refuse(diag, error.SchemaInvalid, prefix ++ ": {t}: family \"{s}\"", .{ k, j.family });
             if (family != familyOf(k)) return refuse(diag, error.SchemaInvalid, prefix ++ ": {t}: family {t}, not {t}", .{ k, family, familyOf(k) });
             const tg = j.threadgroup;
-            if (tg[0] != 32 or tg[1] != simdgroups or tg[2] != 1) return refuse(diag, error.SchemaInvalid, prefix ++ ": {t}: threadgroup {d}x{d}x{d}, not 32x{d}x1", .{ k, tg[0], tg[1], tg[2], simdgroups });
-            if (j.template.len == 0 or j.template.len > max_template) return refuse(diag, error.SchemaInvalid, prefix ++ ": {t}: {d} template parameters", .{ k, j.template.len });
+            if (tg[0] != 32 or tg[1] != nvfp4_decode.simdgroups or tg[2] != 1) return refuse(diag, error.SchemaInvalid, prefix ++ ": {t}: threadgroup {d}x{d}x{d}, not 32x{d}x1", .{ k, tg[0], tg[1], tg[2], nvfp4_decode.simdgroups });
+            if (j.template.len == 0 or j.template.len > nvfp4_decode.max_template) return refuse(diag, error.SchemaInvalid, prefix ++ ": {t}: {d} template parameters", .{ k, j.template.len });
             const template = try a.alloc([:0]const u8, j.template.len);
             for (j.template, template) |t, *o| o.* = try a.dupeSentinel(u8, t, 0);
-            const inputs = try adoptArgs(a, j.inputs, max_inputs, k, diag);
-            const outputs = try adoptArgs(a, j.outputs, max_outputs, k, diag);
+            const inputs = try adoptArgs(a, j.inputs, nvfp4_decode.max_inputs, k, diag);
+            const outputs = try adoptArgs(a, j.outputs, nvfp4_decode.max_outputs, k, diag);
             try checkSignature(k, inputs, outputs, template, diag);
             // The instantiations are the ones this build serves, as they are (`gate_up_instances`, `down_instances`).
             const served = instancesOf(k);
-            const inst = try a.alloc(Instance, j.instances.len);
+            const inst = try a.alloc(nvfp4_decode.Instance, j.instances.len);
             for (j.instances, inst) |ji, *o| o.* = .{ .rows = ji.ROWS, .maxm = ji.MAXM, .k = ji.K, .n = ji.N, .gs = ji.GS, .limit = ji.LIMIT };
             if (inst.len != served.len or !for (inst, served) |x, y| {
                 if (!std.meta.eql(x, y)) break false;
             } else true) return refuse(diag, error.InstancesNotServed, prefix ++ ": {t}: the manifest registers {d} instantiations, not the {d} this build serves", .{ k, inst.len, served.len });
-            var checks: std.EnumSet(Check) = .empty;
-            for (j.checks) |c| checks.insert(std.meta.stringToEnum(Check, c) orelse return refuse(diag, error.SchemaInvalid, prefix ++ ": {t}: check \"{s}\"", .{ k, c }));
+            var checks: std.EnumSet(nvfp4_decode.Check) = .empty;
+            for (j.checks) |c| checks.insert(std.meta.stringToEnum(nvfp4_decode.Check, c) orelse return refuse(diag, error.SchemaInvalid, prefix ++ ": {t}: check \"{s}\"", .{ k, c }));
             if (!checks.contains(.compile)) return refuse(diag, error.SchemaInvalid, prefix ++ ": {t}: no compile check", .{k});
             return .{
                 .kernel = k,

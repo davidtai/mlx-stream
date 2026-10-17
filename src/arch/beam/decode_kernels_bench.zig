@@ -38,6 +38,7 @@ const H: u32 = 5120;
 const I: u32 = 2560;
 const K: u32 = 8;
 const layers: u32 = 49;
+const layers_f: f64 = @floatFromInt(layers);
 const rounds: u32 = 9;
 const warm: u32 = 2;
 const caps = [3]u32{ 128, 8, 16 };
@@ -212,7 +213,7 @@ test "beam decode bench GPU: the fused qmv texts against the stock gathers per r
     try testing.expect(geo.hidden_size == H and geo.intermediate_size == I and geo.num_moe_layers >= 3 and geo.num_experts >= caps[0]);
     const path = try std.fmt.allocPrintSentinel(a, "{s}/experts.bin", .{dir}, 0);
     defer a.free(path);
-    const fd = try io_util.openNoCache(path, .{});
+    const fd = try io_util.openNoCache(path.ptr, .{});
     defer _ = std.c.close(fd);
     const t_build = nowNs();
     var banks: Banks = undefined;
@@ -220,7 +221,7 @@ test "beam decode bench GPU: the fused qmv texts against the stock gathers per r
     defer for (banks) |bk| parity.releaseBank(&g, bk);
     g.reset();
     std.debug.print("BEAM_DECODE_BENCH banks built slots={d} ms={d}\n", .{ caps[0] + caps[1] + caps[2], (nowNs() - t_build) / std.time.ns_per_ms });
-    var math = try experts.Math.init(a, geo, parity.activation);
+    var math = try experts.Math.init(a, geo, experts.expertActivation);
     defer math.deinit(&g);
     var diag: sdk.Diag = .{};
     math.fused = decode_kernels.FusedDecode.install(a, stream, H, I, K, .swiglu_f32, &diag) catch |e| {
@@ -259,7 +260,7 @@ test "beam decode bench GPU: the fused qmv texts against the stock gathers per r
                 for (&waves) |*w| x = try layer(&g, &math, &banks, arm, x, w, weights);
                 const t0 = nowNs();
                 try g.evalAll(&.{x});
-                const dt = @as(f64, @floatFromInt(nowNs() - t0)) / 1000.0 / @as(f64, @floatFromInt(layers));
+                const dt = @as(f64, @floatFromInt(nowNs() - t0)) / 1000.0 / layers_f;
                 if (ri >= warm) times[ai][ri - warm] = dt;
                 if (ri == warm + rounds - 1) {
                     if (last[ai]) |v| g.release(v);
@@ -272,7 +273,7 @@ test "beam decode bench GPU: the fused qmv texts against the stock gathers per r
             const arm: Arm = @fromBackingInt(@intCast(ai));
             var ts = times[ai];
             const med = pct(&ts, 0.5);
-            std.debug.print("BEAM_DECODE_BENCH case={s} arm={s} tokens={d} pairs={d} groups={d} us_per_layer median={d:.1} p10={d:.1} p90={d:.1} ms_per_step={d:.3} dispatches_per_layer={d} distinct_mb_per_layer={d:.1} gb_s={d:.1}\n", .{ cs.name, @tagName(arm), cs.tokens, cs.tokens * K, groups, med, pct(&ts, 0.1), pct(&ts, 0.9), med * layers / 1000.0, dispatches(arm, groups), bytes / layers / 1e6, bytes / layers / (med * 1e3) });
+            std.debug.print("BEAM_DECODE_BENCH case={s} arm={s} tokens={d} pairs={d} groups={d} us_per_layer median={d:.1} p10={d:.1} p90={d:.1} ms_per_step={d:.3} dispatches_per_layer={d} distinct_mb_per_layer={d:.1} gb_s={d:.1}\n", .{ cs.name, @tagName(arm), cs.tokens, cs.tokens * K, groups, med, pct(&ts, 0.1), pct(&ts, 0.9), med * layers_f / 1000.0, dispatches(arm, groups), bytes / layers_f / 1e6, bytes / layers_f / (med * 1e3) });
         }
         // The last round's outputs of both arms, bit for bit (the chain of 49 layers through both routes).
         const n_out: usize = cs.tokens * H;

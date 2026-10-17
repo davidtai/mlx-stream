@@ -26,7 +26,7 @@ const Allocator = std.mem.Allocator;
 
 /// GLM-5.3-Flash's case: the k1 texts at its routed experts (text_config: hidden_size, moe_intermediate_size,
 /// num_experts_per_tok, swiglu_limit; the pack's nvfp4 group).
-const Case = struct {
+const nvfp4_case = struct {
     pub const tag = "glm5next nvfp4";
     pub const manifest = "manifest_glm5_next.json";
     /// sha256 of src/kernels/nvfp4/manifest_glm5_next.json: pins every text.
@@ -41,7 +41,7 @@ const Case = struct {
     pub const activation: @import("../../sdk_ext.zig").quant.Activation = .{ .swiglu_clamped = 10 };
 };
 
-const K = shared.KernelsOf(Case);
+const K = shared.KernelsOf(nvfp4_case);
 /// The set itself (`nvfp4_format.FusedDecodeOf` binds it).
 pub const Kernels = K;
 

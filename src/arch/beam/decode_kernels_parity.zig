@@ -79,11 +79,6 @@ pub fn releaseBank(g: *G, b: bank.BankArrays) void {
     }
 }
 
-/// The experts' activation as the module binds it (experts.zig `expertActivation`).
-pub fn activation(g: *G, gate: T, up: T) anyerror!T {
-    return @import("../../sdk_ext.zig").quant.activation(G, g, .swiglu_f32, gate, up);
-}
-
 fn hostOf(a: std.mem.Allocator, g: *G, x: T) ![]f32 {
     const n: usize = @intCast(g.shapeOf(x).numel());
     const out = try a.alloc(f32, n);
@@ -111,7 +106,7 @@ fn openSlice(a: std.mem.Allocator, dir: []const u8) !struct { geo: bank.Geometry
     if (geo.hidden_size != H or geo.intermediate_size != I or geo.num_moe_layers < 3) return error.BeamSliceGeometry;
     const path = try std.fmt.allocPrintSentinel(a, "{s}/experts.bin", .{dir}, 0);
     defer a.free(path);
-    return .{ .geo = geo, .fd = try io_util.openNoCache(path, .{}) };
+    return .{ .geo = geo, .fd = try io_util.openNoCache(path.ptr, .{}) };
 }
 
 fn windowLocked() !bool {
@@ -164,7 +159,7 @@ test "beam nvfp4 GPU: the fused qmv texts give the stock decode route's SwiGLU a
     for (&banks, 0..) |*bk, b| bk.* = try buildBank(&g, sl.fd, &sl.geo, @intCast(b), 0, slots[b]);
     defer for (banks) |bk| releaseBank(&g, bk);
     g.reset();
-    var math = try experts.Math.init(a, sl.geo, activation);
+    var math = try experts.Math.init(a, sl.geo, experts.expertActivation);
     defer math.deinit(&g);
     var diag: sdk.Diag = .{};
     math.fused = decode_kernels.FusedDecode.install(a, stream, H, I, Kernels.top_k, .swiglu_f32, &diag) catch |e| {

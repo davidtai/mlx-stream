@@ -15,7 +15,7 @@ const shared = @import("../../expert/nvfp4_decode_kernels.zig");
 const nvfp4_format = @import("../../expert/nvfp4_format.zig");
 
 /// Beam 1.0's case: the qmv texts at its routed experts and its activation.
-const Case = struct {
+const nvfp4_case = struct {
     pub const tag = "beam nvfp4";
     pub const manifest = "manifest_beam.json";
     /// sha256 of src/kernels/nvfp4/manifest_beam.json: pins every text.
@@ -29,7 +29,7 @@ const Case = struct {
     pub const activation: @import("../../sdk_ext.zig").quant.Activation = .swiglu_f32;
 };
 
-pub const Kernels = shared.KernelsOf(Case);
+pub const Kernels = shared.KernelsOf(nvfp4_case);
 /// The decode lane's fused route as MiMo's math binds it (`nvfp4_format.FormatOf(.{ .Fused = FusedDecode })`).
 pub const FusedDecode = nvfp4_format.FusedDecodeOf(Kernels);
 

@@ -61,7 +61,7 @@ comptime {
 }
 
 /// The experts' activation: (silu(f32(gate)) * f32(up)) rounded once to bf16 (BeamExperts `_apply_gate`).
-fn expertActivation(g: *ops.MlxOps, gate: T, up: T) anyerror!T {
+pub fn expertActivation(g: *ops.MlxOps, gate: T, up: T) anyerror!T {
     return sdk_ext.quant.activation(ops.MlxOps, g, .swiglu_f32, gate, up);
 }
 

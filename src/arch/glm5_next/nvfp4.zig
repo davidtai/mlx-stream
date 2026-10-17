@@ -40,5 +40,3 @@ test "glm5_next nvfp4 format: the fused route's banks are the kernels' (gate, up
         try testing.expectEqual(b.down.scales.ctx, k.down.scales.ctx);
     }
 }
-
-
