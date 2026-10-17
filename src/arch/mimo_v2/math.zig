@@ -515,6 +515,9 @@ const windowView = Math.viewWindow;
 /// permuted into [count, 8, H] (no [n, 8, H] array is built), then per tile of `tile_rows` tokens f32(row), times its f32
 /// route weight (a separate multiply), MLX's sum over the 8 routes (axis 1, fold order k = 0..7), BF16 once.
 pub const top_k: u32 = 8;
+/// The routed experts per token a combine takes at most (an arch's own k, at most MiMo's 8: the route weights' second
+/// axis, the location pairs per token).
+pub const max_top_k: u32 = top_k;
 /// Tokens per joinless gather tile (a multiple of `tile_rows`).
 pub const combine_tokens: u32 = 4 * tile_rows;
 const max_sources = @import("../deepseek_v41/experts.zig").joinless_sources;
@@ -538,9 +541,11 @@ fn reduceGraph(g: *ops.MlxOps, rows: T, rows_token: u32, route_weights: T, t: u3
     if (comptime timeline.enabled) timeline.tile(.reduce, count, 0, &.{});
     const local = t - rows_token;
     const encode_start = profile.now();
-    const weights = try g.slice(route_weights, &.{ @intCast(t), 0 }, &.{ @intCast(t + count), top_k }, &.{ 1, 1 });
-    const expanded = try g.reshape(weights, &.{ @intCast(count), top_k, 1 });
-    const down = try g.slice(rows, &.{ @intCast(local), 0, 0 }, &.{ @intCast(local + count), top_k, hidden }, &.{ 1, 1, 1 });
+    // The call's routed experts per token (MiMo's 8; another arch's own).
+    const k = g.shapeOf(route_weights).d[1];
+    const weights = try g.slice(route_weights, &.{ @intCast(t), 0 }, &.{ @intCast(t + count), k }, &.{ 1, 1 });
+    const expanded = try g.reshape(weights, &.{ @intCast(count), k, 1 });
+    const down = try g.slice(rows, &.{ @intCast(local), 0, 0 }, &.{ @intCast(local + count), k, hidden }, &.{ 1, 1, 1 });
     const expert_out = try g.astype(down, .float32);
     const output = try g.astype(try g.sum(try g.mul(expert_out, expanded), 1, false), .bfloat16);
     profile.charge(.encode, encode_start);
@@ -620,16 +625,18 @@ pub fn combineJoined(g: *ops.MlxOps, ordered: T, route_weights: T, nt: u32, hidd
 /// p = token * 8 + k. Each gather tile builds exactly the control's
 /// [count, 8, H] rows (copies of the same words), then the same reductions.
 pub fn combineParts(g: *ops.MlxOps, outs: []const T, loc: []const i32, route_weights: T, nt: u32, hidden: c_int, reduce: *const ReduceFn) !T {
-    std.debug.assert(outs.len > 0 and outs.len <= max_sources and loc.len == 2 * @as(usize, nt) * top_k);
+    // The call's routed experts per token: MiMo's 8, or another arch's own (at most `max_top_k`).
+    const k: usize = loc.len / (2 * @as(usize, nt));
+    std.debug.assert(outs.len > 0 and outs.len <= max_sources and k > 0 and k <= max_top_k and loc.len == 2 * @as(usize, nt) * k);
     var out: CombineOutputs = .{};
     defer out.release(g);
-    var idx: [combine_tokens * top_k]u32 = undefined;
-    var perm: [combine_tokens * top_k]u32 = undefined;
+    var idx: [combine_tokens * max_top_k]u32 = undefined;
+    var perm: [combine_tokens * max_top_k]u32 = undefined;
     var token: u32 = 0;
     while (token < nt) {
         const stop = @min(token + combine_tokens, nt);
-        const m: usize = (stop - token) * top_k;
-        const tile_loc = loc[2 * @as(usize, token) * top_k ..][0 .. 2 * m];
+        const m: usize = (stop - token) * k;
+        const tile_loc = loc[2 * @as(usize, token) * k ..][0 .. 2 * m];
         if (comptime timeline.enabled) timeline.stage(.gather);
         const join_start = profile.now();
         const mark = g.mark();
@@ -673,7 +680,7 @@ pub fn combineParts(g: *ops.MlxOps, outs: []const T, loc: []const i32, route_wei
             const pa = try g.hostArray(std.mem.sliceAsBytes(perm[0..m]), &.{@intCast(m)}, .uint32);
             break :blk try g.take(try g.concat(pieces[0..np], 0), pa, 0);
         };
-        const gathered = try g.reshape(rows, &.{ @intCast(stop - token), top_k, hidden });
+        const gathered = try g.reshape(rows, &.{ @intCast(stop - token), @intCast(k), hidden });
         try g.evalAll(&.{gathered});
         const held = g.keep(gathered);
         defer g.release(held);
