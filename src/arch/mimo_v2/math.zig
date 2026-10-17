@@ -614,6 +614,7 @@ fn joinOutputs(g: *ops.MlxOps, out: *CombineOutputs) !T {
 /// The joined reference (the CPU tests' control): `ordered` is the evaluated [nt, 8, H] BF16 routed rows.
 /// `reduce`: the installed drain's reduction driver (`Math.drain.reduce`).
 pub fn combineJoined(g: *ops.MlxOps, ordered: T, route_weights: T, nt: u32, hidden: c_int, reduce: *const ReduceFn) !T {
+    if (nt > max_combine_tiles * tile_rows) return error.MimoCombineTokens;
     var out: CombineOutputs = .{};
     defer out.release(g);
     try reduce(g, ordered, 0, route_weights, 0, nt, hidden, &out);
@@ -625,6 +626,8 @@ pub fn combineJoined(g: *ops.MlxOps, ordered: T, route_weights: T, nt: u32, hidd
 /// p = token * 8 + k. Each gather tile builds exactly the control's
 /// [count, 8, H] rows (copies of the same words), then the same reductions.
 pub fn combineParts(g: *ops.MlxOps, outs: []const T, loc: []const i32, route_weights: T, nt: u32, hidden: c_int, reduce: *const ReduceFn) !T {
+    // The reduction tiles' outputs fit `CombineOutputs` (MiMo's widest call): a wider call refuses by name.
+    if (nt > max_combine_tiles * tile_rows) return error.MimoCombineTokens;
     // The call's routed experts per token: MiMo's 8, or another arch's own (at most `max_top_k`).
     const k: usize = loc.len / (2 * @as(usize, nt));
     std.debug.assert(outs.len > 0 and outs.len <= max_sources and k > 0 and k <= max_top_k and loc.len == 2 * @as(usize, nt) * k);
