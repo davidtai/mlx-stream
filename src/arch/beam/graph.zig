@@ -444,7 +444,9 @@ pub fn prepareFused(g: *G, c: *const beam.Config) !void {
     const m = g.mark();
     defer g.resetTo(m);
     const row = try g.zeros(&.{ 1, @intCast(c.hidden_size) }, .bfloat16);
-    try g.evalAll(&.{ try depthAdd(g, c, row, row, 2), try scaled(g, c, row, try g.scalar(c.routed_scaling, .float32)) });
+    // The full layers' query: [1, heads, rows, head_dim] against [1, 1, rows, 1] (its own signature).
+    const q = try g.zeros(&.{ 1, @intCast(c.n_heads), 1, @intCast(c.head_dim) }, .bfloat16);
+    try g.evalAll(&.{ try depthAdd(g, c, row, row, 2), try scaled(g, c, row, try g.scalar(c.routed_scaling, .float32)), try scaled(g, c, q, try ssmaxScale(g, 0, 1)) });
 }
 
 /// The full layers' query scale at rows [pos, pos + n): (1 + (p + 1) / 2048) ^ 0.1, f32 [1, 1, n, 1].
@@ -489,7 +491,7 @@ pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const 
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
     var out: T = undefined;
     if (lw.full) {
-        q = try g.astype(try g.mul(try g.astype(q, .float32), try ssmaxScale(g, pos, nu)), .bfloat16);
+        q = try scaled(g, c, q, try ssmaxScale(g, pos, nu));
         const view = try cache.slabs[lw.slot].append(g, k, v, pos, nu);
         out = if (n > 1) try sdpa(g, q, view.k, view.v, scale, "causal", .{}) else try sdpa(g, q, view.k, view.v, scale, "", .{});
     } else {
@@ -849,6 +851,30 @@ test "beam graph GPU: the routed output's scale is one kernel, the op chain bit 
         const x = try testBf16(a, &g, &.{ rows, h }, 1.0, 500 + i);
         const s = try g.scalar(c.routed_scaling, .float32);
         try expectBits("routed_scale", &g, try scaleBy(&g, x, s), try scaled(&g, &c, x, s));
+    }
+}
+
+test "beam graph GPU: the full layers' query scale is one kernel, the op chain bit for bit (a step, a tile)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try G.init(a, stream);
+    defer g.deinit();
+    const c: beam.Config = .{};
+    try prepareFused(&g, &c);
+    const heads: c_int = @intCast(c.n_heads);
+    const hd: c_int = @intCast(c.head_dim);
+    // The query as the attention hands it: the normed heads [rows, heads, hd] seen as [1, heads, rows, hd].
+    for ([_]u32{ 1, 512 }, [_]u32{ 30_000, 1024 }, 0..) |rows, pos, i| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const n: c_int = @intCast(rows);
+        const x = try testBf16(a, &g, &.{ n, heads, hd }, 1.0, 600 + i);
+        const q = try g.transposeAxes(try g.reshape(x, &.{ 1, n, heads, hd }), &.{ 0, 2, 1, 3 });
+        const s = try ssmaxScale(&g, pos, rows);
+        try expectBits("query_scale", &g, try scaleBy(&g, q, s), try scaled(&g, &c, q, s));
     }
 }
 
