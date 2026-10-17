@@ -49,8 +49,8 @@ int64_t q3ld_monotonic_ns(void);
 int q3ld_spec_config(int32_t nthreads, const uint64_t *bufs, int32_t nslots, int64_t slot_bytes, int64_t rec_len,
                      int64_t chunk, int64_t *counters);
 int q3ld_spec_streams(int32_t idle_busy);   /* stopped pool, after spec_config: 0 or 1; 0 or -1 */
-/* SPLIT: on a stopped pool, a staged range longer than `bytes` (a page multiple; 0 = the stock loop) is read in pieces
- * of at most `bytes` side by side, each copied into its rows by the thread that read it.  0 or -1. */
+/* SPLIT: on a stopped pool, a range's copy into its rows longer than `bytes` (a page multiple; 0 = the stock loop) runs
+ * in pieces of at most `bytes` side by side (the pool's piece threads).  0 or -1. */
 int q3ld_split_config(int64_t bytes);
 int q3ld_direct_config(int32_t on);
 int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t psize,

@@ -196,10 +196,10 @@ pub const Options = struct {
     /// range: the owner proves the alignment once at construction (`checkDirectBlock` + the stream's
     /// `checkDirectReads`), so the uncached preadv takes the drive's direct path.
     direct: bool = false,
-    /// The staged ranges' read route, fixed at start: 0 (the default) reads a range's span with one preadv and copies it
-    /// into its rows; > 0 (a multiple of the page) reads a span longer than it in pieces of at most this many bytes side
-    /// by side, each piece copied into its rows by the thread that read it (the C pool's piece threads): one range is
-    /// then several reads in flight, its copy parallel. Ignored on the direct route.
+    /// The copies' route, fixed at start: 0 (the default) copies a range's bytes into its rows on the thread that read
+    /// them; > 0 (a multiple of the page) copies more than this many bytes in pieces of at most this many side by side
+    /// (the C pool's piece threads): a staged demand range, a pre-range after its bind, a range adopted out of a
+    /// speculative record. The reads are the same. Ignored on the direct route (it copies nothing).
     split_bytes: u64 = 0,
     spec: ?Spec = null,
 };

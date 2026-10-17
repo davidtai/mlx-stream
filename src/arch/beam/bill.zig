@@ -202,7 +202,7 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         // The plugin's sampler on a row it hands the host (`sdk_ext.sampler.chosen`): eight f32 vocab rows at most.
         .{ .name = "sampler", .bytes = @splat(8 * @as(u64, c.vocab_size) * f32b), .at_construction = false },
         .{ .name = "gpu_warm", .bytes = @splat(if (in.gpu_keep_warm == .waits) gpu_warm.bill_bytes else 0), .at_construction = in.gpu_keep_warm == .waits },
-        // D10: the read pool's piece threads (the split route, settings.zig `read_split_bytes`): their stacks.
+        // D10: the read pool's piece threads (the copy split, settings.zig `read_split_bytes`): their stacks.
         .{ .name = "read_pieces", .bytes = @splat(if (settings.read_split_bytes > 0) expert_io.piece_threads * expert_io.piece_thread_bytes else 0), .at_construction = true },
     };
     return a.dupe(Term, &terms);
