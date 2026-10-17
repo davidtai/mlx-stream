@@ -125,6 +125,8 @@ pub const Stats = struct {
     spec_claimed_inflight: u64 = 0,
     spec_abandoned_bytes: u64 = 0,
     direct_ranges: u64 = 0,
+    /// Ranges read in pieces side by side (`io.Options.split_bytes`).
+    split_ranges: u64 = 0,
     adopt_ranges: u64 = 0,
     adopt_bytes: u64 = 0,
     /// Pre-read ranges queued, served to a demand read, dropped unbound.

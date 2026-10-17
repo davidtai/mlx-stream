@@ -113,6 +113,18 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
  *   needed before the drive reached them (P7 early_whole_trim: the read-ahead jobs still queued when the prompt call's
  *   plans exist).  It never touches the speculative class (no claim is released; the prompt pass issues none).
  *   Inject event kind 11 (withdrawn).
+ *
+ * SPLIT (beam/decode-reads, 2026-10-17; ABI 2026101701): a staged range's read ROUTE, chosen once on a stopped pool by
+ *   q3ld_split_config(bytes): 0 (the default) reads a range's page-aligned span with one preadv and copies it into its
+ *   rows (the stock loop); > 0 (a page multiple) cuts a span longer than `bytes` into pieces of at most `bytes`, read
+ *   side by side: the range's worker reads piece 0 and the pool's piece threads (PIECE_THREADS, started with the
+ *   pool) the others, each piece copied into the rows its bytes belong to by the thread that read it (a pre-range's
+ *   piece waits for the bind first, as the stock loop's first copy does).  So one range is several preadv calls in
+ *   flight and its copy runs in parallel.  Only a range without a deadline whose span fits one staging buffer and the
+ *   file splits (one call of the stock loop); any other range takes the stock loop.  The range's status words are the
+ *   stock loop's (calls and bytes summed over the pieces); a failed piece fails the range (ST_OSERR), a piece that
+ *   ends at the file's end makes it short (ST_SHORT).  Either route lands the same bytes in the same rows.
+ *   SC_SPLIT_RANGES counts the ranges read in pieces.
  */
 #include <errno.h>
 #include <mach/mach_time.h>
@@ -208,6 +220,7 @@ enum {
     SC_EV_HOST_RELEASED,  /* gates the host released (error paths) */
     SC_EV_STOP_RELEASED,  /* live gates released at stop */
     SC_DIRECT_RANGES,     /* demand ranges read straight into their rows (q3ld_direct_config: no staging, no copy) */
+    SC_SPLIT_RANGES,      /* ranges read in pieces side by side (q3ld_split_config) */
     SC_N
 };
 
@@ -496,6 +509,165 @@ static void gauge_exit(void) {
     pthread_mutex_unlock(&mu);
 }
 
+/* ---------------------------------------------------------------- SPLIT: a range's span read in pieces side by side */
+#define MAX_PIECES 16
+#define PIECE_THREADS 16
+typedef struct {
+    int fd;
+    char *stage;              /* the worker's staging buffer: stage[0] holds file byte `aligned` */
+    int64_t aligned;
+    int64_t physical;         /* the span's bytes (page multiple) */
+    int64_t skip;             /* the range's byte 0 is stage[skip] */
+    int64_t requested;        /* the range's payload bytes */
+    int64_t piece;            /* bytes per piece (the last one shorter) */
+    int32_t n;                /* pieces */
+    int32_t left;             /* pieces not done (pq_mu) */
+    int32_t dropped;          /* PRE: the range was unbound at the bind point (cancelled, or the pool stops) */
+    const range_t *rg;        /* the destinations (a pre-range's: read after its bind) */
+    pre_t *pr;                /* PRE: the pre-range the copies wait for, 0 for a job range */
+    int64_t got[MAX_PIECES];  /* bytes read per piece */
+    int64_t calls[MAX_PIECES];
+    int64_t t0[MAX_PIECES];   /* a piece's first preadv */
+    int err[MAX_PIECES];      /* a failed piece's errno */
+} split_t;
+static int64_t split_bytes = 0;
+static pthread_t piece_threads[PIECE_THREADS];
+static int npiece_started = 0;
+static pthread_mutex_t pq_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pq_cv = PTHREAD_COND_INITIALIZER;        /* a piece queued, or the piece threads stop */
+static pthread_cond_t pq_done_cv = PTHREAD_COND_INITIALIZER;   /* a piece done */
+#define PQ_CAP (MAX_WORKERS * MAX_PIECES)
+static struct { split_t *s; int32_t i; } pq[PQ_CAP];
+static int pq_head = 0, pq_len = 0, pq_stop = 0;
+
+/* The span plan of range rg for the split route, into *s: 1 when it splits, 0 for the stock loop. */
+static int split_plan(const job_t *job, const range_t *rg, char *stage, split_t *s) {
+    if (split_bytes <= 0 || job->deadline >= 0) return 0;
+    int64_t req = 0;
+    for (int32_t d = 0; d < rg->ndst; d++) req += rg->len[d];
+    if (req <= 0) return 0;
+    int64_t off = rg->offset;
+    int64_t aligned = off / page_size * page_size;
+    int64_t end = (off + req + page_size - 1) / page_size * page_size;
+    int64_t physical = end - aligned;
+    if (end > job->file_size || physical <= split_bytes || physical > staging_bytes) return 0;
+    int64_t n = (physical + split_bytes - 1) / split_bytes;
+    if (n > MAX_PIECES) return 0;
+    memset(s, 0, sizeof(*s));
+    s->fd = job->fd; s->stage = stage; s->aligned = aligned; s->physical = physical; s->skip = off - aligned;
+    s->requested = req; s->piece = split_bytes; s->n = (int32_t)n; s->left = (int32_t)n; s->rg = rg;
+    return 1;
+}
+
+/* Stage bytes [at, at + got) of the span into the rows: the part inside the range's payload, by component. */
+static void split_copy(const split_t *s, int64_t at, int64_t got) {
+    const range_t *rg = s->rg;
+    int64_t a = at > s->skip ? at : s->skip;
+    int64_t pe = s->skip + s->requested;
+    int64_t b = at + got < pe ? at + got : pe;
+    if (b <= a) return;
+    int64_t ro = a - s->skip, left = b - a, base = 0;
+    const char *src = s->stage + a;
+    for (int32_t d = 0; d < rg->ndst && left > 0; d++) {
+        int64_t len = rg->len[d];
+        if (len > 0 && ro < base + len) {
+            int64_t o = ro - base;
+            int64_t n = len - o < left ? len - o : left;
+            memcpy((char *)(uintptr_t)rg->dst[d] + o, src, (size_t)n);
+            src += n; left -= n; ro += n;
+        }
+        base += len;
+    }
+}
+
+static int pre_bound_wait(pre_t *pr);
+
+/* Piece i: read it whole (short reads continue; a 0 return is the file's end), then copy it into its rows (a
+ * pre-range's after its bind); then count it done. */
+static void piece_run(split_t *s, int32_t i) {
+    int64_t at = (int64_t)i * s->piece;
+    int64_t len = s->physical - at < s->piece ? s->physical - at : s->piece;
+    int64_t got = 0, calls = 0, t0 = 0;
+    int err = 0;
+    while (got < len) {
+        struct iovec iov = { s->stage + at + got, (size_t)(len - got) };
+        calls++;
+        if (!t0) t0 = q3ld_monotonic_ns();
+        ssize_t r = do_preadv(s->fd, &iov, 1, (off_t)(s->aligned + at + got));
+        if (r < 0) { err = errno ? errno : EIO; break; }
+        if (r == 0) break;
+        got += r;
+    }
+    s->got[i] = got; s->calls[i] = calls; s->t0[i] = t0; s->err[i] = err;
+    int copy = !err && got > 0;
+    if (copy && s->pr && !pre_bound_wait(s->pr)) { copy = 0; s->dropped = 1; }
+    if (copy) split_copy(s, at, got);
+    pthread_mutex_lock(&pq_mu);
+    s->left -= 1;
+    pthread_cond_broadcast(&pq_done_cv);
+    pthread_mutex_unlock(&pq_mu);
+}
+
+static void *piece_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&pq_mu);
+        while (pq_len == 0 && !pq_stop) pthread_cond_wait(&pq_cv, &pq_mu);
+        if (pq_len == 0) { pthread_mutex_unlock(&pq_mu); return 0; }
+        split_t *s = pq[pq_head].s;
+        int32_t i = pq[pq_head].i;
+        pq_head = (pq_head + 1) % PQ_CAP;
+        pq_len -= 1;
+        pthread_mutex_unlock(&pq_mu);
+        piece_run(s, i);
+    }
+}
+
+/* A range in pieces (split_plan's): pieces 1.. to the piece threads, piece 0 here, every piece waited; the status
+ * words as the stock loop's.  PRE_DROPPED when a pre-range was unbound at its bind point. */
+static int run_split(split_t *s, pre_t *pr, int64_t *out) {
+    s->pr = pr;
+    pthread_mutex_lock(&pq_mu);
+    for (int32_t i = 1; i < s->n; i++) {
+        pq[(pq_head + pq_len) % PQ_CAP].s = s;
+        pq[(pq_head + pq_len) % PQ_CAP].i = i;
+        pq_len += 1;
+    }
+    if (s->n > 1) pthread_cond_broadcast(&pq_cv);
+    pthread_mutex_unlock(&pq_mu);
+    piece_run(s, 0);
+    pthread_mutex_lock(&pq_mu);
+    while (s->left > 0) pthread_cond_wait(&pq_done_cv, &pq_mu);
+    pthread_mutex_unlock(&pq_mu);
+    pthread_mutex_lock(&mu);
+    sc[SC_SPLIT_RANGES] += 1;
+    pthread_mutex_unlock(&mu);
+    if (s->dropped) return PRE_DROPPED;
+    int64_t calls = 0, returned = 0, t0 = 0, contiguous = 0;
+    int err = 0, full = 1;
+    for (int32_t i = 0; i < s->n; i++) {
+        int64_t len = s->physical - (int64_t)i * s->piece < s->piece ? s->physical - (int64_t)i * s->piece : s->piece;
+        calls += s->calls[i];
+        returned += s->got[i];
+        if (s->t0[i] && (!t0 || s->t0[i] < t0)) t0 = s->t0[i];
+        if (!err && s->err[i]) err = s->err[i];
+        if (full) {
+            contiguous += s->got[i];
+            if (s->got[i] < len) full = 0;
+        }
+    }
+    int64_t payload = contiguous - s->skip;
+    if (payload < 0) payload = 0;
+    if (payload > s->requested) payload = s->requested;
+    out[1] = calls;
+    out[2] = returned;
+    out[3] = payload;
+    out[4] = err;
+    out[5] = t0 ? t0 : q3ld_monotonic_ns();
+    out[6] = q3ld_monotonic_ns();
+    return err ? ST_OSERR : (payload == s->requested ? ST_OK : ST_SHORT);
+}
+
 /* DIRECT (miss_reads, 2026-10-14; ABI 2026101401): the demand ranges' read ROUTE, chosen once on a stopped pool by
  * q3ld_direct_config.  On: every demand range is read straight into its rows by preadv (one iovec per part), no staging
  * buffer and no scatter copy; off (the default): the staging loop + the copy.  No per-range eligibility test: the owner
@@ -512,6 +684,16 @@ int q3ld_direct_config(int32_t on) {
     if (running) { pthread_mutex_unlock(&mu); return -1; }
     direct_reads = on != 0;
     run_range = direct_reads ? run_range_direct_route : run_range_staged;
+    pthread_mutex_unlock(&mu);
+    return 0;
+}
+
+/* SPLIT: the staged ranges' piece bytes on a stopped pool (0 = the stock loop; else a page multiple, checked at
+ * start).  0 or -1. */
+int q3ld_split_config(int64_t bytes) {
+    pthread_mutex_lock(&mu);
+    if (running || bytes < 0) { pthread_mutex_unlock(&mu); return -1; }
+    split_bytes = bytes;
     pthread_mutex_unlock(&mu);
     return 0;
 }
@@ -560,8 +742,11 @@ static int run_range_direct_route(const job_t *job, const range_t *rg, char *sta
     return run_range_direct(job, rg, out);
 }
 
-/* one range: stock _readv_range_into_impl loop + _read_some steps; returns the status (q3_nativeissue.c) */
+/* one range: stock _readv_range_into_impl loop + _read_some steps; returns the status (q3_nativeissue.c); SPLIT: in
+ * pieces side by side when the route is on and the range qualifies */
 static int run_range_staged(const job_t *job, const range_t *rg, char *stage, int64_t *out) {
+    split_t sp;
+    if (split_plan(job, rg, stage, &sp)) return run_split(&sp, 0, out);
     int64_t calls = 0, returned = 0, read_total = 0, t_start = 0;
     int status = ST_OK;
     int32_t d = 0;
@@ -622,6 +807,8 @@ static int run_range_staged(const job_t *job, const range_t *rg, char *stage, in
  * waits (holding its staged bytes) until a demand submit binds the rows, or the range is cancelled / the pool stops
  * unbound: then PRE_DROPPED, no copy.  Every later loop step is the stock one. */
 static int run_range_pre(const job_t *job, pre_t *pr, char *stage, int64_t *out) {
+    split_t sp;
+    if (split_plan(job, &pr->rg, stage, &sp)) return run_split(&sp, pr, out);
     const range_t *rg = &pr->rg;
     int64_t calls = 0, returned = 0, read_total = 0, t_start = 0;
     int status = ST_OK;
@@ -688,6 +875,17 @@ static int run_range_pre(const job_t *job, pre_t *pr, char *stage, int64_t *out)
     out[5] = t_start ? t_start : q3ld_monotonic_ns();
     out[6] = q3ld_monotonic_ns();
     return status;
+}
+
+/* SPLIT: a pre-range piece's bind point (the stock loop's, before its first copy): 1 bound, 0 dropped. */
+static int pre_bound_wait(pre_t *pr) {
+    pthread_mutex_lock(&mu);
+    int64_t tw = q3ld_monotonic_ns();
+    while (!pr->bound && !pr->cancel && !stopping) pthread_cond_wait(&pre_cv, &mu);
+    int ok = pr->bound && !pr->cancel;
+    sc[SC_PRE_BIND_WAIT_NS] += q3ld_monotonic_ns() - tw;
+    pthread_mutex_unlock(&mu);
+    return ok;
 }
 
 /* ---------------------------------------------------------------- pre-read: shared helpers (caller holds mu) */
@@ -1250,7 +1448,7 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     if (tb_denom == 0 && q3ld_init() != 0) return -1;
     pthread_mutex_lock(&mu);
     if (running || !spec_configured || nw < 1 || nw > MAX_WORKERS || psize <= 0 || sbytes % psize
-        || (nspec && (spec_slot_bytes % psize || spec_chunk % psize))) { pthread_mutex_unlock(&mu); return -1; }
+        || (nspec && (spec_slot_bytes % psize || spec_chunk % psize)) || (split_bytes && split_bytes % psize)) { pthread_mutex_unlock(&mu); return -1; }
     for (int i = 0; i < nspec; i++) {
         if (((uintptr_t)spec[i].buf) % (uintptr_t)psize) { pthread_mutex_unlock(&mu); return -1; }
     }
@@ -1285,9 +1483,16 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
         if (pthread_create(&spec_threads[i], 0, spec_worker, (void *)(intptr_t)i) != 0) break;
         nspec_started++;
     }
+    pq_head = pq_len = pq_stop = 0;
+    npiece_started = 0;
+    int npiece = split_bytes ? PIECE_THREADS : 0;
+    for (int i = 0; i < npiece; i++) {
+        if (pthread_create(&piece_threads[i], 0, piece_worker, 0) != 0) break;
+        npiece_started++;
+    }
     running = 1;
     pthread_mutex_unlock(&mu);
-    if (nworkers != nw || nspec_started != nspec_threads) return -2;
+    if (nworkers != nw || nspec_started != nspec_threads || npiece_started != npiece) return -2;
     return 0;
 }
 
@@ -1630,6 +1835,13 @@ int q3ld_stop(void) {
     pthread_mutex_unlock(&mu);
     for (int i = 0; i < nworkers; i++) pthread_join(threads[i], 0);
     for (int i = 0; i < nspec_started; i++) pthread_join(spec_threads[i], 0);
+    /* SPLIT: every split waited for its pieces before its worker returned; the piece threads stop on an empty queue. */
+    pthread_mutex_lock(&pq_mu);
+    pq_stop = 1;
+    pthread_cond_broadcast(&pq_cv);
+    pthread_mutex_unlock(&pq_mu);
+    for (int i = 0; i < npiece_started; i++) pthread_join(piece_threads[i], 0);
+    npiece_started = 0;
     /* EVENT: no ticket publishes any more.  Stop the watchdog, then release every live gate (no GPU wait outlives
      * the pool) and hand the final prefix to the event before the class is disarmed. */
     pthread_mutex_lock(&mu);
@@ -1666,6 +1878,7 @@ int q3ld_stop(void) {
     spec_idle_busy = SPEC_MAX_DEMAND_BUSY;
     direct_reads = 0;
     run_range = run_range_staged;
+    split_bytes = 0;
     free(ranges); free(queue); free(pre_of); free(sub_len); ranges = 0; queue = 0; pre_of = 0; sub_len = 0;
     for (int i = 0; i < MAX_PRE; i++) { memset(&pre[i], 0, sizeof(pre_t)); pre[i].fd = -1; }
     pre_on = 0; pre_ngu = pre_ndown = 0; pre_gu_total = 0;
@@ -1992,7 +2205,7 @@ int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {
 }
 #endif
 
-int32_t q3ld_abi(void) { return 2026101401; }              /* DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
+int32_t q3ld_abi(void) { return 2026101701; }              /* SPLIT as a construction route; 2026101401 DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
 int32_t q3ld_max_gates(void) { return MAX_GATES; }
 int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
 int32_t q3ld_max_pre(void) { return MAX_PRE; }
