@@ -1,8 +1,9 @@
 # Reflection Beam 1.0 (`beam`)
 
 mlx-stream's fifth arch serves Reflection's Beam 1.0 (501B-A23B) from its NVFP4 pack. The 12,544 routed experts (49
-routed layers x 256) stream from the SSD as NVFP4 records through MiMo's expert route. The trunk (16.16 GB of BF16)
-is resident. `scripts/prepare_nvfp4_pack.py --family beam` makes the pack (docs/nvfp4-pack.md).
+routed layers x 256) stream from the SSD as NVFP4 records through MiMo's expert route. The trunk is resident: 16.16 GB
+of BF16, or 9.44 GB in the q8 residents tier (see [The residents](#the-residents)). `scripts/prepare_nvfp4_pack.py
+--family beam` makes the pack (docs/nvfp4-pack.md).
 
 Terms are as in [mimo.md](mimo.md): **pack**, **residents**, **rows** (prompt rows, decode rows), **bill**, **fill**,
 **prompt pass**, **route** (a choice made one time at construction), **control**.
@@ -47,9 +48,9 @@ The arch claims a `config.json` with `model_type` `beam` and this block:
 "expert_streaming": {"family": "mlx-stream", "format": "mlx-stream-nvfp4-expert-bank-v1", "manifest": "expert-manifest.json"}
 ```
 
-The pack has these files: `config.json`, `model.safetensors` with its index (734 BF16 and F32 tensors), `experts.bin`
-with `expert-manifest.json` (layout `nvfp4-gud-9part`), and the tokenizer files. A record is 22,118,412 B. Records start
-every 22,122,496 B (4 KiB alignment). `experts.bin` is 277,504,589,824 B.
+The pack has these files: `config.json`, `model.safetensors` with its index (734 BF16 and F32 tensors, or 1,274 in the
+q8 tier), `experts.bin` with `expert-manifest.json` (layout `nvfp4-gud-9part`), and the tokenizer files. A record is
+22,118,412 B. Records start every 22,122,496 B (4 KiB alignment). `experts.bin` is 277,504,589,824 B.
 
 The parse refuses a config outside the served form, by name (`BeamConfigUnsupported`, `BeamConfigField`,
 `BeamConfigSyntax`). Examples: a tied head, attention bias, an activation other than silu, RoPE on a full layer, more
@@ -80,6 +81,26 @@ synchronization before the logits. There is no draft lane: `draft_lane.arm` bind
 `off`.
 
 The module keeps no prefix. A prompt longer than the billed context refuses with `ContextOverBill`.
+
+## The residents
+
+The pack's `residents_format` (in `config.json`) selects how the trunk's projections are stored. The module reads it
+one time, at construction (`graph.zig` `Linear`). The bank is the same in the two tiers.
+
+| `residents_format` | Projections | Decode | Prompt pass |
+|---|---|---|---|
+| absent or `bf16` | The release's BF16 weights. | MLX's matmul on the transposed weight. | The same. |
+| `affine8_g64` (the q8 tier) | MLX's affine 8-bit, group 64: U32 codes, BF16 scales and biases (docs/nvfp4-pack.md). | MLX's `quantized_matmul` (its qmv kernel). | Each projection dequantized one time for the layer to BF16 (`promptView`), then MLX's matmul. |
+
+The q8 tier quantizes the weight of each linear of the trunk: the attention's q, k, v, gate and o of every layer, the
+gate, up and down of the three dense layers, and the head. The embedding (a lookup), the norms, the gate biases and the
+routers (F32) stay as released.
+
+In a decode step a q8 projection reads 1.0625 B for each weight in place of 2 B. The decode step reads 7.62 GB of
+projections in place of 14.35 GB. The prompt pass is compute-bound, so it keeps the BF16 GEMMs: at the start of each
+prompt layer, MLX's `dequantize` writes each q8 projection of the layer as BF16. Every tile of the layer reads these
+weights, and the end of the layer releases them. This is the prompt route of MiMo's and glm5_next's FP8 residents
+without their cache: the forward holds the weights of one layer at a time. The bill's `prompt_view` term holds them.
 
 ## The expert route
 
@@ -123,6 +144,7 @@ One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV qua
 | `compiler_runtime`, `host_runtime` | MiMo's declared host runtime and compiled kernels (no Beam reading yet). |
 | `resident_wiring`, `buffer_allowance` | The wiring of the wired bytes. DeepSeek's measured cost for each live buffer. |
 | `request`, `request_wiring` | The prompt wave at the widest call, the decode wave, and their wiring. |
+| `prompt_view` | The q8 tier only, prompt phase: the BF16 weights of the widest layer's projections (a dense layer: 838,860,800 B) and their wiring. |
 | `sampler`, `gpu_warm` | The plugin's sampler. MiMo's keep-warm engine when it is on. |
 
 The fill gives the most decode rows and prompt rows that fit the host's ceiling less its wired margin. The floor is 8
@@ -181,6 +203,46 @@ its bound.
 
 On the slice the stream missed 1,312 times, hit 409 times, evicted 209 times and read 32.0 GB.
 
+### The q8 tier
+
+A q8 pack runs in two cases. The script dequantizes the q8 residents (s x q + b in f32), as MLX's qmv reads them.
+
+1. Against its own reference. The bounds are the BF16 pack's: 0.05 on the fixture, 2 x the twin on the slice. This
+   case shows that the served route computes what the q8 weights define.
+2. Against the BF16 pack's reference, on the BF16 reference's routes. The twin of this case is the q8 reference on the
+   same ids and routes (`--ids-from`, `--routes-from`). Thus each row's bound is 2 x the tier's own difference from
+   BF16 on that row, at least 0.05. At least 90 % of the rows must hold their bounds, and the argmax must be the BF16
+   reference's on each row whose top-2 margin clears its bound.
+
+The tier's own difference from BF16 (the two references on the same routes, on the CPU), beside the slice's BF16
+rounding (the BF16 reference against its twin):
+
+| Case | A row's max difference: median | 90th percentile | Largest | Logits up to | Argmax kept (rows with a clear margin) |
+|---|---|---|---|---|---|
+| Fixture, 40 + 8 | 0.035 | 0.042 | 0.056 | 1.39 | 22 of 22 |
+| Fixture, 700 + 4 | 0.037 | 0.047 | 0.066 | 1.48 | 340 of 340 |
+| Real slice, 700 + 4 | 0.520 | 0.814 | 2.18 | 30.0 | 170 of 170 |
+| Real slice, BF16 against f32 (the twin) | 0.402 | 0.668 | 1.78 | 30.0 | |
+
+On the slice the q8 tier moves a row's logits by 1.32 x the model's own BF16 rounding (the median of the ratio).
+
+The served q8 packs (the converter's q8 fixture and `Beam-1.0-slice-0-5-q8-mlx-stream`), with the reference's routes
+forced. The worst row is the row with the largest ratio of its max difference to its bound.
+
+| Case | Reference | Max difference | Worst row / its bound | Rows in bound | Argmax (checked rows) | Router's own choice |
+|---|---|---|---|---|---|---|
+| Fixture, 40 + 8 | q8 | 0.036 | 0.723 | 48 of 48 | 18 of 18 | 191 of 192 (131 of 131 decisive) |
+| Fixture, 700 + 4 | q8 | 0.049 | 0.981 | 704 of 704 | 243 of 243 | 2,756 of 2,816 (1,893 of 1,893 decisive) |
+| Real slice, 700 + 4 | q8 | 1.49 | 2.055 | 667 of 704 | 230 of 230 | 2,008 of 2,112 (no choice clears 0.05) |
+| Fixture, 40 + 8 | BF16 | 0.052 | 0.750 | 48 of 48 | 22 of 22 | 189 of 192 (129 of 129 decisive) |
+| Fixture, 700 + 4 | BF16 | 0.066 | 0.898 | 704 of 704 | 340 of 340 | 2,724 of 2,816 (1,873 of 1,873 decisive) |
+| Real slice, 700 + 4 | BF16 | 1.75 | 1.480 | 683 of 704 | 170 of 170 | 1,954 of 2,112 (no choice clears 0.05) |
+
+On the slice 94.7 % of the rows hold their bounds against the q8 reference, and 97.0 % against the BF16 reference
+(the BF16 pack against its own reference: 93.2 %). The served q8 pack keeps the BF16 reference's argmax on each row
+with a clear margin, as the q8 reference does on the CPU. The BF16 pack's cases on the same build give the numbers of
+the table above.
+
 The fixture serves at the fill's rows only (8 of 8 experts). With fewer rows, the stream floors each slot array at
 one page. Then the E4M3 scales of a projection (2 KiB a slot on the fixture) hold more slots than its words, and
 MLX's `gather_qmm` refuses that. The construction refuses it first (`BeamSlotArrays`). Beam's own scales are 800 KiB a
@@ -237,3 +299,6 @@ arguments, on `/v1/chat/completions` and `/v1/messages`, streamed and not stream
 - A Beam reading of the host runtime and the compiled kernels. The bill uses MiMo's declared values.
 - The lookahead selector's top-k is the bank's fixed 8 (`routed_top_k`). It only selects reads.
 - A profile build and the benchmark record.
+- The q8 tier at more than one row a step (a draft lane's verify window). MLX's qmv reads a projection's weights one
+  time for each row: at 8 rows the trunk's GEMVs take 12.64 ms against 8.36 ms at one row. A GEMV that reads each
+  weight one time for all rows is not done.
