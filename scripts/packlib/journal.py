@@ -20,9 +20,10 @@ def utc():
 
 class Journal:
     """`table` is the pin table ({name: {sha256, size}}) the sources are checked against. A missing source is
-    downloaded by `download` (fetch.Fetcher's), else refused."""
+    downloaded by `download` (fetch.Fetcher's), else refused. `verified` names the work directory's record of the
+    sources already hashed: a second release built into the same pack (the drafter's) keeps its own record."""
 
-    def __init__(self, *, tool, table, src, out, work=None, disk_margin_gb=10.0):
+    def __init__(self, *, tool, table, src, out, work=None, disk_margin_gb=10.0, verified="sources-verified.json"):
         self.tool = tool
         self.table = table
         self.src = Path(src).expanduser().resolve()
@@ -40,7 +41,7 @@ class Journal:
             os.close(self.lock_fd)
             raise PrepError(f"another {tool} run holds {self.work / '.lock'}") from None
         self.journal_path = self.work / "journal.jsonl"
-        self.verified_path = self.work / "sources-verified.json"
+        self.verified_path = self.work / verified
         self.verified = json.loads(self.verified_path.read_text()) if self.verified_path.exists() else {}
 
     def close(self):

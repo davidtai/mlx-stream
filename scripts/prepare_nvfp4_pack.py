@@ -88,7 +88,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))  # packlib, beside this script (python3 -I keeps the script's directory off sys.path)
 
-from packlib import PrepError, ShaMismatch  # noqa: E402
+from packlib import PrepError, ShaMismatch, count  # noqa: E402
 from packlib import bank, fetch, journal, manifest, verify  # noqa: E402
 from packlib.manifest import GROUP, PROJ, Geometry  # noqa: E402
 from packlib.nocache import (copy_verified, open_nocache, pwrite_all, read_exact, sha256_file, stamp,  # noqa: E402
@@ -113,13 +113,6 @@ STATE = "shards-state.json"
 
 # ---- the families --------------------------------------------------------------------------------------------------
 
-def _count(cfg, key):
-    v = cfg.get(key)
-    if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
-        raise PrepError(f"config.json: {key} is {v!r}, not a positive count")
-    return v
-
-
 class Beam:
     """reflection/Beam-1.0 (transformers models/beam): sandwich norms, a gated GQA attention, dense SwiGLU on a prefix
     of layers, then DeepSeek-V3 routed layers of `num_experts` SwiGLU experts (no shared expert); untied head."""
@@ -139,9 +132,9 @@ class Beam:
         if cfg.get("model_type") != self.model_type:
             raise PrepError(f"config.json: model_type {cfg.get('model_type')!r}, the {self.name} family is "
                             f"{self.model_type!r}")
-        d = {k: _count(t, k) for k in ("hidden_size", "vocab_size", "num_attention_heads", "num_key_value_heads",
-                                       "head_dim", "intermediate_size", "moe_intermediate_size", "num_experts",
-                                       "num_hidden_layers", "num_experts_per_tok")}
+        d = {k: count(t, k) for k in ("hidden_size", "vocab_size", "num_attention_heads", "num_key_value_heads",
+                                      "head_dim", "intermediate_size", "moe_intermediate_size", "num_experts",
+                                      "num_hidden_layers", "num_experts_per_tok")}
         if t.get("tie_word_embeddings") is not False:
             raise PrepError(f"config.json: tie_word_embeddings is {t.get('tie_word_embeddings')!r} (an untied lm_head "
                             f"is the family's)")
@@ -195,7 +188,7 @@ class Beam:
         mlp_layer_types cut to the slice, every other key as released (the embedding, the final norm and the head stay).
         Refused unless the slice starts at layer 0, ends inside the model and holds a full_attention layer."""
         lo, hi = layers
-        n = _count(cfg, "num_hidden_layers")
+        n = count(cfg, "num_hidden_layers")
         lt, mlp = cfg.get("layer_types"), cfg.get("mlp_layer_types")
         if not isinstance(lt, list) or len(lt) != n or not isinstance(mlp, list) or len(mlp) != n:
             raise PrepError("config.json: layer_types / mlp_layer_types do not name every layer")
@@ -249,9 +242,9 @@ class Glm5NextStub(Beam):
 
     def geometry(self, cfg):
         t = self.text(cfg)
-        first = _count(t, "first_k_dense_replace") if t.get("first_k_dense_replace") else 0
-        return Geometry(_count(t, "hidden_size"), _count(t, "moe_intermediate_size"), _count(t, "n_routed_experts"),
-                        first, _count(t, "num_hidden_layers") - first)
+        first = count(t, "first_k_dense_replace") if t.get("first_k_dense_replace") else 0
+        return Geometry(count(t, "hidden_size"), count(t, "moe_intermediate_size"), count(t, "n_routed_experts"),
+                        first, count(t, "num_hidden_layers") - first)
 
 
 FAMILIES = {f.name: f for f in (Beam(), Glm5NextStub())}
@@ -264,7 +257,7 @@ class Plan:
     tensor spec, the residents' header and offsets, and each shard's residents and records."""
 
     def __init__(self, fam, cfg, hfq, index, layers=None):
-        full_layers = _count(fam.text(cfg), "num_hidden_layers")
+        full_layers = count(fam.text(cfg), "num_hidden_layers")
         self.layers = layers
         if layers is not None:
             cfg = fam.slice(cfg, layers)

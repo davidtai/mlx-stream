@@ -14,3 +14,11 @@ class PrepError(Exception):
 class ShaMismatch(PrepError):
     def __init__(self, name, expected, actual, what="sha256"):
         super().__init__(f"{what} mismatch: {name}: expected {expected}, actual {actual}")
+
+
+def count(obj, key, what="config.json"):
+    """obj[key] as a positive integer (a bool is not one), else a refusal naming `what` and the key."""
+    v = obj.get(key)
+    if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+        raise PrepError(f"{what}: {key} is {v!r}, not a positive count")
+    return v
