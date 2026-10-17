@@ -700,3 +700,79 @@ test "beam graph: the call geometry and the full layers' query scale" {
     const p1 = @exp(beam.ssmax_power * std.math.log1p(@as(f32, 2048) / beam.ssmax_base));
     try testing.expectApproxEqRel(std.math.pow(f32, 2, 0.1), p1, 1e-6);
 }
+
+// ── The fused chains on the device (BEAM_PARITY's environment: the box's suites under gpu-lock) ──
+
+/// The device tests' gate: Beam's parity environment under the GPU lock (box-build.sh `suites -e`).
+fn deviceTest() !void {
+    _ = std.c.getenv("BEAM_PARITY") orelse return error.SkipZigTest;
+    const guard = std.c.getenv("_GPU_WINDOW_LOCKED") orelse return error.GpuLockRequired;
+    if (!std.mem.eql(u8, std.mem.span(guard), "1")) return error.GpuLockRequired;
+}
+
+/// A bf16 array of `shape` from a fixed seed: values of a few magnitudes around `scale`, with signed zeros, the bf16
+/// extremes of the served range and values where the sigmoid and tanh saturate.
+fn testBf16(a: std.mem.Allocator, g: *G, shape: []const c_int, scale: f32, seed: u64) !T {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const bits = try a.alloc(u16, n);
+    defer a.free(bits);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    const special = [_]f32{ 0.0, -0.0, 1e-30, -1e-30, 60.0, -60.0, 3.0e4, -3.0e4, 0.5, -0.5 };
+    for (bits, 0..) |*b, i| {
+        const v: f32 = if (i % 97 == 0) special[(i / 97) % special.len] else r.floatNorm(f32) * scale * std.math.pow(f32, 2, @floatFromInt(r.intRangeAtMost(i32, -6, 3)));
+        b.* = ops_be.bf16Bits(v);
+    }
+    return g.hostArray(std.mem.sliceAsBytes(bits), shape, .bfloat16);
+}
+
+/// `x` as a row-major array (MLX's `contiguous`: a copy only when `x` is a view of another layout).
+fn rowMajor(g: *G, x: T) !T {
+    var o = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_contiguous(&o, x, false, g.s)) catch |e| {
+        _ = mlx.mlx_array_free(o);
+        return e;
+    };
+    return g.adopt(o);
+}
+
+/// `want` and `got` evaluated and equal bit for bit (same dtype and shape, every byte); the first differing element
+/// named otherwise.
+fn expectBits(name: []const u8, g: *G, want: T, got: T) !void {
+    try g.evalAll(&.{ want, got });
+    try testing.expectEqual(mlx.mlx_array_dtype(want), mlx.mlx_array_dtype(got));
+    try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    const w = try rowMajor(g, want);
+    const o = try rowMajor(g, got);
+    try g.evalAll(&.{ w, o });
+    const bytes = mlx.mlx_array_size(w) * mlx.mlx_array_itemsize(w);
+    const wb = (mlx.mlx_array_data_uint8(w) orelse return error.MlxNoData)[0..bytes];
+    const ob = (mlx.mlx_array_data_uint8(o) orelse return error.MlxNoData)[0..bytes];
+    if (std.mem.indexOfDiff(u8, wb, ob)) |i| {
+        std.debug.print("BEAM FUSED {s}: element {d} differs\n", .{ name, i / mlx.mlx_array_itemsize(w) });
+        return error.BeamFusedBits;
+    }
+    std.debug.print("BEAM FUSED {s} {any}: {d} elements bit-equal\n", .{ name, mlx.getShape(want), mlx.mlx_array_size(w) });
+}
+
+test "beam graph GPU: the f32 SwiGLU's one kernel is the op chain bit for bit (routed rows, dense rows)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try G.init(a, stream);
+    defer g.deinit();
+    const c: beam.Config = .{};
+    const inter: c_int = @intCast(c.moe_intermediate_size);
+    const dense: c_int = @intCast(c.intermediate_size);
+    // A decode wave's group, a prompt tile, a dense decode row, a dense prompt tile.
+    for ([_][2]c_int{ .{ 8, inter }, .{ 1024, inter }, .{ 1, dense }, .{ 2048, dense } }, 0..) |shape, i| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const gate = try testBf16(a, &g, &shape, 3.0, 100 + i);
+        const up = try testBf16(a, &g, &shape, 3.0, 200 + i);
+        try expectBits("swiglu_f32", &g, try sdk_ext.quant.swigluF32Chain(G, &g, gate, up), try sdk_ext.quant.activation(G, &g, .swiglu_f32, gate, up));
+    }
+}

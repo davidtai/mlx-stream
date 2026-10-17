@@ -95,10 +95,10 @@ pub fn attnTileBytes(c: *const beam.Config, n: u64, keys: u64) u64 {
     return q + kvp + mask + out + gate + proj + lane;
 }
 
-/// One dense MLP row (graph.zig `mlp`, `swiglu_f32`): gate and up (bf16), their f32 copies, the f32 SiLU and product,
-/// the bf16 activation, down.
+/// One dense MLP row (graph.zig `mlp`, `swiglu_f32`): gate and up (bf16), the activation (bf16: one compiled kernel, its
+/// f32 values in registers), down.
 pub fn denseRowBytes(c: *const beam.Config) u64 {
-    return @as(u64, c.intermediate_size) * (2 * bf16 + 4 * f32b + bf16) + @as(u64, c.hidden_size) * bf16;
+    return @as(u64, c.intermediate_size) * 3 * bf16 + @as(u64, c.hidden_size) * bf16;
 }
 
 /// One row of the router (graph.zig `route`): the f32 input, the logits, sigmoid, the choice scores, the grouped
@@ -140,8 +140,8 @@ pub fn decodeWaveBytes(c: *const beam.Config, keys: u64) u64 {
 }
 
 /// The phase's largest single buffer (MLX's cache can end one freed buffer over its limit). Prompt: the router's f32
-/// input over the call, its logits, a dense tile's f32 stage, a slab, the merged routed rows under a combine that merges.
-/// Decode: a slab, the logits.
+/// input over the call, its logits, a dense tile's activation, a slab, the merged routed rows under a combine that
+/// merges. Decode: a slab, the logits.
 pub fn overshootBytes(in: *const Inputs, phase: sdk.MemoryBill.Phase) u64 {
     const c = &in.model;
     const h: u64 = c.hidden_size;
@@ -152,7 +152,7 @@ pub fn overshootBytes(in: *const Inputs, phase: sdk.MemoryBill.Phase) u64 {
     var b = decode;
     b = @max(b, t * h * f32b);
     b = @max(b, t * @as(u64, c.n_routed_experts) * f32b);
-    b = @max(b, @as(u64, @min(t, graph.dense_tile_rows)) * @as(u64, c.intermediate_size) * f32b);
+    b = @max(b, @as(u64, @min(t, graph.dense_tile_rows)) * @as(u64, c.intermediate_size) * bf16);
     b = @max(b, @as(u64, graph.tile_rows) * (@as(u64, c.sliding_window) + graph.tile_rows));
     if (in.combine != .inplace) b = @max(b, t * c.n_experts_per_tok * h * bf16);
     return b;
@@ -220,9 +220,6 @@ fn routeInputs(in: *const Inputs) route_bill.Inputs {
         // The open bank's digest (32 B) per record and its layer.
         .record_table_bytes = 32,
         .layer_table_bytes = @sizeOf(bank.Layer),
-        // `swiglu_f32` (experts.zig `expertActivation`): gate and up widened to f32 (8 B a column) and the f32 product
-        // (4 B), past MiMo's activation's own rate; 4 more bytes a column than its 24 at most.
-        .activation_extra_bytes = 4,
     };
 }
 
@@ -354,16 +351,15 @@ test "beam bill: the fill on the 256 GB box sits within the target, the next row
     std.debug.print("\nBEAM BILL fixture (residents 16.16 GB, ctx 32,768, baseline 12.6 GB, ceiling 240 GiB): rows {d}/{d} per_row {d} process_bound {d}\n", .{ rows.prompt, rows.decode, b.per_row, b.processBound(rows) });
 }
 
-test "beam bill: the decode wave holds the dense layers and the first routed attention; the routed tile bills the f32 SwiGLU" {
+test "beam bill: the decode wave holds the dense layers and the first routed attention; the routed tile is MiMo's rate" {
     const c: beam.Config = .{};
     const keys: u64 = 32_768;
     try testing.expect(decodeWaveBytes(&c, keys) >= 4 * attnTileBytes(&c, 1, keys));
     const in = try fixtureInputs(keys);
     const ri = routeInputs(&in);
-    var stock = ri;
-    stock.activation_extra_bytes = 0;
+    // The f32 SwiGLU is one kernel (bf16 in and out): the projection tile's activation is within MiMo's 24 B a column.
     const nr: u64 = 1024;
-    try testing.expectEqual(route_bill.tileBytes(&stock, nr) + nr * 4 * c.moe_intermediate_size, route_bill.tileBytes(&ri, nr));
+    try testing.expectEqual(nr * (20 * @as(u64, c.hidden_size) + 24 * @as(u64, c.moe_intermediate_size) + 32), route_bill.tileBytes(&ri, nr));
 }
 
 test "beam bill: every term is non-decreasing in the billed context (the ladder bounds a rung by the next table)" {

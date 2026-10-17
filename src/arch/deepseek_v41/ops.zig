@@ -155,6 +155,9 @@ pub const MlxOps = struct {
     /// graph is not output-preserving against the op chain).
     silu_fn: mlx.mlx_closure = .{},
     softplus_fn: mlx.mlx_closure = .{},
+    /// sdk_ext.quant's `swiglu_f32` (Beam's experts and dense MLPs): bf16(silu(f32(gate)) * f32(up)) as one compiled
+    /// kernel (shapeless): the op chain's casts, sigmoid and products in the same order, in registers (`swigluF32`).
+    swiglu_f32_fn: mlx.mlx_closure = .{},
     stream_box: *mlx.mlx_stream,
     /// Compiled trunk regions, one per (region type, construction context).
     tapes: std.ArrayList(TapeEntry) = .empty,
@@ -181,9 +184,11 @@ pub const MlxOps = struct {
         errdefer gpa.destroy(box);
         box.* = s;
         var g: MlxOps = .{ .gpa = gpa, .s = s, .stream_box = box };
-        g.silu_fn = try compileUnary(siluBody, box);
+        g.silu_fn = try compileFn(1, siluBody, box);
         errdefer _ = mlx.mlx_closure_free(g.silu_fn);
-        g.softplus_fn = try compileUnary(softplusBody, box);
+        g.softplus_fn = try compileFn(1, softplusBody, box);
+        errdefer _ = mlx.mlx_closure_free(g.softplus_fn);
+        g.swiglu_f32_fn = try compileFn(2, swigluF32Body, box);
         return g;
     }
 
@@ -198,11 +203,12 @@ pub const MlxOps = struct {
         g.tapes.deinit(g.gpa);
         _ = mlx.mlx_closure_free(g.silu_fn);
         _ = mlx.mlx_closure_free(g.softplus_fn);
+        _ = mlx.mlx_closure_free(g.swiglu_f32_fn);
         g.gpa.destroy(g.stream_box);
     }
 
     fn child(g: *const MlxOps) MlxOps {
-        return .{ .gpa = g.gpa, .s = g.s, .silu_fn = g.silu_fn, .softplus_fn = g.softplus_fn, .stream_box = g.stream_box, .is_child = true, .launcher = g.launcher };
+        return .{ .gpa = g.gpa, .s = g.s, .silu_fn = g.silu_fn, .softplus_fn = g.softplus_fn, .swiglu_f32_fn = g.swiglu_f32_fn, .stream_box = g.stream_box, .is_child = true, .launcher = g.launcher };
     }
 
     /// One pinned kernel launch (the kernels contract: its `Kernel` tag and
@@ -877,9 +883,9 @@ pub const MlxOps = struct {
         return g.track(r);
     }
 
-    fn applyUnary(g: *MlxOps, f: mlx.mlx_closure, x: T) !T {
-        const in_arr = [_]T{x};
-        const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
+    /// One call of a closure `compileFn` built: `inputs` in, its one output tracked.
+    fn applyFn(g: *MlxOps, f: mlx.mlx_closure, inputs: []const T) !T {
+        const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
         defer _ = mlx.mlx_vector_array_free(in_vec);
         var out_vec = mlx.mlx_vector_array{ .ctx = null };
         try mlx.check(mlx.mlx_closure_apply(&out_vec, f, in_vec));
@@ -894,12 +900,17 @@ pub const MlxOps = struct {
 
     /// `nn.silu`: the compiled `x * sigmoid(x)`.
     pub fn silu(g: *MlxOps, x: T) !T {
-        return g.applyUnary(g.silu_fn, x);
+        return g.applyFn(g.silu_fn, &.{x});
     }
 
     /// `nn.softplus`: the compiled `logaddexp(x, 0)`.
     pub fn softplus(g: *MlxOps, x: T) !T {
-        return g.applyUnary(g.softplus_fn, x);
+        return g.applyFn(g.softplus_fn, &.{x});
+    }
+
+    /// sdk_ext.quant's `swiglu_f32`, one kernel: bf16(silu(f32(gate)) * f32(up)) in the gate's dtype (`swigluF32Body`).
+    pub fn swigluF32(g: *MlxOps, gate: T, up: T) !T {
+        return g.applyFn(g.swiglu_f32_fn, &.{ gate, up });
     }
 
     /// `mx.hadamard_transform(x, scale)` over the last axis.
@@ -1027,14 +1038,19 @@ pub const MlxOps = struct {
         return p[0];
     }
 
-    fn compileUnary(comptime body: fn (mlx.mlx_array, mlx.mlx_stream) ?mlx.mlx_array, box: *mlx.mlx_stream) !mlx.mlx_closure {
+    /// `mx.compile(body, shapeless=True)` over `n` inputs and one output: MLX traces `body` at its first call per input
+    /// dtypes and ranks and replays the trace at every shape (its elementwise ops one kernel).
+    fn compileFn(comptime n: usize, comptime body: fn ([n]mlx.mlx_array, mlx.mlx_stream) ?mlx.mlx_array, box: *mlx.mlx_stream) !mlx.mlx_closure {
         const Cb = struct {
             fn call(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
                 const s: *const mlx.mlx_stream = @ptrCast(@alignCast(payload.?));
-                var x = mlx.mlx_array_new();
-                if (mlx.mlx_vector_array_get(&x, input, 0) != 0) return -1;
-                defer _ = mlx.mlx_array_free(x);
-                const y = body(x, s.*) orelse return -1;
+                if (mlx.mlx_vector_array_size(input) != n) return -1;
+                var xs: [n]mlx.mlx_array = @splat(mlx.mlx_array_new());
+                defer for (xs) |x| {
+                    _ = mlx.mlx_array_free(x);
+                };
+                for (&xs, 0..) |*x, i| if (mlx.mlx_vector_array_get(x, input, i) != 0) return -1;
+                const y = body(xs, s.*) orelse return -1;
                 const out = [_]mlx.mlx_array{y};
                 res.* = mlx.mlx_vector_array_new_data(&out, 1);
                 _ = mlx.mlx_array_free(y);
@@ -1048,7 +1064,8 @@ pub const MlxOps = struct {
         return compiled;
     }
 
-    fn siluBody(x: mlx.mlx_array, s: mlx.mlx_stream) ?mlx.mlx_array {
+    fn siluBody(in: [1]mlx.mlx_array, s: mlx.mlx_stream) ?mlx.mlx_array {
+        const x = in[0];
         var sig = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sig);
         if (mlx.mlx_sigmoid(&sig, x, s) != 0) return null;
@@ -1060,7 +1077,8 @@ pub const MlxOps = struct {
         return y;
     }
 
-    fn softplusBody(x: mlx.mlx_array, s: mlx.mlx_stream) ?mlx.mlx_array {
+    fn softplusBody(in: [1]mlx.mlx_array, s: mlx.mlx_stream) ?mlx.mlx_array {
+        const x = in[0];
         // `mx.logaddexp(x, 0)`: the Python int is weak, so 0 takes x's dtype.
         const zero = switch (mlx.mlx_array_dtype(x)) {
             .float32 => mlx.mlx_array_new_float(0),
@@ -1069,6 +1087,28 @@ pub const MlxOps = struct {
         defer _ = mlx.mlx_array_free(zero);
         var y = mlx.mlx_array_new();
         if (mlx.mlx_logaddexp(&y, x, zero, s) != 0) {
+            _ = mlx.mlx_array_free(y);
+            return null;
+        }
+        return y;
+    }
+
+    /// sdk_ext.quant's `swiglu_f32` chain, op for op: astype(silu(astype(gate, f32)) * astype(up, f32), gate's dtype),
+    /// the silu `siluBody`'s x * sigmoid(x).
+    fn swigluF32Body(in: [2]mlx.mlx_array, s: mlx.mlx_stream) ?mlx.mlx_array {
+        var gf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gf);
+        if (mlx.mlx_astype(&gf, in[0], .float32, s) != 0) return null;
+        const act = siluBody(.{gf}, s) orelse return null;
+        defer _ = mlx.mlx_array_free(act);
+        var uf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(uf);
+        if (mlx.mlx_astype(&uf, in[1], .float32, s) != 0) return null;
+        var p = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(p);
+        if (mlx.mlx_multiply(&p, act, uf, s) != 0) return null;
+        var y = mlx.mlx_array_new();
+        if (mlx.mlx_astype(&y, p, mlx.mlx_array_dtype(in[0]), s) != 0) {
             _ = mlx.mlx_array_free(y);
             return null;
         }

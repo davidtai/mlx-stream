@@ -65,17 +65,13 @@ pub const Inputs = struct {
     wave_bytes_per_row: u64 = 0,
     /// The decode texts the arch installs (their set and prepared launches, declared); 0 on the stock route.
     decode_kernels: u64 = 0,
-    /// The routed activation's bytes per routed row and intermediate column past MiMo's (its 24 x I in the projection
-    /// tile): an arch whose experts run another activation (beam's `swiglu_f32`: gate and up widened to f32, the f32
-    /// product) bills its extra here.
-    activation_extra_bytes: u64 = 0,
 };
 
 /// The routed math's tile in flight over `nr` routed rows: the NVFP4 projection tile (MiMo's `projection_rows` at its
 /// per-row rate), or a DIG-X wave of `wave_rows` rows where the inputs carry one, whichever is larger.
 pub fn tileBytes(in: *const Inputs, nr: u64) u64 {
     const g = in.geometry;
-    const tile = @as(u64, @min(nr, mimo_math.projection_rows)) * (20 * @as(u64, g.hidden_size) + (24 + in.activation_extra_bytes) * @as(u64, g.intermediate_size) + 32);
+    const tile = @as(u64, @min(nr, mimo_math.projection_rows)) * (20 * @as(u64, g.hidden_size) + 24 * @as(u64, g.intermediate_size) + 32);
     if (in.wave_bytes_per_row == 0) return tile;
     return @max(tile, @min(nr, @as(u64, in.wave_rows)) * in.wave_bytes_per_row);
 }

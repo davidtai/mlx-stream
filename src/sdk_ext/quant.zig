@@ -202,12 +202,19 @@ pub fn activation(comptime G: type, g: *G, act: Activation, gate: G.T, up: G.T) 
             return g.mul(try g.silu(gc), uc);
         },
         .swiglu_f32 => {
-            // A backend without casts (the CPU trace hosts) cannot take it: refused by name, never a silent route.
-            if (comptime !@hasDecl(G, "astype")) return error.ActivationNotFused;
-            const dt = g.dtypeOf(gate);
-            return g.astype(try g.mul(try g.silu(try g.astype(gate, .float32)), try g.astype(up, .float32)), dt);
+            // MLX's backend: the chain below as one compiled kernel (its f32 values never leave the registers).
+            if (comptime @hasDecl(G, "swigluF32")) return g.swigluF32(gate, up);
+            return swigluF32Chain(G, g, gate, up);
         },
     }
+}
+
+/// `swiglu_f32` as backend ops: (silu(f32(gate)) * f32(up)) rounded once to the gate's dtype. A backend without casts
+/// (the CPU trace hosts) cannot take it: refused by name, never a silent route.
+pub fn swigluF32Chain(comptime G: type, g: *G, gate: G.T, up: G.T) !G.T {
+    if (comptime !@hasDecl(G, "astype")) return error.ActivationNotFused;
+    const dt = g.dtypeOf(gate);
+    return g.astype(try g.mul(try g.silu(try g.astype(gate, .float32)), try g.astype(up, .float32)), dt);
 }
 
 // ── FromGatherMatmul: the stock path as a C2 client ──
