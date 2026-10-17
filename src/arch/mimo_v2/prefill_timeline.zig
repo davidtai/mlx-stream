@@ -60,12 +60,13 @@ pub const TileKind = enum(u8) { moe, reduce };
 
 /// The arch that armed the timeline: its lines' tag (`<TAG>_PREFILL_TIMELINE`, `<TAG>_GPU_POWER_PREFILL`, the switch's
 /// env), its log scope and its stages in its line's and TSV's order.
-pub const Arch = enum { mimo, glm5_next };
+pub const Arch = enum { mimo, glm5_next, beam };
 
 pub fn tagOf(comptime a: Arch) []const u8 {
     return switch (a) {
         .mimo => "MIMO",
         .glm5_next => "GLM5_NEXT",
+        .beam => "BEAM",
     };
 }
 
@@ -73,6 +74,7 @@ pub fn logOf(comptime a: Arch) type {
     return switch (a) {
         .mimo => std.log.scoped(.mimo),
         .glm5_next => std.log.scoped(.glm5_next),
+        .beam => std.log.scoped(.beam),
     };
 }
 
@@ -81,7 +83,7 @@ pub const glm5_next_order = [_]Stage{ .edge, .predict, .attn, .indexer, .topk, .
 
 pub fn orderOf(a: Arch) []const Stage {
     return switch (a) {
-        .mimo => &mimo_order,
+        .mimo, .beam => &mimo_order,
         .glm5_next => &glm5_next_order,
     };
 }
@@ -100,11 +102,14 @@ pub const Tile = struct { layer: u16 = 0, kind: TileKind = .moe, idx: u16 = 0, r
 pub const Signal = verify_timeline.Signal;
 pub const no_layer: u16 = 0xFFFF;
 
-pub const max_rows = 1 << 17;
+/// Beam's profile (beam/profile.zig) runs a prompt pass with one MLX primitive per command buffer (MLX_MAX_OPS_PER_BUFFER=0):
+/// ~2,000 buffers a layer over 52 layers.
+pub const max_rows = 1 << 19;
 pub const max_marks = 1 << 15;
 pub const max_tiles = 1 << 15;
 pub const max_signals = 1 << 16;
-pub const max_layers = 48;
+/// Beam has 52 layers.
+pub const max_layers = 64;
 
 const c = if (enabled) struct {
     pub extern fn dsv41tl_mlx_buffer(s: mlx.mlx_stream) ?*anyopaque;
@@ -138,6 +143,8 @@ const State = struct {
     tiles_dropped: u32 = 0,
     n_signals: u32 = 0,
     nb_ok: bool = false,
+    /// The rows the finished pass recorded (`storedRows`).
+    n_rows: u32 = 0,
 };
 var state: if (enabled) State else void = if (enabled) .{} else {};
 /// The storage, zero-fill (undefined): kept out of `State` so it lands in the profile binary's bss, not its data.
@@ -306,6 +313,13 @@ pub fn tile(kind: TileKind, rows: u32, bank_rows: u32, slots: []const u32) void 
     c.dsv41tl_tag(tileTag(st, ti));
 }
 
+/// The finished pass's command-buffer rows in commit order (an arch's own raw dump, Beam's: its kernel log names rows by
+/// this index), until another timeline installs the shim; empty outside profile builds.
+pub fn storedRows() []const Row {
+    if (comptime !enabled) return &.{};
+    return Storage.rows[0..state.n_rows];
+}
+
 /// The distinct slots of sorted `slots` (the bank rows a sorted GEMM tile spans).
 pub fn distinctSorted(slots: []const u32) u32 {
     if (slots.len == 0) return 0;
@@ -333,6 +347,7 @@ pub fn finish(a: std.mem.Allocator, base: ?[]const u8, hidden: u32, inter: u32) 
     }
     _ = c.q3ld_test_ev_log(null, -1);
     const n_rows: u32 = @min(k[0], max_rows);
+    state.n_rows = n_rows;
     const in: Input = .{
         .rows = Storage.rows[0..n_rows],
         .marks = Storage.marks[0..state.n_marks],
