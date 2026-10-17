@@ -60,6 +60,7 @@ comptime {
     _ = @import("sdk_ext/expert/layer_rows.zig");
     _ = @import("sdk_ext/expert/residency.zig");
     _ = @import("sdk_ext/safetensors.zig");
+    _ = @import("sdk_ext/settings.zig");
     _ = @import("arch/deepseek_v41/deepseek_v41.zig");
     _ = @import("arch/deepseek_v41/ops.zig");
     _ = @import("arch/deepseek_v41/graph.zig");

@@ -121,20 +121,28 @@ const input_names = blk: {
 /// byte-equality self-check is the pre-ship gate's `prefill_combine` family).
 pub const Kernel = struct {
     k: mlx.mlx_fast_metal_kernel = .{},
+    /// The routed rows' width the text is instantiated at (its template `H`): the bank's hidden size, whole threadgroups
+    /// of columns (`geometryOk`).
+    h: u32 = hidden,
     /// P7 `inplace`: the table form of the same text (`initInplace`).
     k_inplace: mlx.mlx_fast_metal_kernel = .{},
 
     /// Construction boundary: the routed geometry the text is instantiated for (any bank's geometry: its `hidden_size`).
     pub fn init(geometry: anytype) !Kernel {
-        if (geometry.hidden_size != hidden) return error.MimoPrefillCombineGeometry;
-        return .{ .k = try newKernel("mimo_prefill_combine", &input_names, texts.combine) };
+        if (!geometryOk(geometry.hidden_size)) return error.MimoPrefillCombineGeometry;
+        return .{ .k = try newKernel("mimo_prefill_combine", &input_names, texts.combine), .h = geometry.hidden_size };
+    }
+
+    /// A hidden size the text takes: whole threadgroups of columns (MiMo's and GLM-5.3-Flash's 4,096; Beam's 5,120).
+    pub fn geometryOk(h: u32) bool {
+        return h > 0 and h % (cols_per_thread * threads) == 0;
     }
 
     /// P7 `inplace`: the text's table form, built once at construction (no device work: it compiles at its first
     /// dispatch; the byte-equality self-check is the pre-ship family `prefill_combine`).
     pub fn initInplace(geometry: anytype) !Kernel {
-        if (geometry.hidden_size != hidden) return error.MimoPrefillCombineGeometry;
-        return .{ .k_inplace = try newKernel("mimo_prefill_combine_inplace", &inplace_input_names, texts.combine_inplace) };
+        if (!geometryOk(geometry.hidden_size)) return error.MimoPrefillCombineGeometry;
+        return .{ .k_inplace = try newKernel("mimo_prefill_combine_inplace", &inplace_input_names, texts.combine_inplace), .h = geometry.hidden_size };
     }
 
     fn newKernel(name: [*:0]const u8, names: []const [*:0]const u8, text: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
@@ -171,16 +179,17 @@ pub const Kernel = struct {
         return self.apply(g, self.k_inplace, &in, nt);
     }
 
-    fn apply(_: *const Kernel, g: *ops.MlxOps, k: mlx.mlx_fast_metal_kernel, in: []const T, nt: u32) !T {
+    fn apply(self: *const Kernel, g: *ops.MlxOps, k: mlx.mlx_fast_metal_kernel, in: []const T, nt: u32) !T {
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-        const shape = [_]c_int{ @intCast(nt), @intCast(hidden) };
+        const hidden_cols = self.h;
+        const shape = [_]c_int{ @intCast(nt), @intCast(hidden_cols) };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(nt * (hidden / cols_per_thread)), 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(nt * (hidden_cols / cols_per_thread)), 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @intCast(threads), 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TOPK", @intCast(top_k)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", @intCast(hidden)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", @intCast(hidden_cols)));
         const in_vec = mlx.mlx_vector_array_new_data(in.ptr, in.len);
         defer _ = mlx.mlx_vector_array_free(in_vec);
         var outputs = mlx.mlx_vector_array_new();
