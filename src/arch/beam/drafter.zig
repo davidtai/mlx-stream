@@ -868,7 +868,8 @@ test "beam drafter: the release's manifest parses to its 81 tensors and 3,854,96
     try testing.expectEqual(@as(u64, 5 * 2 * 2 * 4624 * 2048), contextBytes(&m.config, 16_384));
     const res = residentBytes(&m, 16_384);
     try testing.expect(res.bytes >= m.payload_bytes and res.bytes < m.payload_bytes + (2 << 20));
-    try testing.expectEqual(@as(u64, 81 + 20), res.arrays);
+    // 81 tensors and the convolutions' taps: 5 layers x 2 convolutions x 2 halves x 2 taps.
+    try testing.expectEqual(@as(u64, 81 + 40), res.arrays);
     std.debug.print("\nBEAM DRAFTER bill: residents {d} B ({d} arrays), context {d} B, round(16 rows, 4095 keys) {d} B, prompt captures {d} B\n", .{ res.bytes, res.arrays, contextBytes(&m.config, 16_384), roundBytes(&m.config, 16, 4095), promptCaptureBytes(&m.config, 16_384, 16_384) });
 }
 
