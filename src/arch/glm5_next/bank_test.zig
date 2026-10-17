@@ -17,74 +17,10 @@ const Component = bank.Component;
 const n_components = bank.n_components;
 
 /// The projections' components: (weight, block scales, global scale).
-const projections = [3][3]Component{
-    .{ .gate_weight, .gate_scales, .gate_global_scale },
-    .{ .up_weight, .up_scales, .up_global_scale },
-    .{ .down_weight, .down_scales, .down_global_scale },
-};
+const projections = bank.projections;
 
-/// A bank of `layers` x `experts` records written into `dir` with its manifest: every E2M1 code and every E4M3 byte
-/// but the two NaNs from a seeded generator, positive global scales, the padding zero. `data` is the whole experts.bin.
-const Synth = struct {
-    geom: bank.Geometry,
-    data: []u8,
-
-    fn write(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, hidden: u32, inter: u32, experts: u32, first: u32, layers: u32, seed: u64) !Synth {
-        const g = try bank.Geometry.init(hidden, inter, experts, first, layers);
-        const data = try a.alloc(u8, @intCast(g.total_bytes));
-        errdefer a.free(data);
-        @memset(data, 0);
-        var prng = std.Random.DefaultPrng.init(seed);
-        const rand = prng.random();
-        const n_records = @as(usize, experts) * layers;
-        for (0..n_records) |i| {
-            const rec = data[i * g.record_bytes ..][0..@intCast(g.logical_bytes)];
-            for (projections) |p| {
-                const w = g.segments[@backingInt(p[0])];
-                rand.bytes(rec[@intCast(w.offset)..][0..@intCast(w.length)]);
-                const s = g.segments[@backingInt(p[1])];
-                for (rec[@intCast(s.offset)..][0..@intCast(s.length)]) |*b| {
-                    b.* = rand.int(u8);
-                    if (b.* & 0x7f == 0x7f) b.* -= 1;
-                }
-                const gs = g.segments[@backingInt(p[2])];
-                const scale: f32 = 0.01 + rand.float(f32) * 4.0;
-                std.mem.writeInt(u32, rec[@intCast(gs.offset)..][0..4], @bitCast(scale), .little);
-            }
-        }
-        var text: std.ArrayList(u8) = .empty;
-        defer text.deinit(a);
-        try text.print(a, "{{\"format\":\"{s}\",\"data_file\":\"experts.bin\",\"hidden_size\":{d},\"intermediate_size\":{d},\"num_experts\":{d},\"first_moe_layer\":{d},\"num_moe_layers\":{d},", .{ bank.format, hidden, inter, experts, first, layers });
-        try text.print(a, "\"layout\":\"{s}\",\"alignment\":{d},\"record_bytes\":{d},\"record_stride\":{d},\"gate_up_bytes\":{d},\"down_bytes\":{d},\"quantization\":{{\"mode\":\"nvfp4\",\"bits\":4,\"group_size\":16}},", .{ bank.layout, bank.page, g.logical_bytes, g.record_bytes, g.gate_up_bytes, g.logical_bytes - g.gate_up_bytes });
-        try text.appendSlice(a, "\"source\":{\"repository\":\"synthetic\",\"revision\":\"0123456789abcdef0123456789abcdef01234567\"},\"parts\":[");
-        for (g.segments, 0..) |s, c| {
-            try text.print(a, "{s}{{\"name\":\"{s}\",\"dtype\":\"{t}\",\"shape\":[", .{ if (c == 0) "" else ",", @as(Component, @fromBackingInt(@intCast(c))).name(), s.dtype });
-            for (s.shape[0..s.rank], 0..) |d, k| try text.print(a, "{s}{d}", .{ if (k == 0) "" else ",", d });
-            try text.print(a, "],\"offset\":{d},\"length\":{d}}}", .{ s.offset, s.length });
-        }
-        try text.appendSlice(a, "],\"records\":[");
-        for (0..n_records) |i| {
-            var d: [32]u8 = undefined;
-            Sha256.hash(data[i * g.record_bytes ..][0..@intCast(g.logical_bytes)], &d, .{});
-            try text.print(a, "{s}{{\"layer\":{d},\"expert\":{d},\"offset\":{d},\"length\":{d},\"sha256\":\"{x}\"}}", .{ if (i == 0) "" else ",", first + i / experts, i % experts, i * g.record_bytes, g.logical_bytes, d });
-        }
-        var whole: [32]u8 = undefined;
-        Sha256.hash(data, &whole, .{});
-        try text.print(a, "],\"output_files\":{{\"experts.bin\":{{\"size\":{d},\"sha256\":\"{x}\"}}}}}}", .{ g.total_bytes, whole });
-        try dir.writeFile(io, .{ .sub_path = "experts.bin", .data = data });
-        try dir.writeFile(io, .{ .sub_path = "expert-manifest.json", .data = text.items });
-        return .{ .geom = g, .data = data };
-    }
-
-    fn deinit(self: *Synth, a: std.mem.Allocator) void {
-        a.free(self.data);
-        self.* = undefined;
-    }
-
-    fn record(self: *const Synth, layer: u32, expert: u32) []const u8 {
-        return self.data[@intCast(self.geom.recordOffset(layer, expert))..][0..@intCast(self.geom.logical_bytes)];
-    }
-};
+/// A bank written as the converter lays it out (the shared bank's `Synth`).
+const Synth = bank.Synth;
 
 /// `refs` (SDK layer, expert) read through one pool job into rows 0.. of `rows`; every ticket settled ok.
 fn readRecords(b: *const bank.SDKBank, refs: []const [2]u32, rows: anytype) !void {

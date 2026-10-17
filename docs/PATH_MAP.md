@@ -217,6 +217,10 @@ rewrite rules below still hold; the host-side rows of the tables are history.
 | (new) | src/arch/glm5_next/ | the GLM-5.3-Flash arch (docs/glm5-next.md) |
 | (new) | src/arch/glm5_next/exl3_bank.zig | the GLM-5.3-Flash EXL3 K=3 (mul1) bank-v2 pack (`expert-manifest-v2.json`) |
 | (new) | docs/benchmarks/glm53-flash/ | the GLM-5.3-Flash benchmark record |
+| (new) | src/arch/beam/ | the Reflection Beam 1.0 arch (docs/beam.md) |
+| (new) | src/expert/nvfp4_bank.zig, src/expert/nvfp4_format.zig | the NVFP4 bank and projection format, moved from src/arch/glm5_next/bank.zig and nvfp4.zig (glm5_next re-exports them) |
+| (new) | src/arch/mimo_v2/route.zig, route_bill.zig | MiMo's expert route and its bill terms as the NVFP4 arches install them, from src/arch/glm5_next/experts.zig and bill.zig |
+| (new) | src/sdk_ext/safetensors.zig, settings.zig, expert/layer_rows.zig, expert/residency.zig | the residents' header scan, the settings helpers, the rows split and the tally / usage lifecycle, from src/arch/glm5_next/ |
 
 ## Tests ported from the coverage branches
 

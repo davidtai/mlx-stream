@@ -33,6 +33,8 @@ The supported models:
 - a GLM-5.3-Flash pack (`"model_type": "glm5_next"`), with an NVFP4 expert bank or an EXL3 K=3 (mul1) expert bank
   (`expert-manifest-v2.json`); [docs/glm5-next.md](docs/glm5-next.md) gives the arch and its settings,
   [docs/benchmarks/glm53-flash/](docs/benchmarks/glm53-flash/README.md) its benchmark record.
+- a Reflection Beam 1.0 pack (`"model_type": "beam"`) with an NVFP4 expert bank; [docs/beam.md](docs/beam.md) gives the
+  arch and its settings.
 
 No weights are included in this repository.
 
@@ -577,10 +579,12 @@ src/arch/deepseek_v41/host.zig  the harnesses' and bank tests' bridge (config pa
 src/arch/mimo_v2/          the MiMo-V2.6-Flash arch: settings, bill, forward, expert source, draft lane, tests
 src/arch/mimo_v2/kernels/  its pinned Metal kernel texts and their six manifests (embedded at compile time)
 src/exl3/                  the EXL3 quant, kernels, source and self-checks
-src/expert/                the expert stream: bank, stream, admission and lookahead, with their tests
+src/expert/                the expert stream: bank, stream, admission and lookahead, with their tests; the NVFP4 bank
+                           and projection format glm5_next and beam share (nvfp4_bank.zig, nvfp4_format.zig)
 src/sdk_ext.zig, sdk_ext/  the seams only this plugin consumes (expert source, kernel registry, quant, KV lanes, profile,
                            the draft lanes' acceptance)
 src/arch/glm5_next/        the GLM-5.3-Flash arch: settings, bill, forward, NVFP4 and EXL3 K=3 expert banks, draft lane
+src/arch/beam/             the Reflection Beam 1.0 arch: settings, bill, forward, expert source, parity test
 src/arch/glm_moe_dsa/      the GLM-5.3 arch: its banks, bill, module, draft lane and parity tests
 src/arch/glm_moe_dsa/glm53_exl3/  GLM-5.3's EXL3 kernels, routes, quant and self-check (texts in src/kernels/glm53_exl3/)
 src/arch/glm_moe_dsa/trunk_kernels.zig  GLM-5.3's trunk kernels (top-k, routed combine) and their self-check (texts in
@@ -599,6 +603,7 @@ scripts/                   test_dsv41.sh, compile_kernels_offline.py, compile_mi
                            glm53_exl3_manifest.py, glm_trunk_manifest.py
                            compile_glm5next_*_offline.py, glm5next_fusion_kernels_manifest.py   GLM-5.3-Flash's gate
                            tools: CPU-only offline compiles of its kernel texts and the fusion manifest's writer (--check)
+                           beam_reference_logits.py   Beam's numpy reference logits (the parity test's)
                            convert_glm_bank.py, convert_glm_exl3_bank.py, convert_glm_mxfp4_bank.py   the GLM-5.3
                            pack converters (docs/glm53-*pack-format.md), with their tests
 ```

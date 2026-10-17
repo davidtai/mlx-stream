@@ -121,20 +121,28 @@ const input_names = blk: {
 /// byte-equality self-check is the pre-ship gate's `prefill_combine` family).
 pub const Kernel = struct {
     k: mlx.mlx_fast_metal_kernel = .{},
+    /// The routed rows' width the text is instantiated at (its template `H`): the bank's hidden size, whole threadgroups
+    /// of columns (`geometryOk`).
+    h: u32 = hidden,
     /// P7 `inplace`: the table form of the same text (`initInplace`).
     k_inplace: mlx.mlx_fast_metal_kernel = .{},
 
     /// Construction boundary: the routed geometry the text is instantiated for (any bank's geometry: its `hidden_size`).
     pub fn init(geometry: anytype) !Kernel {
-        if (geometry.hidden_size != hidden) return error.MimoPrefillCombineGeometry;
-        return .{ .k = try newKernel("mimo_prefill_combine", &input_names, texts.combine) };
+        if (!geometryOk(geometry.hidden_size)) return error.MimoPrefillCombineGeometry;
+        return .{ .k = try newKernel("mimo_prefill_combine", &input_names, texts.combine), .h = geometry.hidden_size };
+    }
+
+    /// A hidden size the text takes: whole threadgroups of columns (MiMo's and GLM-5.3-Flash's 4,096; Beam's 5,120).
+    pub fn geometryOk(h: u32) bool {
+        return h > 0 and h % (cols_per_thread * threads) == 0;
     }
 
     /// P7 `inplace`: the text's table form, built once at construction (no device work: it compiles at its first
     /// dispatch; the byte-equality self-check is the pre-ship family `prefill_combine`).
     pub fn initInplace(geometry: anytype) !Kernel {
-        if (geometry.hidden_size != hidden) return error.MimoPrefillCombineGeometry;
-        return .{ .k_inplace = try newKernel("mimo_prefill_combine_inplace", &inplace_input_names, texts.combine_inplace) };
+        if (!geometryOk(geometry.hidden_size)) return error.MimoPrefillCombineGeometry;
+        return .{ .k_inplace = try newKernel("mimo_prefill_combine_inplace", &inplace_input_names, texts.combine_inplace), .h = geometry.hidden_size };
     }
 
     fn newKernel(name: [*:0]const u8, names: []const [*:0]const u8, text: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
@@ -171,16 +179,17 @@ pub const Kernel = struct {
         return self.apply(g, self.k_inplace, &in, nt);
     }
 
-    fn apply(_: *const Kernel, g: *ops.MlxOps, k: mlx.mlx_fast_metal_kernel, in: []const T, nt: u32) !T {
+    fn apply(self: *const Kernel, g: *ops.MlxOps, k: mlx.mlx_fast_metal_kernel, in: []const T, nt: u32) !T {
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-        const shape = [_]c_int{ @intCast(nt), @intCast(hidden) };
+        const hidden_cols = self.h;
+        const shape = [_]c_int{ @intCast(nt), @intCast(hidden_cols) };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(nt * (hidden / cols_per_thread)), 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(nt * (hidden_cols / cols_per_thread)), 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @intCast(threads), 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TOPK", @intCast(top_k)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", @intCast(hidden)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", @intCast(hidden_cols)));
         const in_vec = mlx.mlx_vector_array_new_data(in.ptr, in.len);
         defer _ = mlx.mlx_vector_array_free(in_vec);
         var outputs = mlx.mlx_vector_array_new();
@@ -252,6 +261,8 @@ const Fixture = struct {
     w: []f32 = &.{},
     loc_arr: T = .{},
     w_arr: T = .{},
+    /// The sources' width (the text's `H`).
+    h: u32 = hidden,
 
     fn deinit(f: *Fixture, a: std.mem.Allocator, g: *ops.MlxOps) void {
         for (f.outs.items) |x| g.release(x);
@@ -269,10 +280,10 @@ const Fixture = struct {
 /// (output, row) over routed positions; with `merge`, the shared scheduler's merge (`mergeJoinless`) down to <= 24
 /// sources, as `runWideParts` does. bf16 words over wide exponents with signed zeros; weights as module.route makes
 /// them (f32 sigmoid picks over their sum).
-fn makeFixture(a: std.mem.Allocator, g: *ops.MlxOps, nt: u32, n_out: u32, seed: u32, keep_host: bool, merge: bool) !Fixture {
+fn makeFixture(a: std.mem.Allocator, g: *ops.MlxOps, h: u32, nt: u32, n_out: u32, seed: u32, keep_host: bool, merge: bool) !Fixture {
     const nr: usize = @as(usize, nt) * top_k;
     std.debug.assert(n_out >= 1 and n_out <= nr and (merge or n_out <= inplace_sources));
-    var f: Fixture = .{};
+    var f: Fixture = .{ .h = h };
     errdefer f.deinit(a, g);
     var state: u32 = seed | 1;
     // Sizes: even split, then random moves between neighbours (every output keeps >= 1 row).
@@ -293,9 +304,9 @@ fn makeFixture(a: std.mem.Allocator, g: *ops.MlxOps, nt: u32, n_out: u32, seed: 
         i -= 1;
         std.mem.swap(u32, &pos[i], &pos[nextU32(&state) % (i + 1)]);
     }
-    const H: c_int = @intCast(hidden);
+    const H: c_int = @intCast(h);
     for (sizes) |r| {
-        const words = try a.alloc(u16, @as(usize, r) * hidden);
+        const words = try a.alloc(u16, @as(usize, r) * h);
         errdefer a.free(words);
         for (words, 0..) |*v, wi| {
             const bits = nextU32(&state);
@@ -370,34 +381,34 @@ fn makeFixture(a: std.mem.Allocator, g: *ops.MlxOps, nt: u32, n_out: u32, seed: 
 /// The stock route over a fixture (math.zig `combineParts` with the sync control's reductions): KEPT bf16 [nt, H].
 fn stockOf(g: *ops.MlxOps, f: *const Fixture, nt: u32) !T {
     const prefill_math = @import("math.zig");
-    return prefill_math.combineParts(g, f.outs.items, f.loc, f.w_arr, nt, @intCast(hidden), (try prefill_math.drains(.sync)).reduce);
+    return prefill_math.combineParts(g, f.outs.items, f.loc, f.w_arr, nt, @intCast(f.h), (try prefill_math.drains(.sync)).reduce);
 }
 
 /// An evaluated bf16 [nt, H]'s words, read 1,024 tokens at a time (bounded host staging).
-fn wordsOf(a: std.mem.Allocator, g: *ops.MlxOps, x: T, nt: u32) ![]u16 {
-    const out = try a.alloc(u16, @as(usize, nt) * hidden);
+fn wordsOf(a: std.mem.Allocator, g: *ops.MlxOps, x: T, nt: u32, h: u32) ![]u16 {
+    const out = try a.alloc(u16, @as(usize, nt) * h);
     errdefer a.free(out);
     const chunk: u32 = 1024;
-    const tmp = try a.alloc(f32, @as(usize, @min(chunk, nt)) * hidden);
+    const tmp = try a.alloc(f32, @as(usize, @min(chunk, nt)) * h);
     defer a.free(tmp);
     var t: u32 = 0;
     while (t < nt) {
         const n = @min(chunk, nt - t);
         const mark = g.mark();
-        const part = try g.astype(try g.slice(x, &.{ @intCast(t), 0 }, &.{ @intCast(t + n), @intCast(hidden) }, &.{ 1, 1 }), .float32);
-        const vals = tmp[0 .. @as(usize, n) * hidden];
+        const part = try g.astype(try g.slice(x, &.{ @intCast(t), 0 }, &.{ @intCast(t + n), @intCast(h) }, &.{ 1, 1 }), .float32);
+        const vals = tmp[0 .. @as(usize, n) * h];
         _ = try g.hostF32(part, vals);
-        for (vals, out[@as(usize, t) * hidden ..][0..vals.len]) |v, *o| o.* = @intCast(@as(u32, @bitCast(v)) >> 16);
+        for (vals, out[@as(usize, t) * h ..][0..vals.len]) |v, *o| o.* = @intCast(@as(u32, @bitCast(v)) >> 16);
         g.resetTo(mark);
         t += n;
     }
     return out;
 }
 
-fn expectWords(name: []const u8, want: []const u16, got: []const u16) !void {
+fn expectWords(name: []const u8, want: []const u16, got: []const u16, h: u32) !void {
     try std.testing.expectEqual(want.len, got.len);
     for (want, got, 0..) |w, x, i| if (w != x) {
-        std.debug.print("MIMO_PREFILL_COMBINE first divergence case={s} token={d} col={d} stock=0x{x:0>4} fused=0x{x:0>4}\n", .{ name, i / hidden, i % hidden, w, x });
+        std.debug.print("MIMO_PREFILL_COMBINE first divergence case={s} token={d} col={d} stock=0x{x:0>4} fused=0x{x:0>4}\n", .{ name, i / h, i % h, w, x });
         return error.MimoPrefillCombineNotExact;
     };
 }
@@ -478,7 +489,7 @@ test "mimo prefill combine CPU: the fused text's host reference is bit-equal to 
     defer _ = mlx.mlx_stream_free(s);
     var g = try ops.MlxOps.init(a, s);
     defer g.deinit();
-    const Case = struct { nt: u32, outs: []const u32, merge: bool = false };
+    const Case = struct { nt: u32, outs: []const u32, merge: bool = false, h: u32 = hidden };
     const all24 = comptime blk: {
         var v: [24]u32 = undefined;
         for (&v, 1..) |*x, n| x.* = n;
@@ -492,29 +503,32 @@ test "mimo prefill combine CPU: the fused text's host reference is bit-equal to 
         .{ .nt = 1037, .outs = &.{30}, .merge = true },
         // P7 `inplace`: more than 24 sources, none merged (the table form reads each in place).
         .{ .nt = 1037, .outs = &.{ 25, 140 } },
+        // Beam's hidden size (5,120: whole threadgroups of the text's columns), the same 8 routes a token.
+        .{ .nt = 7, .outs = &.{ 1, 24 }, .h = 5120 },
+        .{ .nt = 1037, .outs = &.{ 3, 30 }, .h = 5120 },
     };
     var checked: usize = 0;
     for (cases, 0..) |c, ci| for (c.outs) |n_out| {
         const seed = 0x7c0b1e5d +% @as(u32, @intCast(ci * 131 + n_out));
-        var f = try makeFixture(a, &g, c.nt, n_out, seed, true, c.merge);
+        var f = try makeFixture(a, &g, c.h, c.nt, n_out, seed, true, c.merge);
         defer f.deinit(a, &g);
         // Past 24 sources the stock route reads the merged twin (the same rows; the merge copies words).
-        var twin: ?Fixture = if (!c.merge and n_out > sources) try makeFixture(a, &g, c.nt, n_out, seed, false, true) else null;
+        var twin: ?Fixture = if (!c.merge and n_out > sources) try makeFixture(a, &g, c.h, c.nt, n_out, seed, false, true) else null;
         defer if (twin) |*t| t.deinit(a, &g);
         const stock = try stockOf(&g, if (twin) |*t| t else &f, c.nt);
         defer g.release(stock);
-        const want = try wordsOf(a, &g, stock, c.nt);
+        const want = try wordsOf(a, &g, stock, c.nt, c.h);
         defer a.free(want);
         const got = try a.alloc(u16, want.len);
         defer a.free(got);
-        combineRef(f.bits.items, f.loc, f.w, c.nt, hidden, got);
+        combineRef(f.bits.items, f.loc, f.w, c.nt, c.h, got);
         var name_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "t{d}_outs{d}{s}", .{ c.nt, n_out, if (c.merge) "_merged" else "" });
-        try expectWords(name, want, got);
+        const name = try std.fmt.bufPrint(&name_buf, "h{d}_t{d}_outs{d}{s}", .{ c.h, c.nt, n_out, if (c.merge) "_merged" else "" });
+        try expectWords(name, want, got, c.h);
         std.debug.print("MIMO_PREFILL_COMBINE case={s} tokens={d} sources={d} words={d} bit_equal=true\n", .{ name, c.nt, f.outs.items.len, want.len });
         checked += 1;
     };
-    try testing.expectEqual(@as(usize, 8 + 24 + 3 + 2 + 1 + 2), checked);
+    try testing.expectEqual(@as(usize, 8 + 24 + 3 + 2 + 1 + 2 + 2 + 2), checked);
 }
 
 // ── Device self-check (pre-ship family `prefill_combine`; never constructed by ordinary host checks) ──
@@ -528,17 +542,19 @@ test "mimo prefill combine CPU: the fused text's host reference is bit-equal to 
 // P7 `inplace` past 24 sources (16,384 tokens, 140 sources): the merged twin the stock route reads (its sources, the
 // same 1,073,741,824 B) and its merge's concatenate while it is built (<= the same again), the table (<= 2 KiB).
 const selfcheck_ceiling_bytes: u64 = 5 << 30;
+/// Beam's hidden size, the family's second geometry.
+const beam_hidden: u32 = 5120;
 
-fn selfcheckBound(nt: u64) u64 {
+fn selfcheckBound(nt: u64, h: u64) u64 {
     const mib: u64 = 1 << 20;
-    const row = @as(u64, hidden) * 2;
+    const row = h * 2;
     const nr = nt * top_k;
     const twin = 2 * nr * row + 4096;
     return nr * row + 2 * 11_000 * row + 3 * 64 * mib + (2 * 32 + 4 + 2) * mib + 2 * nt * row + nt * row + nt * top_k * 12 + 4 * 16 * mib + 2 * nt * row + 256 * mib + twin;
 }
 
 /// A device self-check case: tokens, outputs of the wide call, merged (the stock scheduler's merge) or not, host reference.
-const SelfCheckCase = struct { nt: u32, outs: u32, merge: bool = false, host: bool = true };
+const SelfCheckCase = struct { nt: u32, outs: u32, merge: bool = false, host: bool = true, h: u32 = hidden };
 
 /// The device self-check's position in its cases (`selfCheckFailed`).
 const SelfCheckAt = struct {
@@ -564,15 +580,16 @@ fn selfCheckFailed(at: SelfCheckAt, e: anyerror) void {
 /// host reference when the case keeps host words); `at` follows the case through its stages for `selfCheckFailed`.
 fn selfCheckCase(a: std.mem.Allocator, g: *ops.MlxOps, kernel: *const Kernel, inplace: *const Kernel, c: SelfCheckCase, ci: usize, at: *SelfCheckAt) !void {
     const seed = 0x4d505243 +% @as(u32, @intCast(ci * 977));
-    var f = try makeFixture(a, g, c.nt, c.outs, seed, c.host, c.merge);
+    std.debug.assert(kernel.h == c.h and inplace.h == c.h);
+    var f = try makeFixture(a, g, c.h, c.nt, c.outs, seed, c.host, c.merge);
     defer f.deinit(a, g);
     // Past 24 sources the stock route reads the merged twin (the same rows; the merge copies words).
-    var twin: ?Fixture = if (!c.merge and c.outs > sources) try makeFixture(a, g, c.nt, c.outs, seed, false, true) else null;
+    var twin: ?Fixture = if (!c.merge and c.outs > sources) try makeFixture(a, g, c.h, c.nt, c.outs, seed, false, true) else null;
     defer if (twin) |*t| t.deinit(a, g);
     at.stage = "stock";
     const stock = try stockOf(g, if (twin) |*t| t else &f, c.nt);
     defer g.release(stock);
-    const want = try wordsOf(a, g, stock, c.nt);
+    const want = try wordsOf(a, g, stock, c.nt, c.h);
     defer a.free(want);
     at.words = want.len;
     // The bound form takes <= 24 sources; the table form every case.
@@ -589,16 +606,16 @@ fn selfCheckCase(a: std.mem.Allocator, g: *ops.MlxOps, kernel: *const Kernel, in
         defer g.release(fused);
         g.resetTo(mark);
         at.stage = "read";
-        const got = try wordsOf(a, g, fused, c.nt);
+        const got = try wordsOf(a, g, fused, c.nt, c.h);
         defer a.free(got);
         at.stage = "compare";
-        try expectWords(at.name, want, got);
+        try expectWords(at.name, want, got, c.h);
         if (c.host) {
             at.stage = "host_ref";
             const ref = try a.alloc(u16, want.len);
             defer a.free(ref);
-            combineRef(f.bits.items, f.loc, f.w, c.nt, hidden, ref);
-            try expectWords(at.name, ref, got);
+            combineRef(f.bits.items, f.loc, f.w, c.nt, c.h, ref);
+            try expectWords(at.name, ref, got, c.h);
         }
         std.debug.print("MIMO_PREFILL_COMBINE_SELFCHECK case={s} form={s} tokens={d} sources={d} words={d} byte_equal=true host_ref={s}\n", .{ at.name, at.form, c.nt, f.outs.items.len, want.len, if (c.host) "equal" else "skipped" });
     }
@@ -609,7 +626,8 @@ test "mimo prefill combine GPU: the fused text is byte-equal to the stock gather
     _ = std.c.getenv("MIMO_PREFILL_COMBINE_GPU") orelse return error.SkipZigTest;
     const guard = std.c.getenv("_GPU_WINDOW_LOCKED") orelse return error.GpuLockRequired;
     if (!std.mem.eql(u8, std.mem.span(guard), "1")) return error.GpuLockRequired;
-    const bound = selfcheckBound(16_384);
+    // The largest case: MiMo's 16,384 tokens at 4,096 (Beam's cases at 5,120 stop at 1,037 tokens).
+    const bound = @max(selfcheckBound(16_384, hidden), selfcheckBound(1037, beam_hidden));
     std.debug.print("MIMO_PREFILL_COMBINE_SELFCHECK bound_bytes={d} ceiling_bytes={d}\n", .{ bound, selfcheck_ceiling_bytes });
     if (bound > selfcheck_ceiling_bytes) return error.MimoPrefillCombineAdmission;
     mlx.installErrorHandler();
@@ -641,6 +659,11 @@ test "mimo prefill combine GPU: the fused text is byte-equal to the stock gather
     // P7 `inplace`: the table form, checked on the same cases (<= 24 sources) and past 24 (none merged).
     var inplace = try Kernel.initInplace(try bank_mod.Geometry.init(hidden, moe.inter, 256, 1, 47));
     defer inplace.deinit();
+    // Beam's geometry (hidden 5,120, inter 2,560, 256 experts top-8 on 49 routed layers): the same family on its texts.
+    var kernel_beam = try Kernel.init(try bank_mod.Geometry.init(beam_hidden, 2560, 256, 3, 49));
+    defer kernel_beam.deinit();
+    var inplace_beam = try Kernel.initInplace(try bank_mod.Geometry.init(beam_hidden, 2560, 256, 3, 49));
+    defer inplace_beam.deinit();
     const cases = [_]SelfCheckCase{
         .{ .nt = 2, .outs = 1 },
         .{ .nt = 7, .outs = 1 },
@@ -653,16 +676,22 @@ test "mimo prefill combine GPU: the fused text is byte-equal to the stock gather
         .{ .nt = 1037, .outs = 25 },
         .{ .nt = 1037, .outs = 255 },
         .{ .nt = 16_384, .outs = 140, .host = false },
+        // Beam's hidden size: the bound form, the merged route, the table form past 24 sources.
+        .{ .nt = 7, .outs = 24, .h = beam_hidden },
+        .{ .nt = 1037, .outs = 3, .h = beam_hidden },
+        .{ .nt = 1037, .outs = 30, .merge = true, .h = beam_hidden },
+        .{ .nt = 1037, .outs = 140, .h = beam_hidden },
     };
     for (cases, 0..) |c, ci| {
         var name_buf: [64]u8 = undefined;
         // Where the case is when it fails: one FAILED line with the case, form, stage and MLX's own error text.
         var at: SelfCheckAt = .{
-            .name = try std.fmt.bufPrint(&name_buf, "t{d}_outs{d}{s}", .{ c.nt, c.outs, if (c.merge) "_merged" else "" }),
+            .name = try std.fmt.bufPrint(&name_buf, "h{d}_t{d}_outs{d}{s}", .{ c.h, c.nt, c.outs, if (c.merge) "_merged" else "" }),
             .tokens = c.nt,
             .sources = c.outs,
         };
-        selfCheckCase(a, &g, &kernel, &inplace, c, ci, &at) catch |e| {
+        const beam_case = c.h == beam_hidden;
+        selfCheckCase(a, &g, if (beam_case) &kernel_beam else &kernel, if (beam_case) &inplace_beam else &inplace, c, ci, &at) catch |e| {
             selfCheckFailed(at, e);
             return e;
         };

@@ -24,6 +24,7 @@ const mimo_stream = @import("../mimo_v2/stream.zig");
 const bridge = @import("../mimo_v2/stream_source.zig");
 const mimo_math = @import("../mimo_v2/math.zig");
 const prefill_combine = @import("../mimo_v2/prefill_combine.zig");
+const route = @import("../mimo_v2/route.zig");
 const bank_mod = @import("bank.zig");
 const exl3_bank = @import("exl3_bank.zig");
 const exl3_math = @import("exl3_math.zig");
@@ -76,13 +77,9 @@ pub fn Types(comptime fam: Family) type {
     };
 }
 
-/// `decode_predict: bf16`: the next routed layer's scores from its router's BF16 weight as stored ([experts, hidden], MLX's
-/// gemv over x [n, hidden]), then the sigmoid and the correction as MiMo's F32 route: f32 [n, experts]. Half the F32
-/// copy's bytes and no input cast; the scores pick the lookahead's reads only.
-pub fn scoresBf16(_: *const mimo_math.Predictor, g: *ops.MlxOps, x: T, router: T, correction: T) anyerror!T {
-    const logits = try g.matmul(x, try g.transpose(router));
-    return g.add(try g.sigmoid(try g.astype(logits, .float32)), correction);
-}
+/// `decode_predict: bf16`: the next routed layer's scores from its router's BF16 weight as stored (the shared route's
+/// `scoresStored`): half the F32 copy's bytes and no input cast; the scores pick the lookahead's reads only.
+pub const scoresBf16 = route.scoresStored;
 
 /// `fuse_predictor: on` (fusion.zig): `scoresBf16`'s product, then its epilogue (the f32 widening, the sigmoid and the
 /// correction) in one dispatch, element for element the three stock dispatches' arithmetic; a call wider than the
@@ -95,22 +92,15 @@ pub fn scoresBf16Fused(p: *const mimo_math.Predictor, g: *ops.MlxOps, x: T, rout
 }
 pub const Residents = B.S.Residents;
 
-/// MiMo's construction routes, fixed here (its stack of record; each exact against its control).
-pub const read_schedule: mimo_stream.ReadSchedule = .early_whole_trim;
-pub const drain: mimo_math.Drain = .pipelined;
-pub const bank_view: mimo_math.BankView = .window;
-pub const decode_window: mimo_stream.DecodeWindow = .verify;
-/// Prompt lever 1 (glm5next/prefill-levers): the overlap schedule's relocation (`Options.prompt_relocate`). A read-ahead
-/// record the call's plans evict before any group hits it (a misprediction: an earlier group's seed miss takes its row)
-/// and load again later in the call into a transient row no earlier group reads is copied at the plans from its
-/// read-ahead row into that row, so it is read once, not twice (the profile's 33.8 double reads per layer, read again
-/// inside the drive-bound MoE stage). The same plans, slots and kernels, the record's own bytes in its row before any
-/// kernel reads it: exact by construction, installed unconditionally.
-pub const prompt_relocate = true;
-/// P7 `pooled`: MLX's cache limit through the prompt pass, purged at a prompt layer's end once half full; decode keeps
-/// its own limit (`decode_cache_bytes`).
-pub const prompt_cache_bytes: usize = 2 << 30;
-pub const decode_cache_bytes: usize = 256 << 20;
+/// MiMo's construction routes, fixed (the shared route's, mimo_v2/route.zig; each exact against its control).
+pub const read_schedule = route.read_schedule;
+pub const drain = route.drain;
+pub const bank_view = route.bank_view;
+pub const decode_window = route.decode_window;
+/// Prompt lever 1 (glm5next/prefill-levers): the overlap schedule's relocation, installed unconditionally.
+pub const prompt_relocate = route.prompt_relocate;
+pub const prompt_cache_bytes = route.prompt_cache_bytes;
+pub const decode_cache_bytes = route.decode_cache_bytes;
 /// The prompt pass's routed calls take the wide lane; the decode lane takes a decode-phase call of at most
 /// `decode_lane_rows` rows (a serial token; the MTP verify's 4 rows in phase 4).
 pub const decode_lane_rows: u32 = Math.decode_forward_rows;
@@ -121,27 +111,10 @@ comptime {
     if (mimo_stream.decode_lane_route_ids != decode_lane_rows * top_k) @compileError("glm5_next: decode's window 0 is not the decode lane's route");
 }
 
-/// The stream's construction options over a family's bridge `Bp` (pure: the CPU tests read them; the same options for
-/// every family): MiMo's event gates and lookahead over `rows`, the phase rows' transient release, the read schedule's
-/// overlap route with prompt lever 1's relocation, decode's window 0, and the rate tally (`tally`: every layer pins at
-/// most floor(ratio x 288) experts; none at ratio 0), with the demand reads' route
-/// (`settings.MissReads`): `direct` sets the pool's direct route and turns the decode pre-read off (a pre-range stages);
-/// the stream proves the geometry at its construction (`checkDirectReads`, `checkDirectRows`).
+/// The stream's construction options over a family's bridge `Bp` (the shared route's, with the demand reads' route
+/// `settings.MissReads`: `direct` sets the pool's direct route and turns the decode pre-read off).
 pub fn streamOptionsOf(comptime Bp: type, rows: []const u32, memory: Bp.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings, miss_reads: settings.MissReads) !Bp.Options {
-    var opts = Bp.eventOptions(rows, memory, event);
-    opts.transient_release = true;
-    try Bp.applyReadSchedule(&opts, read_schedule);
-    opts.prompt_relocate = prompt_relocate;
-    opts.decode_route_ids = mimo_stream.decodeRouteIds(decode_window);
-    opts.tally = if (tally.enabled()) .{ .ratio = tally.ratio, .window = tally.window } else null;
-    switch (miss_reads) {
-        .staged => {},
-        .direct => {
-            opts.pool.direct = true;
-            opts.lookahead.?.preread = false;
-        },
-    }
-    return opts;
+    return route.streamOptionsOf(Bp, rows, memory, event, tally, miss_reads == .direct);
 }
 
 /// The construction's engagement line of the demand reads' route (`miss_reads`): the installed block (0 = staged), whether
@@ -164,55 +137,24 @@ pub fn promptResidentsLine(residents: settings.PromptResidents) []const u8 {
     };
 }
 
-/// What came before a request's start (`requestStart`): the construction (the stream still in its prompt phase, its
-/// warm-up's residents), the usage seed (`Source.seedResidents`: the residents the load read), or a reverse change.
-pub const Start = enum { construction, seeded, reversed };
-
-/// A request's start on the stream (or its source), after `Source.resumePrefill` (nothing live). After the construction:
-/// every resident and the prompt state forgotten (`forgetResidents`: the warm-up's residents belong to no prompt). After
-/// the usage seed: the seeded residents stay (the seed left them as `shrink(.keep)` leaves a kept one), whatever
-/// `prompt_residents` says. After a reverse change: `forget` (the control) forgets every resident; `keep` leaves the
-/// residents `shrink(.keep)` left in the prompt rows (that shrink already cleared their prompt state). A request that
-/// stops at its prompt still enters decode (`ttft_tail: deferred` runs the phase change in its tail, `finishTail` ->
-/// `enterDecode`), so the next request starts after a reverse change and finds that prompt's residents kept, as after
-/// any decode. Then the prompt counts are zeroed and the pins refreshed (`resetPromptCounts`).
-pub fn requestStart(stream: anytype, residents: settings.PromptResidents, start: Start) !void {
-    const forget = switch (start) {
-        .construction => true,
-        .seeded => false,
-        .reversed => residents == .forget,
-    };
-    if (forget) _ = try stream.forgetResidents();
-    stream.resetPromptCounts();
-}
-
+/// A request's start on the stream (the shared route's `requestStart`).
+pub const Start = route.Start;
+pub const requestStart = route.requestStart;
 
 /// The phase route of a routed call (MiMo's `decodeLane`): one row in either phase, up to `decode_lane_rows` in decode.
 pub fn decodeLane(nt: u32, decoding: bool) bool {
-    return nt == 1 or (decoding and nt <= decode_lane_rows);
+    return route.decodeLane(nt, decoding, decode_lane_rows);
 }
 
-/// The decode lane's combine (MiMo's stock): `routed` [n, 8, H] bf16 in router order, f32 weights [n, 8]; f32 products,
-/// the sum over the 8 routes, bf16 once.
+/// The decode lane's combine (MiMo's stock, the shared route's).
 fn combineStock(g: *ops.MlxOps, routed: T, route_weights: T) !T {
-    const n = g.shapeOf(routed).d[0];
-    const expanded = try g.reshape(route_weights, &.{ n, top_k, 1 });
-    return g.astype(try g.sum(try g.mul(try g.astype(routed, .float32), expanded), 1, false), .bfloat16);
+    return route.combineStock(g, routed, route_weights, top_k);
 }
 
-/// The host's monotonic clock (ns): the phase change's one timing (`beginDecodeTimed`), never per call.
-fn monotonicNs() u64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
+const monotonicNs = route.monotonicNs;
 
-/// The prompt combine the host's wired policy allows (`MLX_SERVE_WIRED`, read once at construction): `inplace` under
-/// `max` (the host's default), `fused` under any other.
-pub fn combineRoute() prefill_combine.Route {
-    const wired = std.c.getenv("MLX_SERVE_WIRED") orelse return .inplace;
-    return if (std.mem.eql(u8, std.mem.span(wired), "max")) .inplace else .fused;
-}
+/// The prompt combine the host's wired policy allows (the shared route's).
+pub const combineRoute = route.combineRoute;
 
 /// The SiLU of the experts (the arch's, `swiglu_limit` 10, as mlx-serve's `clampedSwiGLU` computes it in the tensor
 /// dtype): silu(min(gate, 10)) * clip(up, -10, 10).
@@ -295,7 +237,7 @@ pub fn SourceOf(comptime fam: Family) type {
             };
             errdefer bank.deinit();
             const geo = bank.geometry;
-            try geo.requireFlash();
+            if (comptime fam == .exl3) try geo.requireFlash() else try bm.requireFlash(&geo);
             if (rows.len != geo.num_moe_layers or decode_rows.len != rows.len) return error.Glm5NextExpertRows;
             var widest: u32 = mimo_stream.transient_rows;
             for (rows, decode_rows) |p, d| {

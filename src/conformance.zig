@@ -114,6 +114,32 @@ test "mlx-stream conformance: each arch claims only its own pack" {
     try sdk.testing.expectClaims(dsv.claims, &.{ .{ .config = mimo_pack, .want = null }, .{ .config = dsv_pack, .want = .native } });
 }
 
+test "mlx-stream conformance: Beam and GLM-5.3-Flash each claim only their own NVFP4 pack and share the one reader" {
+    const beam = comptime sdk.Arch.of(@import("root.zig").beam.arch);
+    const flash = comptime sdk.Arch.of(@import("root.zig").glm5_next.arch);
+    const mimo = comptime sdk.Arch.of(plugin_mimo.provides.arch.?);
+    const block = "\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-nvfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\"}";
+    const beam_pack = "{\"model_type\":\"beam\"," ++ block ++ "}";
+    const flash_pack = "{\"model_type\":\"glm5_next\"," ++ block ++ "}";
+    const mimo_pack = @embedFile("fixtures/mimo_v2_flash_q4_config.json");
+    try sdk.testing.expectClaims(beam.claims, &.{
+        .{ .config = beam_pack, .want = .native },
+        .{ .config = flash_pack, .want = null },
+        .{ .config = mimo_pack, .want = null },
+        .{ .config = "{\"model_type\":\"beam\"}", .want = null },
+    });
+    try sdk.testing.expectClaims(flash.claims, &.{ .{ .config = beam_pack, .want = null }, .{ .config = flash_pack, .want = .native } });
+    try sdk.testing.expectClaims(mimo.claims, &.{.{ .config = beam_pack, .want = null }});
+    try std.testing.expect(beam.spec == .draft_lane and beam.caps.owns_decode_state and beam.caps.prefill_whole_prompt and beam.caps.prefill_yields_last_logits and beam.caps.residents_past_page_cache);
+    try beam.claim_process.?();
+    try std.testing.expectError(error.ExpertReaderInUse, flash.claim_process.?());
+    try std.testing.expectError(error.ExpertReaderInUse, mimo.claim_process.?());
+    beam.release_process.?();
+    try flash.claim_process.?();
+    try std.testing.expectError(error.ExpertReaderInUse, beam.claim_process.?());
+    flash.release_process.?();
+}
+
 test "mlx-stream conformance: both arches share one expert reader claim" {
     const dsv = comptime sdk.Arch.of(plugin.provides.arch.?);
     const mimo = comptime sdk.Arch.of(plugin_mimo.provides.arch.?);
