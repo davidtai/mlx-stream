@@ -156,7 +156,7 @@ pub const Module = struct {
         self.requestEnd();
         if (req.prompt_tokens != ids.len) return error.BeamPrefixNotKept;
         try self.beginPrompt(ids);
-        const logits = try self.promptCalls(ids, false);
+        const logits = try self.promptCalls(ids, .last, {});
         errdefer self.g.release(logits);
         try self.enterDecode(ids.len);
         return logits;
@@ -176,8 +176,9 @@ pub const Module = struct {
     }
 
     /// The prompt's calls (at most `experts.call_rows` rows each, layer by layer): the last call's logits (every row's
-    /// under `all_rows`: the parity test's), evaluated, the source flushed.
-    pub fn promptCalls(self: *Module, ids: []const u32, comptime all_rows: bool) !T {
+    /// under `head == .all`: the parity test's), evaluated, the source flushed. `force`: `{}`, or the parity test's routes
+    /// (graph.zig `ForcedRoutes`).
+    pub fn promptCalls(self: *Module, ids: []const u32, comptime head: graph.Head, force: anytype) !T {
         var logits: ?T = null;
         errdefer if (logits) |x| self.g.release(x);
         var at: usize = 0;
@@ -185,7 +186,7 @@ pub const Module = struct {
             const end = @min(ids.len, at + experts.call_rows);
             if (logits) |x| self.g.release(x);
             logits = null;
-            logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids[at..end], self.cache.len, &self.cache, self.src, all_rows);
+            logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids[at..end], self.cache.len, &self.cache, self.src, head, force);
             at = end;
         }
         try self.g.evalAll(&.{logits.?});
@@ -202,18 +203,23 @@ pub const Module = struct {
     /// A serial step (or a short extend) after the committed positions: the last row's logits f32 [1, vocab]. A step
     /// wider than the decode lane takes the prompt phase for it, then decode again.
     pub fn step(self: *Module, ids: []const u32) !T {
+        return self.stepWith(ids, {});
+    }
+
+    /// `step` with `force`: `{}` (served), or the parity test's routes (graph.zig `ForcedRoutes`).
+    pub fn stepWith(self: *Module, ids: []const u32, force: anytype) !T {
         if (ids.len == 0) return error.BeamEmptyStep;
         if (self.cache.len + ids.len > self.cache.cap) return error.ContextOverBill;
         try self.checkTokens(ids);
         if (!self.src.decodeLaneAt(@intCast(ids.len))) {
             try self.src.resumePrefill();
-            const logits = try self.promptCalls(ids, false);
+            const logits = try self.promptCalls(ids, .last, force);
             errdefer self.g.release(logits);
             try self.src.beginDecode();
             return logits;
         }
         const t0 = self.nowNs();
-        const logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids, self.cache.len, &self.cache, self.src, false);
+        const logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids, self.cache.len, &self.cache, self.src, .last, force);
         errdefer self.g.release(logits);
         try self.g.evalAll(&.{logits});
         try self.src.flush();

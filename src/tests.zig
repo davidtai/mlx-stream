@@ -69,6 +69,7 @@ comptime {
     _ = @import("arch/beam/bill.zig");
     _ = @import("arch/beam/module.zig");
     _ = @import("arch/beam/root.zig");
+    _ = @import("arch/beam/parity.zig");
     _ = @import("arch/deepseek_v41/deepseek_v41.zig");
     _ = @import("arch/deepseek_v41/ops.zig");
     _ = @import("arch/deepseek_v41/graph.zig");

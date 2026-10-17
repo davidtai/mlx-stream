@@ -497,14 +497,27 @@ pub const Routing = struct { indices: T, weights: T };
 /// chosen experts' sigmoid scores, normalized to sum 1 (+ 1e-20). x [n, hidden] -> ids u32 [n, k], weights f32 [n, k].
 /// `routed_scaling_factor` multiplies the experts' weighted sum (the caller), not these weights.
 pub fn route(g: *G, c: *const beam.Config, r: Router, x: T) !Routing {
-    const n = g.shapeOf(x).dim(0);
+    const s = try routerScores(g, r, x);
+    const inds = try select(g, c, s.choice);
+    return .{ .indices = inds, .weights = try weightsAt(g, c, s.scores, inds) };
+}
+
+const Scores = struct { scores: T, choice: T };
+
+/// The sigmoid scores of the f32 logits and the choice scores (+ the correction bias), f32 [n, experts].
+fn routerScores(g: *G, r: Router, x: T) !Scores {
+    const scores = try g.sigmoid(try linear(g, try g.astype(x, .float32), r.w));
+    return .{ .scores = scores, .choice = try g.add(scores, r.bias) };
+}
+
+/// The group top-k of the choice scores: u32 [n, k] (in no order).
+fn select(g: *G, c: *const beam.Config, choice: T) !T {
+    const n = g.shapeOf(choice).dim(0);
     const e: c_int = @intCast(c.n_routed_experts);
     const ng: c_int = @intCast(c.n_group);
     const eg: c_int = @intCast(c.groupExperts());
     const k: c_int = @intCast(c.n_experts_per_tok);
     const tg: c_int = @intCast(c.topk_group);
-    const scores = try g.sigmoid(try linear(g, try g.astype(x, .float32), r.w));
-    const choice = try g.add(scores, r.bias);
     const grouped = try g.reshape(choice, &.{ n, ng, eg });
     var top2 = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_topk_axis(&top2, grouped, 2, -1, g.s));
@@ -518,10 +531,43 @@ pub fn route(g: *G, c: *const beam.Config, r: Router, x: T) !Routing {
     const mask = try g.reshape(try g.broadcastTo(try g.reshape(kept, &.{ n, ng, 1 }), &.{ n, ng, eg }), &.{ n, e });
     const masked = try g.where(mask, choice, try g.scalar(-std.math.inf(f64), .float32));
     const part = try g.argpartition(try g.neg(masked), k - 1, -1);
-    const inds = try g.astype(try g.slice(part, &.{ 0, 0 }, &.{ n, k }, &.{ 1, 1 }), .uint32);
-    var w = try g.takeAlongAxis(scores, inds, -1);
-    if (c.norm_topk_prob) w = try g.div(w, try g.add(try g.sum(w, -1, true), try g.scalar(1e-20, .float32)));
-    return .{ .indices = inds, .weights = w };
+    return g.astype(try g.slice(part, &.{ 0, 0 }, &.{ n, k }, &.{ 1, 1 }), .uint32);
+}
+
+/// The chosen experts' sigmoid scores, normalized to sum 1 (+ 1e-20) under `norm_topk_prob`: f32 [n, k].
+fn weightsAt(g: *G, c: *const beam.Config, scores: T, inds: T) !T {
+    const w = try g.takeAlongAxis(scores, inds, -1);
+    if (!c.norm_topk_prob) return w;
+    return g.div(w, try g.add(try g.sum(w, -1, true), try g.scalar(1e-20, .float32)));
+}
+
+/// The parity test's routes (parity.zig): every routed layer's expert ids by position, the reference's, taken in place
+/// of the router's choice; the router's own choice at each of them recorded beside (one read back per routed layer: a
+/// test's forward only). Layout of both: [routed layer][position][k].
+pub const ForcedRoutes = struct {
+    ids: []const u32,
+    chosen: []u32,
+    positions: usize,
+    k: usize,
+
+    fn at(f: *const ForcedRoutes, moe: usize, pos: usize) usize {
+        return (moe * f.positions + pos) * f.k;
+    }
+};
+
+/// Routed layer `l`'s routing of rows [start, start + n) under forced routes: the forced ids, the weights at them; the
+/// router's own choice evaluated and recorded.
+fn forcedRoute(g: *G, c: *const beam.Config, r: Router, x: T, f: *const ForcedRoutes, l: u32, start: u32) !Routing {
+    const n: usize = @intCast(g.shapeOf(x).dim(0));
+    const k: c_int = @intCast(c.n_experts_per_tok);
+    const moe = l - c.first_k_dense;
+    if (f.k != c.n_experts_per_tok or start + n > f.positions) return error.BeamForcedRoutes;
+    const s = try routerScores(g, r, x);
+    const own = try select(g, c, s.choice);
+    try g.evalAll(&.{own});
+    _ = try g.readU32(own, f.chosen[f.at(moe, start)..][0 .. n * f.k]);
+    const inds = try g.hostArray(std.mem.sliceAsBytes(f.ids[f.at(moe, start)..][0 .. n * f.k]), &.{ @intCast(n), k }, .uint32);
+    return .{ .indices = inds, .weights = try weightsAt(g, c, s.scores, inds) };
 }
 
 /// Each expert's routed rows in `ids` (u32 [rows, k]) against every expert id (`all_ids`, u32 [1, n]): int32 [n].
@@ -545,10 +591,14 @@ fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, s
     try src.readAheadSeed(l, expert_policy.rankHottest(host, &src.ahead_ranked));
 }
 
+/// The head's rows: the last row's logits (served), or every row's (the parity test's).
+pub const Head = enum { last, all };
+
 /// One forward of `ids` at positions [start, start + ids.len) through every layer (each layer's state advanced in
 /// `cache`), the routed experts through `src`: the last row's logits f32 [1, vocab] (soft-capped), a kept handle the
-/// caller frees. With `all_rows`, every row's logits f32 [rows, vocab] (the parity test's).
-pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, src: anytype, comptime all_rows: bool) !T {
+/// caller frees; under `head == .all` every row's, f32 [rows, vocab]. `force` is `{}` when served, or the parity test's
+/// `*const ForcedRoutes` (its own comptime instance: the served forward has no branch on it).
+pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, src: anytype, comptime head: Head, force: anytype) !T {
     const rows: u32 = @intCast(ids.len);
     if (rows == 0 or rows > experts.call_rows) return error.BeamCallRows;
     if (start + rows > cache.cap) return error.ContextOverBill;
@@ -590,7 +640,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         const x1 = try depthAdd(g, try rmsNorm(g, attn, lw.post_attn_norm, c.rms_norm_eps), x, beam.Config.residualIndex(l, false));
         const h = try rmsNorm(g, x1, lw.pre_ff_norm, c.rms_norm_eps);
         const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, h, rows) else try mlp(g, d, h)) else blk: {
-            const r = try route(g, c, lw.router.?, h);
+            const r = if (comptime @TypeOf(force) == void) try route(g, c, lw.router.?, h) else try forcedRoute(g, c, lw.router.?, h, force, l, start);
             if (prompt) try g.asyncEval(&.{ r.indices, r.weights });
             const routed = try g.adopt(try src.forward(l, h, r.indices, r.weights));
             break :blk try scaleBf16(g, routed, c.routed_scaling);
@@ -610,7 +660,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         }
     }
     cache.len = start + rows;
-    if (all_rows) return g.keep(try logitsOf(g, c, w, x));
+    if (head == .all) return g.keep(try logitsOf(g, c, w, x));
     const last = try g.slice(x, &.{ @intCast(rows - 1), 0 }, &.{ @intCast(rows), hidden }, &.{ 1, 1 });
     return g.keep(try logitsOf(g, c, w, last));
 }
