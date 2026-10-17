@@ -37,7 +37,6 @@ const mimo_draft = @import("../mimo_v2/draft.zig");
 const acc = @import("../../sdk_ext.zig").acceptance;
 /// The plugin's draw for every row handed to the host (`sdk_ext.sampler`): bound per request by `draft_lane.arm`.
 pub const Sampler = @import("../../sdk_ext.zig").sampler.SamplerOf(graph.G);
-const pagecache = @import("../mimo_v2/pagecache.zig");
 /// Profile builds only (glm5_next/profile.zig): the route trace, the prompt timeline, the phase lines, the decode
 /// timers and the serial forwards' GPU timeline; every call compiles to nothing in a served build.
 const gprof = @import("profile.zig");
@@ -1050,17 +1049,12 @@ fn roundPassOf(gl: glue.Route, fam: experts.Family) *const fn (*Module, std.mem.
     };
 }
 
-/// The construction config the module fills on: the host's facts, with the fill's baseline the box as the window guard
-/// counts it (MiMo's `pagecache.admissionBaseline`: physical used less the pack's own page cache, evicted here, floored
-/// at the host's non-file baseline).
+/// The construction config the module fills on: the host's facts, with the fill's baseline by glm5_next's route
+/// (`bill.fill_baseline`: MiMo's box baseline, physical used less the pack's own page cache, evicted here, floored at
+/// the host's non-file baseline).
 pub fn admitted(io: std.Io, c: *const settings.Config, facts: *const sdk.LoadFacts) !settings.Config {
     var built = c.withFacts(facts);
-    if (facts.memory_baseline_bytes) |nonfile| if (c.model_dir) |dir| {
-        const physical_used = sdk.memory.physicalUsedBytes(sdk.memory.vmBytes());
-        const pack_cached = try pagecache.packCachedBytes(io, dir, true);
-        built.memory_baseline_bytes = pagecache.baselineOf(physical_used, pack_cached, nonfile);
-        log.info("glm5_next admission baseline: physical_used={d} pack_cached={d} nonfile={d} -> baseline={d}\n", .{ physical_used, pack_cached, nonfile, built.memory_baseline_bytes.? });
-    };
+    built.memory_baseline_bytes = try @import("../mimo_v2/route_bill.zig").admissionBaseline(io, "glm5_next", bill.fill_baseline, c.model_dir, facts);
     return built;
 }
 
