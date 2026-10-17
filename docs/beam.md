@@ -170,6 +170,50 @@ one page. Then the E4M3 scales of a projection (2 KiB a slot on the fixture) hol
 MLX's `gather_qmm` refuses that. The construction refuses it first (`BeamSlotArrays`). Beam's own scales are 800 KiB a
 slot.
 
+## Serve on the M5 Ultra box
+
+This recipe served the full pack (`Beam-1.0-501B-A23B-NVFP4-mlx-stream`) on the 256 GB M5 Ultra (mac-studio-m5u,
+`iogpu.wired_limit_mb` 245760). The host is mlx-serve with `plugin.beam` (branch feat/beam-tools, 0c1802e7: it also
+splits the Harmony channels and parses Beam's tool calls).
+
+1. Get the GPU lock.
+2. Remove the page cache of each large file that is not the pack. The admission baseline counts every other file's
+   page cache as used memory. Before this step, 155 GB of cache from the source checkpoint gave a baseline of 174.0 GB
+   and only 45 prompt rows. After it, the baseline was 35.1 GB and the fill gave 173 prompt rows and 183 decode rows.
+   You can use `msync(MS_INVALIDATE)` on each file (no sudo) or `purge`.
+3. Start the server with a fresh `~/.mlx-serve`:
+
+```sh
+MLX_SERVE_GPU_CEILING_MB=245760 mlx-serve --model <pack> --serve --port 11391 --ctx-size 32768 --no-vision \
+  --no-warmup-eager --prefix-cache-entries 0 --metrics --log-file off --kv-quant off --wired-margin-gib 2
+```
+
+4. To seed the residents, run one request with `expert_usage_record` set to an absolute path. Then put that
+   `expert-usage-v1.json` beside the pack (or in a copy of the pack with hard links). The next load reads it
+   (`resident_seed: usage`, the default when the file is there).
+
+The server lines of the first load:
+
+```text
+beam memory: target=255550554112 baseline=35063922688 process_bound=220247399128 prompt_rows=173 decode_rows=183 reserve_tokens=32768 kv=bf16 phase_rows=on growth_rows=10 forced=no
+beam construction check: footprint 207761354992 B (MLX active 207363614604 B, cache 0 B, host side 397740388 B), billed construction terms 208243792880 B, residual 482437888 B (billed less footprint)
+```
+
+The residents (734 tensors, 16,163,485,456 B) read in 1.13 s. The server answers `/health` 10 s after its start.
+
+Measured on the coding workload (`coding.json`: 16,445 prompt tokens, 1,024 generated, temperature 1.0, top_p 0.95,
+seed 1234), each on a fresh server. The rows are 173 prompt / 183 decode. GB = 1e9 B.
+
+| Run | Load | TTFT | Prefill | Decode | SSD read a decode token | Expert hits in decode | Peak footprint |
+|---|---|---|---|---|---|---|---|
+| Not seeded | 10 s | 26.15 s | 629 tok/s | 16.4 tok/s | 233 MB | 97.3 % | 217.5 GB |
+| Seeded from the first run | 28 s | 19.02 s | 865 tok/s | 15.5 tok/s | 270 MB | 96.9 % | 217.5 GB |
+
+The seed reads 8,477 records (187.5 GB) in 13.3 s at the load. The hit rate is 1 - (SSD bytes a token / 22,122,496 B)
+/ 392 routes a token. A short request (53 prompt tokens, cold rows) decodes at 9.3 tok/s. With feat/beam-tools the
+reasoning goes to `reasoning_content` and the final channel to `content`. Tool calls come back parsed, with JSON
+arguments, on `/v1/chat/completions` and `/v1/messages`, streamed and not streamed.
+
 ## Not done
 
 - Fused NVFP4 decode texts at Beam's geometry. glm5_next's texts are checked against its own geometry. A Beam set
