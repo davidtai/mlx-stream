@@ -992,3 +992,55 @@ test "beam graph GPU: the f32 SwiGLU's one kernel is the op chain bit for bit (r
         try expectBits("swiglu_f32", &g, try sdk_ext.quant.swigluF32Chain(G, &g, gate, up), try sdk_ext.quant.activation(G, &g, .swiglu_f32, gate, up));
     }
 }
+
+test "beam graph GPU: the experts' nvfp4 gathers on host identity rows are MLX's own gathers bit for bit (a sorted tile, decode rows, a matrix row)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const nvfp4 = @import("../../expert/nvfp4_format.zig");
+    const nvfp4_bank = @import("../../expert/nvfp4_bank.zig");
+    const a = testing.allocator;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try G.init(a, stream);
+    defer g.deinit();
+    const c: beam.Config = .{};
+    // A gate projection's slot arrays at Beam's geometry: 16 slots of [inter, hidden] (E2M1 words, E4M3 scales between
+    // 0.5 and 2, a global scale on each slot's own line of a page-sized array).
+    const slots = 16;
+    const inter: usize = c.moe_intermediate_size;
+    const hidden: usize = c.hidden_size;
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const r = prng.random();
+    const words = try a.alloc(u32, slots * inter * hidden / 8);
+    defer a.free(words);
+    for (words) |*v| v.* = r.int(u32);
+    const scale_bytes = try a.alloc(u8, slots * inter * hidden / nvfp4_bank.group_size);
+    defer a.free(scale_bytes);
+    for (scale_bytes) |*v| v.* = r.intRangeAtMost(u8, 0x30, 0x40);
+    const lines = nvfp4_bank.scale_array_min_bytes / nvfp4_bank.scale_line_bytes;
+    var gs: [lines * nvfp4_bank.scale_line_floats]f32 = @splat(0);
+    for (0..slots) |s| gs[s * nvfp4_bank.scale_line_floats] = 2688.0 * (0.25 + 0.05 * @as(f32, @floatFromInt(s)));
+    const ci = struct {
+        fn f(v: usize) c_int {
+            return @intCast(v);
+        }
+    }.f;
+    const p: nvfp4_bank.Arrays(T) = .{
+        .w = try g.hostArray(std.mem.sliceAsBytes(words), &.{ slots, ci(inter), ci(hidden / 8) }, .uint32),
+        .scales = try g.hostArray(scale_bytes, &.{ slots, ci(inter), ci(hidden / nvfp4_bank.group_size) }, .uint8),
+        .global_scale = try g.hostArray(std.mem.sliceAsBytes(&gs), &.{ ci(lines), nvfp4_bank.scale_line_floats }, .float32),
+    };
+    // A prompt tile's sorted gather (MLX's sorted kernel: 512 rows over 16 slots), a decode wave's rows, a matrix row.
+    const Case = struct { rows: c_int, m: c_int, sorted: bool };
+    for ([_]Case{ .{ .rows = 512, .m = 1, .sorted = true }, .{ .rows = 8, .m = 1, .sorted = false }, .{ .rows = 1, .m = 4, .sorted = false } }, 0..) |cs, i| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const x = try testBf16(a, &g, &.{ cs.rows, cs.m, ci(hidden) }, 1.0, 1000 + i);
+        const ids = try a.alloc(u32, @intCast(cs.rows));
+        defer a.free(ids);
+        for (ids, 0..) |*v, j| v.* = if (cs.sorted) @intCast(j * slots / ids.len) else r.uintLessThan(u32, slots);
+        const rhs = try g.hostArray(std.mem.sliceAsBytes(ids), &.{cs.rows}, .uint32);
+        const want = try nvfp4.gatherNvfp4(&g, x, p, .{ .ctx = null }, rhs, cs.sorted);
+        try expectBits("nvfp4_gather_identity", &g, want, try nvfp4.gatherNvfp4(&g, x, p, try nvfp4.identityRows(&g, x), rhs, cs.sorted));
+    }
+}

@@ -171,7 +171,11 @@ needs the host's wired policy `max`; under another policy the fused combine is i
 
 The gathers are MLX's `gather_qmm` in `nvfp4` mode (group 16) with each slot's f32 global scale, through the plugin's
 shim (`glm5_gather_qmm_nvfp4`: MLX's C++ op; mlx-c's `mlx_gather_qmm` has no global scale and is not changed): MLX folds
-g / 2688 into each group scale, so there is no output scaling and no extra rounding.
+g / 2688 into each group scale, so there is no output scaling and no extra rounding. Each gather gives the shim the
+identity index of x's rows as host data (`nvfp4_format.zig` `identityRows`, up to 1,024 rows). Without an index, MLX's op
+makes an arange in each call (one kernel). An index that is given to the op turns off MLX's sorted kernel (GatherQMM
+`right_sorted` is `sorted && !lhs`). Thus the shim makes the op without an index and puts the caller's index into the
+op's GatherQMM in place of the arange. The primitive and the index values do not change, so the result is the same.
 
 The decode lane's experts take the route `decode_moe` names, installed once at construction: `stock` runs the gathers
 above per bank; `fused` installs the NVFP4 decode texts (`decode_kernels.zig`, MiMo's k1 family over the NVFP4 bank: the
