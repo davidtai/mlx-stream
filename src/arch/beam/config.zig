@@ -75,7 +75,12 @@ pub const Config = struct {
     }
 
     pub fn nFull(c: *const Config) u32 {
-        return @popCount(c.full_mask & ((@as(u64, 1) << @intCast(c.n_layers)) - 1));
+        return @popCount(c.full_mask & layerMask(c.n_layers));
+    }
+
+    /// The bits of layers [0, n): every bit at n = 64 (a shift by 64 is outside u64's).
+    pub fn layerMask(n: u32) u64 {
+        return if (n >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(n)) - 1;
     }
 
     pub fn nSliding(c: *const Config) u32 {
@@ -246,6 +251,16 @@ test "beam config: the release's config.json parses to Beam 1.0's served form" {
     try testing.expectEqual(@as(f32, 30), c.final_logit_softcapping);
     try testing.expectEqual(@as(u32, 2), Config.residualIndex(0, false));
     try testing.expectEqual(@as(u32, 105), Config.residualIndex(51, true));
+}
+
+test "beam config: the layer mask at every served depth, 64 layers included" {
+    try testing.expectEqual(@as(u64, 0), Config.layerMask(0));
+    try testing.expectEqual(@as(u64, 0x7f), Config.layerMask(7));
+    try testing.expectEqual(~@as(u64, 0) >> 1, Config.layerMask(63));
+    try testing.expectEqual(~@as(u64, 0), Config.layerMask(max_layers));
+    const c: Config = .{ .n_layers = max_layers, .full_mask = ~@as(u64, 0) };
+    try testing.expectEqual(@as(u32, 64), c.nFull());
+    try testing.expectEqual(@as(u32, 0), c.nSliding());
 }
 
 test "beam config: a config off the served form refuses by name" {
