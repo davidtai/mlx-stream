@@ -346,6 +346,19 @@ MLX_SERVE_GPU_CEILING_MB=245760 mlx-serve --model <pack> --serve --port 11391 --
    `expert-usage-v1.json` beside the pack (or in a copy of the pack with hard links). The next load reads it
    (`resident_seed: usage`, the default when the file is there).
 
+### The usage file (`usage`)
+
+The seeded start is the pack's default state. The pack directory holds `expert-usage-v1.json`: the usage record of
+one run of the coding workload on a cold start (the control's A run, seed 1234). At the load, the empty prompt rows of
+each layer get the layer's most used experts of the file. The first request keeps them. The file holds no prompt
+text: only the counts per layer and expert, and the label of the prompt set (`expert_usage_label`).
+
+- The converter (`scripts/prepare_nvfp4_pack.py`) does not write the file. A served run writes it
+  (`expert_usage_record`), and the pack directory gets it after that run.
+- A load without the file, or with `resident_seed: none`, starts cold: the first prompt reads every record once.
+- To measure a cold start and a seeded start on one pack, make a copy of the pack with hard links (no bytes copied) and
+  put the file in one copy only.
+
 The server lines of the first load:
 
 ```text
