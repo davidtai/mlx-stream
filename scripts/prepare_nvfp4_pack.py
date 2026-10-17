@@ -3,10 +3,10 @@
 
 The routed experts become one NVFP4 expert bank (experts.bin + expert-manifest.json, format
 mlx-stream-nvfp4-expert-bank-v1, layout nvfp4-gud-9part: src/arch/glm5_next/bank.zig is the spec); every other tensor
-becomes the residents (model.safetensors + index, each tensor's sha256 in the index). The residents tier (`--residents`):
-bf16 (the default) writes the release's bytes and dtypes, nothing quantized or rounded; q8 writes every linear of the
-trunk and the head as MLX affine 8-bit group 64 (packlib/affine.py: U32 codes, BF16 scales and biases; config.json
-`residents_format: affine8_g64`) and every other resident as released.
+becomes the residents (model.safetensors + index, each tensor's sha256 in the index). The residents tier
+(`--residents`): bf16 (the default) writes the release's bytes and dtypes, nothing quantized or rounded; q8 writes every
+linear of the trunk and the head as MLX affine 8-bit group 64 (packlib/affine.py: U32 codes, BF16 scales and biases;
+config.json `residents_format: affine8_g64`) and every other resident as released.
 
 Families (`--family`):
   beam       reflection/Beam-1.0-501B-A23B-NVFP4 at 3bd1dccf13c8f7aa3d6732c5aaa48ba107a2c086 (model_type beam). The
@@ -44,8 +44,8 @@ build.
              tokenizer files, generation_config.json and chat_template.jinja copied
   verify     the pack's file set, the config and the manifest against the spec, a seeded random sample of records
              against the source shards (bytes and manifest sha256), a dequant spot check of a few rows per projection,
-             every resident tensor's sha256 (and each q8 site quantized again from its source to the same bytes, within
-             1.5 scales of the release's values), then pack-sha256.txt
+             every resident tensor's sha256 (and each q8 site quantized again from its source to the same bytes, each
+             value within half a scale of the release's), then pack-sha256.txt
 
 --layers 0-N builds a slice: the first N + 1 layers (from 0, with a full_attention layer), config.json cut to them,
 the embedding, final norm and head kept, the manifest's source pin with "layers": [0, N] (docs/nvfp4-pack.md).
@@ -301,8 +301,9 @@ class Plan:
             if dt != "BF16":
                 raise PrepError(f"{n}: {dt}: the q8 residents tier quantizes BF16 projections")
             p, (out, inn) = n[:-len(".weight")], sh
-            self.layout += [(p + ".weight", "U32", [out, inn // 4]), (p + ".scales", "BF16", [out, inn // affine.GROUP]),
-                            (p + ".biases", "BF16", [out, inn // affine.GROUP])]
+            groups = [out, inn // affine.GROUP]
+            self.layout += [(p + ".weight", "U32", [out, inn // 4]), (p + ".scales", "BF16", groups),
+                            (p + ".biases", "BF16", groups)]
         self.expert_of = {}  # name -> (layer, expert, proj, kind)
         for layer in range(g.first, g.first + g.layers):
             for e in range(g.experts):
@@ -839,7 +840,7 @@ def verify_bank(a, ctx, plan):
 def verify_residents(ctx, plan):
     """Every tensor of model.safetensors against its read-back sha256 and the index's; each resident whose source shard
     is in SRC against it: a release tensor byte for byte, a q8 site quantized again from the source to the same bytes,
-    its codes within 1.5 scales of the release's values (packlib/affine.py `error`)."""
+    each value within half a scale of the release's and none past its group's code range (packlib/affine.py)."""
     sums = json.loads((ctx.work / "residents-sha256.json").read_text())
     idx = json.loads((ctx.out / "model.safetensors.index.json").read_text())
     names = {n for n, _, _ in plan.layout}
@@ -875,17 +876,19 @@ def verify_residents(ctx, plan):
             p = name[:-len(".weight")]
             for kind, arr in zip((".weight", ".scales", ".biases"), q):
                 if hashlib.sha256(arr.tobytes()).hexdigest() != sums[p + kind]:
-                    raise PrepError(f"model.safetensors {p + kind} is not the q8 tier's quantization of {shard}'s {name}")
-            rel, worst = affine.error(w, *q)
-            if worst > 1.5:
-                raise PrepError(f"{name}: a q8 value is {worst:.3f} scales off the release's (the bound is 1.5)")
-            errors.append((rel, worst))
+                    raise PrepError(f"model.safetensors {p + kind} is not the q8 quantization of {shard}'s {name}")
+            rel, inside, past = affine.error(w, *q)
+            if inside > 0.5 + 1e-3 or past > 0:
+                raise PrepError(f"{name}: a q8 value is {inside:.4f} scales off the release's, {past:.4f} past its "
+                                f"group's code range (the rule gives at most 0.5, none past)")
+            errors.append((rel, inside, past))
     finally:
         for f in src.values():
             f.close()
     ctx.log("verify", "residents", tier=plan.tier, tensors=len(plan.layout), against_source=len(src),
             quantized_checked=len(errors), q8_rel_rms_max=max((e[0] for e in errors), default=0.0),
-            q8_scales_off_max=max((e[1] for e in errors), default=0.0))
+            q8_inside_scales_max=max((e[1] for e in errors), default=0.0),
+            q8_past_range_scales_max=max((e[2] for e in errors), default=0.0))
 
 
 def step_verify(a, ctx):
@@ -953,8 +956,8 @@ def parse_args(argv):
                    help="seed of the keep set (seed), the parity sample (seed + 1) and the dequant rows (seed + 2)")
     g.add_argument("--settings", metavar="JSON", help="a JSON object written verbatim as expert_streaming.settings")
     g.add_argument("--residents", choices=("bf16", "q8"), default="bf16",
-                   help="the residents tier: bf16 (default) the release's tensors; q8 every linear of the trunk and the "
-                        "head as MLX affine 8-bit group 64 (config.json residents_format affine8_g64)")
+                   help="the residents tier: bf16 (default) the release's tensors; q8 every linear of the trunk and "
+                        "the head as MLX affine 8-bit group 64 (config.json residents_format affine8_g64)")
     g.add_argument("--bank-from", metavar="PACK",
                    help="bank: hard-link experts.bin and expert-manifest.json from PACK (same release, slice and "
                         "geometry; one filesystem) instead of building them; the shard pass takes the residents only")

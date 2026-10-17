@@ -37,7 +37,7 @@ residents are not quantized and the manifest holds the bank's quantization. mlx-
 | tier | residents | class against the release |
 |---|---|---|
 | `bf16` (the default) | Each tensor has the bytes and the dtype of the checkpoint. Nothing is quantized. | The release's weights. |
-| `q8` | The weight of each linear of the trunk and the head is MLX's affine 8-bit, group 64. The other residents are as released: the embedding (a lookup), the norms, the gate biases, the routers (F32). | Rounding-class: a value is at most 1.5 scales from the release's value. |
+| `q8` | The weight of each linear of the trunk and the head is MLX's affine 8-bit, group 64. The other residents are as released: the embedding (a lookup), the norms, the gate biases, the routers (F32). | Rounding-class: each value is within half a scale of the release's value. |
 
 A q8 projection `W` [out, in] becomes three tensors. MLX's `quantized_matmul` and `dequantize` (mode `affine`, bits 8,
 group size 64) read them as they are.
@@ -48,15 +48,20 @@ group size 64) read them as they are.
 | `<prefix>.scales` | BF16 | [out, in / 64] | One scale s for each group of 64 inputs. |
 | `<prefix>.biases` | BF16 | [out, in / 64] | One bias b for each group. |
 
-The value of a code is s x q + b. `scripts/packlib/affine.py` makes the tensors on the CPU. For each group it takes
-the scale and the bias of MLX's `affine_quantize` (mlx-src 64ea011cb, `mlx/backend/metal/kernels/quantized.h`, lines
-2604-2627): the group's maximum from 0, its minimum, the scale (maximum - minimum) / 255 with the sign of the edge of
-larger magnitude, the bias at that edge, and 0 at a code. It rounds the scale and the bias to BF16 (nearest even). Then
-it takes each code nearest to the release's value under the rounded scale and bias (half to even), in 0 .. 255. MLX
-takes the codes from the scale and the bias before they are rounded. The rounded pair gives less error. On Beam's
-weights the relative RMS error is 0.54-0.63 % with the rounded pair and 0.69-0.84 % with MLX's codes. The script is
-deterministic: the same release gives the same bytes. On the M5 Ultra, MLX's `dequantize` of these tensors equals
-bf16(s x q + b) of the script's values for each value.
+The value of a code is s x q + b. `scripts/packlib/affine.py` makes the tensors on the CPU. For each group of 64:
+
+- b is the group's minimum. It is a BF16 value of the release, so b holds it exactly.
+- s is the smallest BF16 that is not less than (maximum - minimum) / 255, and at least 1e-7.
+- Each code is the nearest to the release's value (half to even).
+
+Thus the group's maximum is at most code 255, and no value is clipped. Each value is within half a scale of the
+release's value (and the f32 rounding of s x q + b). MLX's own quantize (mlx-src 64ea011cb,
+`mlx/backend/metal/kernels/quantized.h` `affine_quantize`) puts the bias at the edge of larger magnitude and makes 0 a
+code. It takes the codes before it rounds the scale and the bias to BF16. Thus it can clip the far edge of a group by up
+to 1.5 codes. On Beam's weights the relative RMS error of this rule is 0.54-0.63 %, and its largest error is about half
+that of MLX's codes. MLX's own codes give 0.69-0.84 %. The script is deterministic: the same release gives the same
+bytes. On the M5 Ultra, MLX's `dequantize` of these tensors equals bf16(s x q + b) of the script's values for each
+value.
 
 | `--family beam` | tensors | `model.safetensors` |
 |---|---|---|
@@ -134,8 +139,8 @@ The steps of `all`, in order. Each step is also a subcommand.
    against the records made again from the source shards, byte for byte; for three of them, four rows of each
    projection dequantized both ways (the checkpoint's and the bank's, within 2 f32 ulps); every resident tensor's
    sha256 (the read-back and the index's); each resident against its source shard when the shard is in `SRC` (a
-   release tensor byte for byte, a q8 projection quantized again to the same bytes and within 1.5 scales of the
-   release); then `pack-sha256.txt`. With `--delete-verified` it then deletes the keep set.
+   release tensor byte for byte, a q8 projection quantized again to the same bytes, each value within half a scale
+   of the release's); then `pack-sha256.txt`. With `--delete-verified` it then deletes the keep set.
 
 The script also refuses: a missing or an extra tensor in the index or a shard; an E4M3 block scale that is NaN; a
 quantization that is not NVFP4 with group size 16; a resident linear that `hf_quant_config.json` does not exclude

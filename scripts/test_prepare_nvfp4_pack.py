@@ -25,7 +25,7 @@ sys.dont_write_bytecode = True
 import beam_fixture as fx  # noqa: E402
 import prepare_nvfp4_pack as conv  # noqa: E402
 from packlib import PrepError, affine, manifest  # noqa: E402
-from packlib.st import E2M1, E4M3, StFile, bf16_rne  # noqa: E402
+from packlib.st import E2M1, E4M3, StFile  # noqa: E402
 
 BANK_ZIG = HERE.parent / "src" / "arch" / "glm5_next" / "bank.zig"
 SEED = 7
@@ -398,21 +398,17 @@ class Slice(unittest.TestCase):
 
 
 def q8_group(vals):
-    """The q8 tier's rule for one group of 64 release values (exact f32), scalar: MLX's scale and bias in f32 (the
-    maximum from 0, the minimum, the scale signed to the larger edge, 0 a code), both rounded to BF16, each code the
-    nearest (half to even) under the rounded pair, clipped to 0 .. 255. Returns (codes, scale bits, bias bits)."""
-    f = np.float32
-    hi, lo = max(f(0), max(vals)), min(vals)
-    scale = max(f(f(hi - lo) / f(255)), f(1e-7))
-    side = abs(lo) > abs(hi)
-    scale = scale if side else f(-scale)
-    edge = lo if side else hi
-    q0 = np.round(f(edge / scale))
-    scale, bias = (f(edge / q0), edge) if q0 != 0 else (scale, f(0))
-    sb, bb = int(bf16_rne(np.array([scale], f))[0]), int(bf16_rne(np.array([bias], f))[0])
-    s = float(np.array([sb << 16], np.uint32).view(f)[0])
-    b = float(np.array([bb << 16], np.uint32).view(f)[0])
-    return [min(255, max(0, round((float(v) - b) / s))) for v in vals], sb, bb
+    """The q8 tier's rule for one group of 64 release values (exact f32), scalar: the bias the group's minimum, the
+    scale the smallest BF16 not less than (maximum - minimum) / 255 (at least 1e-7), each code the nearest (half to
+    even). Returns (codes, scale bits, bias bits)."""
+    lo, hi = min(vals), max(vals)
+    need = max((float(hi) - float(lo)) / 255.0, float(np.float32(1e-7)))
+    sb = int(np.array([np.float32(need)], np.float32).view(np.uint32)[0]) >> 16
+    while float(np.array([sb << 16], np.uint32).view(np.float32)[0]) < need:
+        sb += 1
+    s = float(np.array([sb << 16], np.uint32).view(np.float32)[0])
+    bb = int(np.array([lo], np.float32).view(np.uint32)[0]) >> 16
+    return [min(255, max(0, round((float(v) - float(lo)) / s))) for v in vals], sb, bb
 
 
 Q8_SITES = [f"model.layers.{li}.self_attn.{p}_proj.weight" for li in range(fx.L) for p in ("q", "k", "v", "gate", "o")]
@@ -461,10 +457,11 @@ class Q8Residents(unittest.TestCase):
                     for gi in range(inn // 64):
                         want, sb, bb = q8_group(list(vals[r, gi * 64:(gi + 1) * 64]))
                         self.assertEqual(codes[r, gi * 64:(gi + 1) * 64].tolist(), want, f"{name} row {r} group {gi}")
-                        self.assertEqual((int(scales[r, gi]), int(biases[r, gi])), (sb, bb), f"{name} row {r} group {gi}")
-                rel, worst = affine.error(np.asarray(arr, np.uint16), words, scales, biases)
+                        self.assertEqual((int(scales[r, gi]), int(biases[r, gi])), (sb, bb), f"{name} {r} {gi}")
+                rel, inside, past = affine.error(np.asarray(arr, np.uint16), words, scales, biases)
                 self.assertLess(rel, 0.008, name)
-                self.assertLessEqual(worst, 1.5, name)
+                self.assertLessEqual(inside, 0.5 + 1e-6, name)
+                self.assertEqual(past, 0.0, name)
         finally:
             sf.close()
 
@@ -477,7 +474,8 @@ class Q8Residents(unittest.TestCase):
             for n, (dtype, shape, arr) in kept.items():
                 self.assertEqual((sf.header[n]["dtype"], sf.header[n]["shape"]), (dtype, shape), n)
                 self.assertEqual(bytes(sf.raw_bytes(n)), np.ascontiguousarray(arr).tobytes(), n)
-            for n in ("model.embed_tokens.weight", "model.layers.4.mlp.gate.weight", "model.layers.4.self_attn.gate_bias"):
+            for n in ("model.embed_tokens.weight", "model.layers.4.mlp.gate.weight",
+                      "model.layers.4.self_attn.gate_bias"):
                 self.assertIn(n, kept)
             idx = json.loads((self.q8 / "model.safetensors.index.json").read_text())
             self.assertEqual(set(idx["weight_map"]), set(sf.header))
