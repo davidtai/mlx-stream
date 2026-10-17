@@ -165,17 +165,11 @@ pub fn chainDrafts(comptime Ops: type, g: *Ops, head: anytype, x0: Ops.T, start:
     _ = try g.hostF32(q_all, q_out[0..depth]);
 }
 
-/// The draft gate (`settings.draft_gate`, theta): of a round's `q.len` drafts, the leading ones whose cumulative top-1
-/// probability q_1 x .. x q_s stays at or above theta are verified, the rest dropped (the verify's rows saved). theta 0
-/// (the default, off) keeps every draft. The products only fall, so the first one under theta ends the prefix.
+/// The draft gate (`settings.draft_gate`, theta): the shared seam's (`mimo_v2/draft.zig` `gatedDrafts`) over a round's
+/// head top-1 probabilities, at most `max_depth` of them.
 pub fn gatedDrafts(q: []const f32, theta: f32) u32 {
     std.debug.assert(q.len <= max_depth);
-    var cum: f32 = 1;
-    for (q, 0..) |p, s| {
-        cum *= p;
-        if (cum < theta) return @intCast(s);
-    }
-    return @intCast(q.len);
+    return mimo_draft.gatedDrafts(q, theta);
 }
 
 /// The request's acceptance by draft position and the head's top-1 probability q (the calibration the draft gate reads):
