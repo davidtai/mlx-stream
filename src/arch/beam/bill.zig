@@ -109,9 +109,10 @@ pub fn routerRowBytes(c: *const beam.Config) u64 {
     return @as(u64, c.hidden_size) * f32b + 7 * e * f32b + e + 6 * ng * f32b + 4 * @as(u64, c.n_experts_per_tok) * f32b;
 }
 
-/// One MoE row (the routed call's output beside the router): the router, the routed sum and its scaled f32 and bf16.
+/// One MoE row (the routed call's output beside the router): the router, the routed sum and its scaled copy (bf16: one
+/// compiled kernel).
 pub fn moeRowBytes(c: *const beam.Config) u64 {
-    return routerRowBytes(c) + @as(u64, c.hidden_size) * (bf16 + f32b + bf16);
+    return routerRowBytes(c) + @as(u64, c.hidden_size) * 2 * bf16;
 }
 
 /// The prompt pass's wave at its widest call (`t` rows over `keys` keys): the call's stream (the layer's input, its

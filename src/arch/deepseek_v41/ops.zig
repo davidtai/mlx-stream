@@ -133,7 +133,7 @@ fn freeFrom(comptime E: type, list: *std.ArrayList(E), from: usize, comptime fre
 
 /// The compiled regions a model builds at construction (`prepareTape`), one
 /// closure per region and context (the trunk's config, the draft head's).
-pub const Region = enum { attn_core, qkv_prep, out_prep, gate_prefix, moe_combine, hc_attn_prep, hc_ffn_prep, hc_post, seg2, seg3, draft_kv, markov_step, confidence, shared_mid, beam_depth_add };
+pub const Region = enum { attn_core, qkv_prep, out_prep, gate_prefix, moe_combine, hc_attn_prep, hc_ffn_prep, hc_post, seg2, seg3, draft_kv, markov_step, confidence, shared_mid, beam_depth_add, beam_scale };
 const n_regions = std.meta.fieldNames(Region).len;
 const contexts_per_region = 2;
 

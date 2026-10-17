@@ -385,15 +385,28 @@ fn sdpa(g: *G, q: T, k: T, v: T, scale: f32, mode: [*:0]const u8, mask: T) !T {
     return g.adopt(o);
 }
 
-/// `x` bf16 times an f32 constant, rounded once to bf16 (a bf16 tensor times a Python float in the reference).
-fn scaleBf16(g: *G, x: T, v: f64) !T {
-    return scaleBy(g, x, try g.scalar(v, .float32));
-}
-
-/// `x` bf16 times the f32 array `s` (broadcast), rounded once to bf16.
-fn scaleBy(g: *G, x: T, s: T) !T {
+/// `x` bf16 times the f32 array `s` (broadcast), rounded once to bf16 (a bf16 tensor times a Python float, or the f32
+/// query scale, in the reference).
+pub fn scaleBy(g: *G, x: T, s: T) !T {
     return g.astype(try g.mul(try g.astype(x, .float32), s), .bfloat16);
 }
+
+/// `scaleBy` as one compiled kernel (`ScaleBy`): the f32 copy and the f32 product in registers.
+fn scaled(g: *G, c: *const beam.Config, x: T, s: T) !T {
+    var o: [1]T = undefined;
+    try g.tape(ScaleBy, c, &.{ x, s }, &o);
+    return o[0];
+}
+
+const ScaleBy = struct {
+    pub const region: ops_be.Region = .beam_scale;
+    pub const Ctx = beam.Config;
+    pub const n_out = 1;
+    pub const shapeless = true;
+    pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
+        out[0] = try scaleBy(g, in[0], in[1]);
+    }
+};
 
 /// The depth-scaled residual add of sublayer index `i`: h / sqrt(i) + r * sqrt((i - 1) / i), each product rounded to
 /// bf16 (the reference's two scalar multiplies), then their bf16 sum. One compiled kernel (`DepthAdd`): the scales are
@@ -427,10 +440,11 @@ const DepthAdd = struct {
 /// builds its kernels at the load and not in the first request.
 pub fn prepareFused(g: *G, c: *const beam.Config) !void {
     try g.prepareTape(DepthAdd, c);
+    try g.prepareTape(ScaleBy, c);
     const m = g.mark();
     defer g.resetTo(m);
     const row = try g.zeros(&.{ 1, @intCast(c.hidden_size) }, .bfloat16);
-    try g.evalAll(&.{try depthAdd(g, c, row, row, 2)});
+    try g.evalAll(&.{ try depthAdd(g, c, row, row, 2), try scaled(g, c, row, try g.scalar(c.routed_scaling, .float32)) });
 }
 
 /// The full layers' query scale at rows [pos, pos + n): (1 + (p + 1) / 2048) ^ 0.1, f32 [1, 1, n, 1].
@@ -679,7 +693,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             const r = if (comptime @TypeOf(force) == void) try route(g, c, lw.router.?, h) else try forcedRoute(g, c, lw.router.?, h, force, l, start);
             if (prompt) try g.asyncEval(&.{ r.indices, r.weights });
             const routed = try g.adopt(try src.forward(l, h, r.indices, r.weights));
-            break :blk try scaleBf16(g, routed, c.routed_scaling);
+            break :blk try scaled(g, c, routed, try g.scalar(c.routed_scaling, .float32));
         };
         const x2 = try depthAdd(g, c, try rmsNorm(g, f, lw.post_ff_norm, c.rms_norm_eps), x1, beam.Config.residualIndex(l, true));
         const next = g.keep(x2);
@@ -815,6 +829,26 @@ test "beam graph GPU: the depth-scaled add's one kernel is the op chain bit for 
             const want = try depthAddChain(&g, x, r, try g.scalar(1.0 / @sqrt(fi), .float32), try g.scalar(@sqrt((fi - 1.0) / fi), .float32));
             try expectBits("depth_add", &g, want, try depthAdd(&g, &c, x, r, i));
         }
+    }
+}
+
+test "beam graph GPU: the routed output's scale is one kernel, the op chain bit for bit (a step's row, a call)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try G.init(a, stream);
+    defer g.deinit();
+    const c: beam.Config = .{};
+    try prepareFused(&g, &c);
+    const h: c_int = @intCast(c.hidden_size);
+    for ([_]c_int{ 1, 61, 16_384 }, 0..) |rows, i| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const x = try testBf16(a, &g, &.{ rows, h }, 1.0, 500 + i);
+        const s = try g.scalar(c.routed_scaling, .float32);
+        try expectBits("routed_scale", &g, try scaleBy(&g, x, s), try scaled(&g, &c, x, s));
     }
 }
 
