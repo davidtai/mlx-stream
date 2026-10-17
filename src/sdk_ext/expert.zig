@@ -145,6 +145,12 @@ pub const Stats = struct {
     /// Prompt records copied from a transient row into a resident's row (`Stream.promote`) and their bytes.
     promoted: u64 = 0,
     promoted_bytes: u64 = 0,
+    /// P6 (`Options.prompt_stage_rows`): records read into the staging rows and their bytes (in `expert_bytes_read`
+    /// too), the call's loads copied from a staged row in place of a read, and the staged records no load copied.
+    staged: u64 = 0,
+    staged_bytes: u64 = 0,
+    stage_copies: u64 = 0,
+    stage_unused: u64 = 0,
 
     /// The counters since `prev`, an earlier snapshot of the same stream: each field's difference, at least zero.
     pub fn since(s: Stats, prev: Stats) Stats {

@@ -75,6 +75,22 @@ rows, at most 2 tiles in flight. The dense MLP runs in tiles of 2,048 rows. Befo
 predictor posts the layer's predicted experts to the stream (MiMo's read-ahead). The routed MLP runs over the call's
 rows on the wide lane.
 
+### The staged reads (P6)
+
+The read-ahead reads only into empty prompt rows. With the usage seed, every prompt row holds a resident at the load.
+Thus the read-ahead reads nothing, and a 16K call reads its 84 misses a layer only after its plans: the drive is idle
+through each layer's attention, and the GPU waits for the reads in the MoE stage.
+
+The stream has 64 staging rows (`experts.zig` `prompt_stage_rows`; host pages, 1.42 GB). When a layer has no empty
+prompt row, its read-ahead reads its predicted experts that are not resident into the staging rows, hottest first,
+while the attention runs. At the call's posts, a load of a staged expert copies the staged row into its planned row on
+the copier thread and reads nothing; the load's waits and its gate hold until the copy is done. The plans, the slots
+and the kernels do not change, and each planned row holds its record's bytes before a kernel reads it: the change is
+exact. The staging rows go at the phase change with the prompt's transient rows and come back with them.
+
+The prompt pass's end writes one line: `beam prompt: tokens= wall_s= ssd_bytes= ahead_posted= ahead_dropped= staged=
+stage_copies= stage_unused= loads= skipped=`.
+
 Decode is serial: one row a step. The routed call takes MiMo's decode lane. Its routing barrier is the only host-GPU
 synchronization before the logits. There is no draft lane: `draft_lane.arm` binds the plugin's sampler and answers
 `off`.
@@ -138,6 +154,7 @@ One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV qua
 | `resident_wiring`, `buffer_allowance` | The wiring of the wired bytes. DeepSeek's measured cost for each live buffer. |
 | `request`, `request_wiring` | The prompt wave at the widest call, the decode wave, and their wiring. |
 | `sampler`, `gpu_warm` | The plugin's sampler. MiMo's keep-warm engine when it is on. |
+| `slot_stage` | The staging rows (P6): 64 slot rows and a page a component, in the prompt phase only. |
 
 The fill gives the most decode rows and prompt rows that fit the host's ceiling less its wired margin. The floor is 8
 rows. On the 256 GB M5 Ultra (ceiling 240 GiB, margin 2 GiB, baseline 12.6 GB, context 32,768) the bill test prints
