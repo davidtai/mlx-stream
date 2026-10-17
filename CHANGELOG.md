@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Reflection Beam 1.0, the fifth arch (`beam`, src/arch/beam/, docs/beam.md): the 12,544 routed experts stream from
+  the SSD as an NVFP4 expert bank (`experts.bin`, format `mlx-stream-nvfp4-expert-bank-v1`, layout `nvfp4-gud-9part`)
+  through MiMo's expert route; the trunk (sandwich norms, depth-scaled residual adds, sliding attention with RoPE and
+  full attention with the scalable-softmax query scale, a per-head output gate, f32 SwiGLU, the soft-capped head) is
+  resident in BF16. Decode is serial on MLX's stock nvfp4 `gather_qmm`; there is no draft lane. The arch claims only
+  a prepared pack (`model_type: beam` plus the `expert_streaming` block). `scripts/beam_reference_logits.py` and
+  `src/arch/beam/parity.zig` (`BEAM_PARITY`, `BEAM_PARITY_REF`) compare the served logits with a numpy reference.
+- The NVFP4 bank and its projection format move to `src/expert/nvfp4_bank.zig` and `nvfp4_format.zig`, geometry-free
+  (`Geometry.require` checks a model's topology); MiMo's expert route as the NVFP4 arches install it moves to
+  `src/arch/mimo_v2/route.zig` and its bill terms to `route_bill.zig`; the residents' header scan, the settings
+  helpers, `expert_rows_by_layer`'s split and the tally / usage lifecycle move to `src/sdk_ext/`. glm5_next uses each
+  with its bill, its manifests and its refusals unchanged. `sdk_ext.quant` gains the `swiglu_f32` activation. MiMo's
+  stock combine takes the call's top-k; the prefill combine text takes the bank's hidden size.
 - MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
   as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
   DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the
