@@ -6,8 +6,10 @@
 //! pipelined drains) and MiMo's prompt combine (`mimo_v2/prefill_combine`: the in-place text over the wide call's
 //! sources). The decode lane takes the construction's route (`settings.DecodeMoe`): the fused qmv texts over the three
 //! banks at once (decode_kernels.zig, the shared scheduler's banked waves: one launch of gate/up and one of down per
-//! wave), or MLX's gathers (`gather_qmm` nvfp4 with each slot's global scale) per bank; the fused rows are the stock
-//! route's bit for bit. The activation is the f32 SwiGLU (`sdk_ext.quant.Activation.swiglu_f32`).
+//! wave), with the hit wave from the layer's resident slot LUT on the device (`hitpass`, the scheduler's DEVROUTE, as
+//! glm5_next installs it) or built by the host after the ids (`fused`); or MLX's gathers (`gather_qmm` nvfp4 with each
+//! slot's global scale) per bank. The three routes' rows are the same bits. The activation is the f32 SwiGLU
+//! (`sdk_ext.quant.Activation.swiglu_f32`).
 //! A routed call's output is the weighted sum of its experts [nt, H] bf16 (the weights the router's normalized scores);
 //! the trunk multiplies it by `routed_scaling_factor`.
 
@@ -42,8 +44,8 @@ pub const top_k: u32 = 8;
 pub const max_experts: u32 = 256;
 /// The prompt pass's calls: at most this many rows each (MiMo's: the expert math's row scratch holds one call).
 pub const call_rows: u32 = 16_384;
-/// The NVFP4 format with the fused qmv decode texts (installed under `decode_moe: fused`), prompt calls of at most
-/// `call_rows` rows.
+/// The NVFP4 format with the fused qmv decode texts (installed under `decode_moe: hitpass` and `fused`), prompt calls of
+/// at most `call_rows` rows.
 pub const Format = nvfp4_format.FormatOf(.{ .Fused = decode_kernels.FusedDecode, .max_call_tokens = call_rows });
 /// The bridge over the NVFP4 bank: its {w, scales, global_scale} slot bindings, its read pool's staging.
 pub const B = bridge.For(bank, .{ .Arrays = bank.Arrays, .staging_bytes = settings.reader_staging_bytes });
@@ -160,9 +162,10 @@ pub const Source = struct {
         math.bank_view = try Math.bankViewsOf(route.bank_view);
         // The lookahead's scores on the routers' stored F32 weights ([experts, hidden]: no copy).
         math.predictor = .{ .scores = route.scoresStored };
-        // The decode lane's route: the fused qmv texts installed here (the model's geometry against the set's, the set's
-        // compile self-check, the launches prepared per wave width), refused by name; the stock gathers otherwise.
-        if (decode_moe == .fused) {
+        // The decode lane's route: the fused qmv texts installed here under `hitpass` and `fused` (the model's geometry
+        // against the set's, the set's compile self-check, the launches prepared per wave width), refused by name; the
+        // stock gathers otherwise.
+        if (decode_moe != .stock) {
             var diag: sdk.Diag = .{};
             math.fused = decode_kernels.FusedDecode.install(a, stream, geo.hidden_size, geo.intermediate_size, k, .swiglu_f32, &diag) catch |e| {
                 log.err("beam: the fused decode route refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
@@ -183,10 +186,11 @@ pub const Source = struct {
             .n_routed_experts = geo.num_experts,
             .n_experts_per_tok = k,
         };
-        self.ex = try Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true }, .banked = decode_moe == .fused });
+        self.ex = try Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true }, .banked = decode_moe != .stock, .devroute = decode_moe == .hitpass });
         errdefer self.ex.deinit();
         if (self.combine_route == .inplace) self.ex.setJoinlessBound(prefill_combine.inplace_sources);
         log.info("beam experts: NVFP4 g16 bank {d} x {d} records of {d} B (scale lines isolated, {d}-byte lines); decode_moe={s} ({s}); prompt_combine={s}; {s}\n", .{ geo.num_moe_layers, geo.num_experts, geo.record_bytes, bank.scale_line_bytes, @tagName(decode_moe), switch (decode_moe) {
+            .hitpass => "the qmv texts over the three banks; each call's hit wave from the layer's resident slot LUT behind the routing barrier, the miss parts after the route",
             .fused => "the qmv texts over the three banks, one launch of gate/up and one of down per wave",
             .stock => "MLX's gather_qmm nvfp4 per bank",
         }, @tagName(self.combine_route), expert_usage.promptResidentsLine("beam", prompt_residents) });

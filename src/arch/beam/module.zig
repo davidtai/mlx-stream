@@ -95,7 +95,7 @@ pub const Module = struct {
         // `decode_moe`: the DEFAULT resolves to the stock route where the fused set is not registered or on a CPU
         // stream, once, with one line.
         const decode_moe = try self.c.decodeMoeRoute(gpu_warm.gpuStream(s));
-        if (decode_moe != self.c.decode_moe) log.info("beam route decode_moe=stock reason=default fused {s}\n", .{if (self.c.fusedRegistered()) "on a CPU stream (the texts need a GPU stream)" else "is not registered at this model's routed experts"});
+        if (decode_moe != self.c.decode_moe) log.info("beam route decode_moe=stock reason=default {s}: the fused texts {s}\n", .{ @tagName(self.c.decode_moe), if (self.c.fusedRegistered()) "need a GPU stream" else "are not registered at this model's routed experts" });
         const want: experts.bank.Topology = .{ .hidden_size = model.hidden_size, .intermediate_size = model.moe_intermediate_size, .num_experts = model.n_routed_experts, .first_moe_layer = model.first_k_dense, .num_moe_layers = n_moe };
         self.src = try experts.Source.init(gpa, io, dir, want, model.n_experts_per_tok, prompt_rows, decode_rows, self.gates, s, warm_route, self.c.tally, self.c.prompt_residents, decode_moe);
         errdefer self.src.deinit();
