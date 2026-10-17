@@ -207,6 +207,10 @@ test "beam decode bench GPU: the fused qmv texts against the stock gathers per r
     if (!mlx.streamIsGpu(stream)) return error.SkipZigTest;
     var old_limit: usize = 0;
     _ = mlx.mlx_set_cache_limit(&old_limit, 512 << 20);
+    defer {
+        var ignored: usize = 0;
+        _ = mlx.mlx_set_cache_limit(&ignored, old_limit);
+    }
     var g = try G.init(a, stream);
     defer g.deinit();
     const geo = try bank.inspect(a, testing.io, dir);
