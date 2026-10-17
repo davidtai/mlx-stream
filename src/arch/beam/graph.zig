@@ -33,6 +33,8 @@ const mimo = @import("../mimo_v2/config.zig");
 const kv = @import("../mimo_v2/kv.zig");
 const beam = @import("config.zig");
 const experts = @import("experts.zig");
+/// Profile builds only: MiMo's prompt-pass timeline's stage marks (a no-op outside a recorded prompt pass).
+const ptl = @import("../mimo_v2/prefill_timeline.zig");
 
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
@@ -618,7 +620,12 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         const l: u32 = @intCast(li);
         const m = g.mark();
         defer g.resetTo(m);
+        if (comptime ptl.enabled) {
+            ptl.layer(l);
+            ptl.stage(.predict);
+        }
         if (prompt and lw.router != null) try postReadAhead(g, c, lw, l, x, src);
+        if (comptime ptl.enabled) ptl.stage(.attn);
         // The attention, tile by tile (the rings and slabs carry from one tile to the next); in a prompt call each tile
         // is committed as built and the tile before it waited, so at most `tiles_in_flight` run at once.
         const xn = try rmsNorm(g, x, lw.input_norm, c.rms_norm_eps);
@@ -637,6 +644,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             if (i > 0) try g.evalAll(&.{outs[i - 1]});
         }
         const attn = if (n_tiles == 1) outs[0] else try g.concat(outs[0..n_tiles], 0);
+        if (comptime ptl.enabled) ptl.stage(if (lw.dense != null) .dense else .router);
         const x1 = try depthAdd(g, try rmsNorm(g, attn, lw.post_attn_norm, c.rms_norm_eps), x, beam.Config.residualIndex(l, false));
         const h = try rmsNorm(g, x1, lw.pre_ff_norm, c.rms_norm_eps);
         const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, h, rows) else try mlp(g, d, h)) else blk: {
@@ -652,6 +660,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         // MiMo's tail: a prompt layer's output evaluated before the next layer starts (bounding its graph), then the
         // pooled scratch's purge. A decode step's stays lazy: the next routing barrier evaluates it.
         if (prompt) {
+            if (comptime ptl.enabled) ptl.stage(.tail);
             g.resetTo(m);
             for (outs[0..n_kept]) |o| g.release(o);
             n_kept = 0;
@@ -659,6 +668,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             src.promptLayerEnd();
         }
     }
+    if (comptime ptl.enabled) ptl.leaveLayers();
     cache.len = start + rows;
     if (head == .all) return g.keep(try logitsOf(g, c, w, x));
     const last = try g.slice(x, &.{ @intCast(rows - 1), 0 }, &.{ @intCast(rows), hidden }, &.{ 1, 1 });
