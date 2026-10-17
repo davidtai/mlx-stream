@@ -397,7 +397,7 @@ fn servedLogits(a: std.mem.Allocator, dir: []const u8, prefix: []const u8, rows:
     return out;
 }
 
-test "beam parity: on the real-weight slice the fused decode experts give the stock route's logits, bit for bit (BEAM_PARITY_SLICE, BEAM_PARITY_SLICE_REF)" {
+test "beam parity: on the real-weight slice the fused decode experts and the hit pass give the stock route's logits, bit for bit (BEAM_PARITY_SLICE, BEAM_PARITY_SLICE_REF)" {
     const dir = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE") orelse return error.SkipZigTest);
     const refs = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE_REF") orelse return error.SkipZigTest);
     const a = testing.allocator;
@@ -405,12 +405,15 @@ test "beam parity: on the real-weight slice the fused decode experts give the st
     while (it.next()) |prefix| {
         const stock = try servedLogits(a, dir, prefix, slice_rows, .stock);
         defer a.free(stock);
-        const fused = try servedLogits(a, dir, prefix, slice_rows, .fused);
-        defer a.free(fused);
-        var differ: usize = 0;
-        for (stock, fused) |x, y| differ += @intFromBool(@as(u32, @bitCast(x)) != @as(u32, @bitCast(y)));
-        std.debug.print("BEAM PARITY {s} fused vs stock decode experts: {d} logits, {d} differ\n", .{ std.fs.path.basename(prefix), stock.len, differ });
-        try testing.expectEqual(@as(usize, 0), differ);
+        // The slice at 64 of 256 rows: the stream misses and evicts, so the hit pass's LUTs follow the routes.
+        for ([_]settings.DecodeMoe{ .fused, .hitpass }) |route| {
+            const got = try servedLogits(a, dir, prefix, slice_rows, route);
+            defer a.free(got);
+            var differ: usize = 0;
+            for (stock, got) |x, y| differ += @intFromBool(@as(u32, @bitCast(x)) != @as(u32, @bitCast(y)));
+            std.debug.print("BEAM PARITY {s} {s} vs stock decode experts: {d} logits, {d} differ\n", .{ std.fs.path.basename(prefix), @tagName(route), stock.len, differ });
+            try testing.expectEqual(@as(usize, 0), differ);
+        }
     }
 }
 
