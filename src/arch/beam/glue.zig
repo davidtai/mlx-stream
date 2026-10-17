@@ -5,12 +5,14 @@
 //!     logits), or with the next routed layer's, then its sigmoid and correction (EPI 1: the predictor's scores); each
 //!     sum MLX's gemv at M = 1 (gemv_float32_bm1_bn8_sm1_sn32_tm4_tn4, the stock route's `astype` and `matmul`), in
 //!     `rows_per_group` rows of the weight a threadgroup;
-//!   - `glue_router_select`: the tail (sigmoid, correction, the group top-k, the top-k, the normalized weights).
+//!   - `glue_router_select`: the tail (sigmoid, correction, the group top-k, the top-k, the normalized weights);
+//!   - `glue_qk_norm`: a decode row's query and key heads normed (q_norm, k_norm), then RoPE on a sliding layer, or the
+//!     query's scale on a full layer (graph.zig `qkStock`: two norms and two ropes, or two norms and a scale).
 //! Stock: the router is the input cast, the GEMV and 17 ops (sigmoid, add, the groups' topk and sum, negation,
 //! argpartition, the group ids, equal, sum, greater, where, negation, argpartition, take_along_axis, sum, add, divide);
-//! the predictor is the cast, the GEMV, sigmoid and add. Exact: the ids, the weights and the predictor's scores are the
-//! stock route's bit for bit (`install`'s self-check over the first routed layers' tables; the device tests `beam glue
-//! GPU`). At M > 1 the router's product stays MLX's matmul (MLX routes [M > 1, D] x [D, E] f32 to its GEMM: reproduced
+//! the predictor is the cast, the GEMV, sigmoid and add. Exact: the ids, the weights, the predictor's scores and the
+//! normed heads are the stock route's bit for bit (`install`'s self-check over the model's own tables; the device tests
+//! `beam glue GPU`). At M > 1 the router's product stays MLX's matmul (MLX routes [M > 1, D] x [D, E] f32 to its GEMM: reproduced
 //! only by running it) and the select text takes its logits; the predictor keeps the stock route there. Installed once
 //! at construction (the geometry refused by name, the kernel objects, the launch configurations per decode-lane width,
 //! the self-check); the forward then dispatches with no per-call config work.
@@ -36,6 +38,8 @@ pub const max_rows: u32 = @import("experts.zig").decode_lane_rows;
 pub const rows_per_group: u32 = 2;
 /// The GEMV's threadgroup: MLX's bm1_bn8 block (8 simdgroups of 32 lanes, 4 columns a lane: 1,024 columns a block).
 pub const gemv_threads: u32 = 256;
+/// The q / k norm text's heads a threadgroup (one simdgroup a head).
+pub const heads_per_group: u32 = 8;
 
 // ── the texts and their pins (src/kernels/decode_glue/manifest_beam.json) ──
 
@@ -46,31 +50,34 @@ pub const texts = struct {
     pub const header = @embedFile(dir ++ "header_decode_glue.metal");
     pub const gemv = @embedFile(dir ++ "glue_router_gemv.metal");
     pub const select = @embedFile(dir ++ "glue_router_select.metal");
+    pub const qk = @embedFile(dir ++ "glue_qk_norm.metal");
 };
 /// sha256 of manifest_beam.json (scripts/decode_glue_manifest.py prints it), which records every text's sha256 (checked
 /// against the pins by a CPU test).
-pub const manifest_sha256 = "1d1b8316fecab645e309d8138251184b389a30cbdc30bc97074dd808efcd2942";
+pub const manifest_sha256 = "5cb39505ae53b4b13d77b84b9bb91a6199288f24d82e2312d7e9f7752e72e0d0";
 pub const text_pins = [_]kset.TextPin{
     .{ .file = "header_decode_glue.metal", .text = texts.header, .sha256 = "6bec0858b4e0754c74a4eee95560bd78f0942ecc092cc50d50bcc7840977e484" },
     .{ .file = "glue_router_gemv.metal", .text = texts.gemv, .sha256 = "1c82d26867b1c277adb2ca003200f6c05c3ecc396126b74ac571854b202bdcb7" },
     .{ .file = "glue_router_select.metal", .text = texts.select, .sha256 = "5a7369ad5c53e6eb5b08013219ad7731cfa797863599d9be8f2c2e4715bf47f6" },
+    .{ .file = "glue_qk_norm.metal", .text = texts.qk, .sha256 = "4118ee77c24b91bf6386e0bb28e84df8aeec27a87064387d29609339891c1067" },
 };
 
 pub fn checkPins() !void {
     return kset.checkTextPins(texts.manifest, manifest_sha256, &text_pins, error.BeamGlueManifestNotPinned, error.BeamGlueTextNotPinned);
 }
 
-/// A routed geometry the manifest registers (scripts/decode_glue_manifest.py `CASES`).
-pub const Geometry = struct { hidden: u32, experts: u32, groups: u32, kept_groups: u32, top_k: u32 };
+/// A model geometry the manifest registers (scripts/decode_glue_manifest.py `CASES`): the router's and the heads'.
+pub const Geometry = struct { hidden: u32, experts: u32, groups: u32, kept_groups: u32, top_k: u32, heads: u32, kv_heads: u32, head_dim: u32 };
 
-/// Beam 1.0's and the converter's fixture's (scripts/beam_fixture.py: hidden 256, 8 experts in 2 groups, 1 kept, top-2).
+/// Beam 1.0's and the converter's fixture's (scripts/beam_fixture.py: hidden 256, 8 experts in 2 groups, 1 kept, top-2,
+/// 4 / 2 heads of 64).
 pub const registered_geometries = [_]Geometry{
-    .{ .hidden = 5120, .experts = 256, .groups = 8, .kept_groups = 4, .top_k = 8 },
-    .{ .hidden = 256, .experts = 8, .groups = 2, .kept_groups = 1, .top_k = 2 },
+    .{ .hidden = 5120, .experts = 256, .groups = 8, .kept_groups = 4, .top_k = 8, .heads = 48, .kv_heads = 8, .head_dim = 128 },
+    .{ .hidden = 256, .experts = 8, .groups = 2, .kept_groups = 1, .top_k = 2, .heads = 4, .kv_heads = 2, .head_dim = 64 },
 };
 
 pub fn geometryOf(c: *const beam.Config) Geometry {
-    return .{ .hidden = c.hidden_size, .experts = c.n_routed_experts, .groups = c.n_group, .kept_groups = c.topk_group, .top_k = c.n_experts_per_tok };
+    return .{ .hidden = c.hidden_size, .experts = c.n_routed_experts, .groups = c.n_group, .kept_groups = c.topk_group, .top_k = c.n_experts_per_tok, .heads = c.n_heads, .kv_heads = c.n_kv_heads, .head_dim = c.head_dim };
 }
 
 /// The texts serve the model: its routed geometry is a registered one (each where MLX's gemv takes its bm1_bn8 route:
@@ -90,6 +97,9 @@ const Config = mlx.mlx_fast_metal_kernel_config;
 pub const Kernels = struct {
     gemv: Kernel = .{ .ctx = null },
     select: Kernel = .{ .ctx = null },
+    qk: Kernel = .{ .ctx = null },
+    /// The q / k norm text on a sliding layer (MODE 0) and a full one (MODE 1).
+    qk_cfg: [2]Config = @splat(.{ .ctx = null }),
     /// The GEMV at M = 1: the router's logits (EPI 0) and the predictor's scores (EPI 1).
     route_cfg: Config = .{ .ctx = null },
     pred_cfg: Config = .{ .ctx = null },
@@ -101,12 +111,15 @@ pub const Kernels = struct {
     hidden: u32 = 0,
     experts: u32 = 0,
     top_k: u32 = 0,
+    /// RoPE's log2(base) as MLX's host computes it (rope.cpp: std::log2 of the f32 base) and the norms' eps.
+    rope_log2: f32 = 0,
+    eps: f32 = 0,
 
     pub fn deinit(k: *Kernels) void {
-        for ([_]Kernel{ k.gemv, k.select }) |x| if (x.ctx != null) {
+        for ([_]Kernel{ k.gemv, k.select, k.qk }) |x| if (x.ctx != null) {
             mtl.mlx_fast_metal_kernel_free(x);
         };
-        for ([_]Config{ k.route_cfg, k.pred_cfg } ++ k.select_cfg) |cfg| if (cfg.ctx != null) {
+        for ([_]Config{ k.route_cfg, k.pred_cfg } ++ k.select_cfg ++ k.qk_cfg) |cfg| if (cfg.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         };
         if (k.consts.ctx != null) _ = mlx.mlx_array_free(k.consts);
@@ -136,6 +149,12 @@ pub const Launch = struct {
     pub fn select(experts: u32, rows: u32) Launch {
         return .{ .grid = .{ experts, rows, 1 }, .group = .{ experts, 1, 1 } };
     }
+
+    /// The q / k norm text: a simdgroup a head, `heads_per_group` heads a threadgroup.
+    pub fn qk(heads: u32) Launch {
+        const groups = (heads + heads_per_group - 1) / heads_per_group;
+        return .{ .grid = .{ 32 * heads_per_group * groups, 1, 1 }, .group = .{ 32 * heads_per_group, 1, 1 } };
+    }
 };
 
 fn newKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8) !Kernel {
@@ -156,6 +175,14 @@ fn gemvConfig(geo: Geometry, epi: i32) !Config {
     return kset.buildConfig(.{ .grid = l.grid, .threadgroup = l.group, .out_shapes = &.{&shape}, .out_dtypes = &.{.float32}, .template = &t });
 }
 
+fn qkConfig(geo: Geometry, mode: i32) !Config {
+    const l = Launch.qk(geo.heads + geo.kv_heads);
+    const qs = [_]c_int{ 1, @intCast(geo.heads), 1, @intCast(geo.head_dim) };
+    const ks = [_]c_int{ 1, @intCast(geo.kv_heads), 1, @intCast(geo.head_dim) };
+    const t = templateOf(&.{ "HQ", "HK", "HD", "HPG", "MODE" }, .{ @intCast(geo.heads), @intCast(geo.kv_heads), @intCast(geo.head_dim), @intCast(heads_per_group), mode });
+    return kset.buildConfig(.{ .grid = l.grid, .threadgroup = l.group, .out_shapes = &.{ &qs, &ks }, .out_dtypes = &.{ .bfloat16, .bfloat16 }, .template = &t });
+}
+
 fn selectConfig(geo: Geometry, rows: u32) !Config {
     const l = Launch.select(geo.experts, rows);
     const shape = [_]c_int{ @intCast(rows), @intCast(geo.top_k) };
@@ -164,8 +191,8 @@ fn selectConfig(geo: Geometry, rows: u32) !Config {
 }
 
 /// The model's tables the self-check runs over (construction only): the first routed layer's router (its F32 weight
-/// and correction bias) and the next routed layer's (the predictor's).
-pub const CheckTables = struct { w: T, bias: T, next_w: T, next_bias: T };
+/// and correction bias), the next routed layer's (the predictor's), and the first layer's q_norm and k_norm.
+pub const CheckTables = struct { w: T, bias: T, next_w: T, next_bias: T, q_norm: T, k_norm: T };
 
 /// The route's construction on the module's GPU stream `s` (refused by name: `diag`): the geometry, the two texts'
 /// kernel objects, the configs, then the self-check (`selfCheck`: Metal compiles each text at its first dispatch).
@@ -183,13 +210,15 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const beam.Config, t
         return error.BeamGlueNotGpu;
     }
     const geo = geometryOf(c);
-    var k: Kernels = .{ .hidden = geo.hidden, .experts = geo.experts, .top_k = geo.top_k };
+    var k: Kernels = .{ .hidden = geo.hidden, .experts = geo.experts, .top_k = geo.top_k, .rope_log2 = log2f(c.rope_theta), .eps = c.rms_norm_eps };
     errdefer k.deinit();
     k.gemv = try newKernel("beam_glue_router_gemv", &.{ "x", "w", "bias" }, &.{"out"}, texts.gemv);
     k.select = try newKernel("beam_glue_router_select", &.{ "logits", "bias", "consts" }, &.{ "ids", "weights" }, texts.select);
+    k.qk = try newKernel("beam_glue_qk_norm", &.{ "q", "k", "qw", "kw", "consts" }, &.{ "qo", "ko" }, texts.qk);
     k.route_cfg = try gemvConfig(geo, 0);
     k.pred_cfg = try gemvConfig(geo, 1);
     for (&k.select_cfg, 1..) |*cfg, m| cfg.* = try selectConfig(geo, @intCast(m));
+    for (&k.qk_cfg, 0..) |*cfg, mode| cfg.* = try qkConfig(geo, @intCast(mode));
     var cv: [8]f32 = @splat(0);
     cv[0] = 1;
     k.consts = mlx.mlx_array_new_data(&cv, &[_]c_int{8}, 1, .float32);
@@ -239,6 +268,27 @@ fn predictorScores(p: *const mimo_math.Predictor, g: *G, x: T, router: T, correc
     return out[0];
 }
 
+/// MLX's host computes RoPE's log2(base) with the C library's (rope.cpp `std::log2(base_)` on the f32 base).
+extern "c" fn log2f(x: f32) f32;
+
+pub const Heads = struct { q: T, k: T };
+
+/// A decode row's normed query and key heads: q [1, heads * head_dim], k [1, kv_heads * head_dim] bf16 (the fused
+/// projections' row views), the layer's q_norm and k_norm [head_dim] bf16, at position `pos` -> q [1, heads, 1,
+/// head_dim], k [1, kv_heads, 1, head_dim] bf16: roped on a sliding layer, the query times `scale` (the full layer's
+/// query scale, graph.zig `ssmaxAt`) on a full layer. One dispatch (graph.zig `qkStock`'s four or three).
+pub fn qkNorm(g: *G, k: *const Kernels, q: T, kk: T, q_norm: T, k_norm: T, pos: u32, full: bool, scale: f32) !Heads {
+    var cv: [8]f32 = @splat(0);
+    cv[0] = k.rope_log2;
+    cv[1] = scale;
+    cv[2] = k.eps;
+    cv[3] = @floatFromInt(pos);
+    const consts = try g.hostArray(std.mem.sliceAsBytes(&cv), &.{8}, .float32);
+    var out: [2]T = undefined;
+    try apply(g, k.qk, k.qk_cfg[@intFromBool(full)], &.{ q, kk, q_norm, k_norm, consts }, &out);
+    return .{ .q = out[0], .k = out[1] };
+}
+
 // ── the self-check (construction, once) ──
 
 /// A fixed bf16 row [1, n] for the self-check: values of a few magnitudes, both signs, and a few exact zeros.
@@ -284,8 +334,11 @@ fn stockRoute(g: *G, c: *const beam.Config, w: T, bias: T, x: T) !struct { logit
 /// byte for byte: the logits, the ids, the weights (M = 1), the predictor's scores; then the select text at the decode
 /// lane's widest call on MLX's logits of that many rows. Every text is dispatched (Metal compiles it here).
 pub fn selfCheck(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const beam.Config, k: *const Kernels, t: CheckTables, diag: ?*sdk.Diag) !void {
+    const graph = @import("graph.zig");
     var g = try G.init(a, s);
     defer g.deinit();
+    // The stock ops' compiled regions on this graph (the full layer's query scale is one).
+    try graph.prepareFused(&g, c);
     const x = try checkRow(&g, a, c.hidden_size);
     const stock = try stockRoute(&g, c, t.w, t.bias, x);
     var logits: [1]T = undefined;
@@ -305,19 +358,32 @@ pub fn selfCheck(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const beam.Config,
     const wf = try routeRows(&g, k, t.w, t.bias, xs, max_rows);
     try sameBytes(&g, "the router's ids at the lane's widest call", wide.ids, wf.ids, diag);
     try sameBytes(&g, "the router's weights at the lane's widest call", wide.weights, wf.weights, diag);
+    // The heads on a sliding layer and a full one, over the first layer's norms: rows of the fixed row's values, at a
+    // position inside the first window and one far past it.
+    const qn: c_int = @intCast(c.n_heads * c.head_dim);
+    const kn: c_int = @intCast(c.n_kv_heads * c.head_dim);
+    const row = try checkRow(&g, a, @intCast(qn + kn));
+    const q = try g.slice(row, &.{ 0, 0 }, &.{ 1, qn }, &.{ 1, 1 });
+    const kk = try g.slice(row, &.{ 0, qn }, &.{ 1, qn + kn }, &.{ 1, 1 });
+    for ([_]u32{ 300, 16_957 }) |pos| for ([_]bool{ false, true }) |full| {
+        const want = try graph.qkStock(&g, c, t.q_norm, t.k_norm, q, kk, 1, pos, full);
+        const got = try qkNorm(&g, k, q, kk, t.q_norm, t.k_norm, pos, full, graph.ssmaxAt(pos));
+        try sameBytes(&g, if (full) "the full layer's query heads" else "the sliding layer's query heads", want.q, got.q, diag);
+        try sameBytes(&g, if (full) "the full layer's key heads" else "the sliding layer's key heads", want.k, got.k, diag);
+    };
 }
 
 const testing = std.testing;
 
 test "beam glue: the embedded manifest and texts are the pinned ones" {
     try checkPins();
-    try kset.expectManifestPins(texts.manifest, &text_pins, 2);
+    try kset.expectManifestPins(texts.manifest, &text_pins, 3);
 }
 
 test "beam glue: Beam 1.0's and the fixture's routers are the texts'; another is refused by name" {
     const c: beam.Config = .{};
     try testing.expect(registered(&c));
-    try testing.expect(registered(&.{ .hidden_size = 256, .n_routed_experts = 8, .n_group = 2, .topk_group = 1, .n_experts_per_tok = 2 }));
+    try testing.expect(registered(&.{ .hidden_size = 256, .n_routed_experts = 8, .n_group = 2, .topk_group = 1, .n_experts_per_tok = 2, .n_heads = 4, .n_kv_heads = 2, .head_dim = 64 }));
     for ([_]beam.Config{
         .{ .hidden_size = 4096 },
         .{ .n_experts_per_tok = 6 },
@@ -325,10 +391,13 @@ test "beam glue: Beam 1.0's and the fixture's routers are the texts'; another is
         .{ .topk_group = 2 },
         .{ .n_routed_experts = 128 },
         .{ .norm_topk_prob = false },
+        .{ .n_heads = 64 },
+        .{ .head_dim = 64 },
     }) |bad| try testing.expect(!registered(&bad));
     // Every registered geometry is one MLX's gemv runs as bm1_bn8 (matmul.cpp `gemv_axbpy`: K >= 16 N, K > 64) in whole
     // threadgroups of the GEMV and within one threadgroup of the select text.
     for (registered_geometries) |r| {
+        try testing.expect(r.head_dim == 64 or r.head_dim == 128);
         try testing.expect(r.hidden >= 16 * r.experts and r.hidden > 64 and r.hidden % 4 == 0);
         try testing.expect(r.experts % rows_per_group == 0 and r.experts % 4 == 0 and r.experts <= 1024);
         try testing.expect(r.experts % r.groups == 0 and r.experts / r.groups >= 2 and r.kept_groups <= r.groups and r.top_k <= 8);
@@ -344,6 +413,9 @@ test "beam glue: the launch geometry (the GEMV's experts / R threadgroups of 256
         try testing.expectEqual([3]u32{ 256, @intCast(m), 1 }, sl.grid);
         try testing.expectEqual([3]u32{ 256, 1, 1 }, sl.group);
     }
+    // 48 + 8 heads: 7 threadgroups of 8 simdgroups; the fixture's 4 + 2: one.
+    try testing.expectEqual([3]u32{ 7 * 256, 1, 1 }, Launch.qk(56).grid);
+    try testing.expectEqual([3]u32{ 256, 1, 1 }, Launch.qk(6).grid);
 }
 
 test "beam glue: the manifest registers the instantiations the install builds (each geometry at M = 1 and the lane's widths)" {
@@ -355,6 +427,7 @@ test "beam glue: the manifest registers the instantiations the install builds (e
     for (registered_geometries) |geo| {
         var gemv_found: [2]bool = @splat(false);
         var select_found: [max_rows]bool = @splat(false);
+        var qk_found: [2]bool = @splat(false);
         for (m.value.kernels) |kk| for (kk.instances) |inst| {
             const o = inst.object;
             const int = struct {
@@ -365,12 +438,17 @@ test "beam glue: the manifest registers the instantiations the install builds (e
             if (std.mem.eql(u8, kk.name, "glue_router_gemv")) {
                 if (int(o, "D") == geo.hidden and int(o, "E") == geo.experts and int(o, "M") == 1 and int(o, "R") == rows_per_group)
                     gemv_found[@intCast(int(o, "EPI"))] = true;
-            } else if (int(o, "E") == geo.experts and int(o, "G") == geo.groups and int(o, "TG") == geo.kept_groups and int(o, "K") == geo.top_k) {
-                select_found[@intCast(int(o, "M") - 1)] = true;
-            }
+            } else if (std.mem.eql(u8, kk.name, "glue_router_select")) {
+                if (int(o, "E") == geo.experts and int(o, "G") == geo.groups and int(o, "TG") == geo.kept_groups and int(o, "K") == geo.top_k)
+                    select_found[@intCast(int(o, "M") - 1)] = true;
+            } else if (std.mem.eql(u8, kk.name, "glue_qk_norm")) {
+                if (int(o, "HQ") == geo.heads and int(o, "HK") == geo.kv_heads and int(o, "HD") == geo.head_dim and int(o, "HPG") == heads_per_group)
+                    qk_found[@intCast(int(o, "MODE"))] = true;
+            } else return error.BeamGlueManifestKernel;
         };
         for (gemv_found) |f| try testing.expect(f);
         for (select_found) |f| try testing.expect(f);
+        for (qk_found) |f| try testing.expect(f);
     }
 }
 
@@ -417,9 +495,9 @@ fn testBf16(a: std.mem.Allocator, g: *G, shape: []const c_int, scale: f32, seed:
     return g.hostArray(std.mem.sliceAsBytes(bits), shape, .bfloat16);
 }
 
-/// The model of a registered geometry (the router's fields; the rest Beam's).
+/// The model of a registered geometry (the router's and the heads' fields; the rest Beam's).
 fn configOf(geo: Geometry) beam.Config {
-    return .{ .hidden_size = geo.hidden, .n_routed_experts = geo.experts, .n_group = geo.groups, .topk_group = geo.kept_groups, .n_experts_per_tok = geo.top_k };
+    return .{ .hidden_size = geo.hidden, .n_routed_experts = geo.experts, .n_group = geo.groups, .topk_group = geo.kept_groups, .n_experts_per_tok = geo.top_k, .n_heads = geo.heads, .n_kv_heads = geo.kv_heads, .head_dim = geo.head_dim };
 }
 
 test "beam glue GPU: the router's and the predictor's texts are the stock ops bit for bit (Beam's router and the fixture's; M = 1 .. 4; ties, saturation)" {
@@ -444,9 +522,12 @@ test "beam glue GPU: the router's and the predictor's texts are the stock ops bi
         defer a.free(tie_v);
         for (tie_v, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 3)) * 0.25;
         const bias_ties = try g.hostArray(std.mem.sliceAsBytes(tie_v), &.{e}, .float32);
-        try g.evalAll(&.{ w, bias, w2, bias2, bias_ties });
+        const hd: c_int = @intCast(geo.head_dim);
+        const qn = try testBf16(a, &g, &.{hd}, 0.5, 15);
+        const kn = try testBf16(a, &g, &.{hd}, 0.5, 16);
+        try g.evalAll(&.{ w, bias, w2, bias2, bias_ties, qn, kn });
         var diag: sdk.Diag = .{};
-        var k = install(a, s, &c, .{ .w = w, .bias = bias, .next_w = w2, .next_bias = bias2 }, &diag) catch |err| {
+        var k = install(a, s, &c, .{ .w = w, .bias = bias, .next_w = w2, .next_bias = bias2, .q_norm = qn, .k_norm = kn }, &diag) catch |err| {
             std.debug.print("beam glue install refused: {s}\n", .{diag.message()});
             return err;
         };
@@ -478,6 +559,53 @@ test "beam glue GPU: the router's and the predictor's texts are the stock ops bi
     }
 }
 
+test "beam glue GPU: the q / k norm text is the stock norms and RoPE, or the norms and the query scale, bit for bit (both geometries, positions to 2^20)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const graph = @import("graph.zig");
+    for (registered_geometries) |geo| {
+        const c = configOf(geo);
+        var g = try G.init(a, s);
+        defer g.deinit();
+        // The stock ops' compiled regions (the full layer's query scale is one).
+        try graph.prepareFused(&g, &c);
+        const d: c_int = @intCast(geo.hidden);
+        const e: c_int = @intCast(geo.experts);
+        const hd: c_int = @intCast(geo.head_dim);
+        const qd: c_int = @intCast(geo.heads * geo.head_dim);
+        const kd: c_int = @intCast(geo.kv_heads * geo.head_dim);
+        const w = try testF32(a, &g, &.{ e, d }, 1.0 / @sqrt(@as(f32, @floatFromInt(geo.hidden))), 11);
+        const bias = try testF32(a, &g, &.{e}, 0.01, 12);
+        const qn = try testBf16(a, &g, &.{hd}, 0.5, 15);
+        const kn = try testBf16(a, &g, &.{hd}, 0.5, 16);
+        try g.evalAll(&.{ w, bias, qn, kn });
+        var diag: sdk.Diag = .{};
+        var k = install(a, s, &c, .{ .w = w, .bias = bias, .next_w = w, .next_bias = bias, .q_norm = qn, .k_norm = kn }, &diag) catch |err| {
+            std.debug.print("beam glue install refused: {s}\n", .{diag.message()});
+            return err;
+        };
+        defer k.deinit();
+        var calls: usize = 0;
+        for ([_]u32{ 0, 1, 7, 300, 511, 512, 16_957, 32_767, 1_048_575 }, 0..) |pos, i| for ([_]bool{ false, true }) |full| {
+            const m = g.mark();
+            defer g.resetTo(m);
+            // The fused projections' row (q, k at its head), its values of a few magnitudes, with zeros.
+            const row = try testBf16(a, &g, &.{ 1, qd + kd + kd + qd }, 1.0, 1300 + i);
+            const q = try g.slice(row, &.{ 0, 0 }, &.{ 1, qd }, &.{ 1, 1 });
+            const kk = try g.slice(row, &.{ 0, qd }, &.{ 1, qd + kd }, &.{ 1, 1 });
+            const want = try graph.qkStock(&g, &c, qn, kn, q, kk, 1, pos, full);
+            const got = try qkNorm(&g, &k, q, kk, qn, kn, pos, full, graph.ssmaxAt(pos));
+            try sameBytes(&g, "query heads", want.q, got.q, null);
+            try sameBytes(&g, "key heads", want.k, got.k, null);
+            calls += 1;
+        };
+        std.debug.print("BEAM GLUE qk_norm {d} / {d} heads of {d}: {d} rows (9 positions to 2^20, sliding and full) bit-equal\n", .{ geo.heads, geo.kv_heads, geo.head_dim, calls });
+    }
+}
+
 test "beam glue GPU bench: a step's routers, the stock ops against the texts at R = 1, 2, 4 (49 layers' tables, M = 1)" {
     try deviceTest();
     mlx.installErrorHandler();
@@ -504,8 +632,10 @@ test "beam glue GPU bench: a step's routers, the stock ops against the texts at 
     };
     try g.evalAll(&ws);
     try g.evalAll(&bs);
+    const qn = try testBf16(a, &g, &.{@intCast(geo.head_dim)}, 0.5, 15);
+    const kn = try testBf16(a, &g, &.{@intCast(geo.head_dim)}, 0.5, 16);
     var diag: sdk.Diag = .{};
-    var k = try install(a, s, &c, .{ .w = ws[0], .bias = bs[0], .next_w = ws[1], .next_bias = bs[1] }, &diag);
+    var k = try install(a, s, &c, .{ .w = ws[0], .bias = bs[0], .next_w = ws[1], .next_bias = bs[1], .q_norm = qn, .k_norm = kn }, &diag);
     defer k.deinit();
     const x = g.keep(try testBf16(a, &g, &.{ 1, d }, 1, 400));
     defer g.release(x);

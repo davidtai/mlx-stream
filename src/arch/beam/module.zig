@@ -97,13 +97,14 @@ pub const Module = struct {
             };
             const first = &self.w.layers[model.first_k_dense];
             const next = if (model.moeLayers() > 1) &self.w.layers[model.first_k_dense + 1] else first;
-            self.glue_kernels = glue.install(gpa, s, model, .{ .w = first.router.?.w, .bias = first.router.?.bias, .next_w = next.router.?.w, .next_bias = next.router.?.bias }, &diag) catch |e| {
+            const attn0 = &self.w.layers[0].attn;
+            self.glue_kernels = glue.install(gpa, s, model, .{ .w = first.router.?.w, .bias = first.router.?.bias, .next_w = next.router.?.w, .next_bias = next.router.?.bias, .q_norm = attn0.q_norm, .k_norm = attn0.k_norm }, &diag) catch |e| {
                 log.err("beam: the decode glue refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
                 diag = .{};
                 return e;
             };
             self.routes.glue = &self.glue_kernels;
-            log.info("beam decode glue installed: router {d} threadgroups + select, predictor {d} threadgroups (decode_glue=fused); self-check passed\n", .{ model.n_routed_experts / glue.rows_per_group, model.n_routed_experts / glue.rows_per_group });
+            log.info("beam decode glue installed: q/k/v/gate one GEMV, q/k norms and RoPE (or the query scale) one launch, router {d} threadgroups + select, predictor {d} threadgroups (decode_glue=fused); self-check passed\n", .{ model.n_routed_experts / glue.rows_per_group, model.n_routed_experts / glue.rows_per_group });
         }
         errdefer self.glue_kernels.deinit();
         // The expert source at the plan's rows: every routed layer alike (`expert_rows_by_layer: uniform`, the default),

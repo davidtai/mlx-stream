@@ -34,9 +34,10 @@ pub const default_tally_ratio: f64 = 0;
 pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "expert_rows_by_layer", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "prompt_residents", "gpu_keep_warm", "decode_glue" } ++ expert_usage.keys;
 
 /// The decode lane's glue, installed once at construction: `fused` (the default) the router's and the predictor's texts
-/// (glue.zig: the router's product and its tail in two launches, the predictor's in one) and each layer's q, k, v and
-/// gate projections in one buffer and one GEMV (graph.zig `fuseProjections`), each bit for bit the stock ops; `ops` the
-/// stock op chain (the router's input cast, GEMV and 17 ops; the predictor's four; four projection GEMVs). The default
+/// (glue.zig: the router's product and its tail in two launches, the predictor's in one), each layer's q, k, v and gate
+/// projections in one buffer and one GEMV (graph.zig `fuseProjections`) and its q / k norms with RoPE or the query scale
+/// in one launch (glue.zig `qkNorm`), each bit for bit the stock ops; `ops` the stock op chain (the router's input cast,
+/// GEMV and 17 ops; the predictor's four; four projection GEMVs; two norms and two ropes, or two norms and a scale). The default
 /// resolves to `ops` where the texts do not register the model's router (another routed geometry) or on a CPU stream
 /// (`decodeGlueRoute`); `fused` named there refuses the load by name.
 pub const DecodeGlue = enum { fused, ops };
