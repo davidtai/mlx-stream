@@ -45,6 +45,7 @@ const expert_tally = @import("../../sdk_ext.zig").expert.tally;
 const expert_usage = @import("../../sdk_ext.zig").expert.usage;
 const exl3_forms = @import("exl3_forms.zig");
 const prompt_levers = @import("prompt_levers.zig");
+const layer_rows = @import("../../sdk_ext/expert/layer_rows.zig");
 
 /// The context a load bills when the model sets none: the standard request (16,384 prompt tokens and 1,024 generated).
 pub const fill_reserve_tokens: u64 = 16_384 + 1_024;
@@ -284,23 +285,7 @@ pub const MissReads = enum { staged, direct };
 /// (each within i16) summing to 0, of length the model's routed layers; anything else refuses by name in `validate`;
 /// a layer over its experts is held at them, the excess moved to the narrowest layers; plan rows over the experts refuse
 /// at construction (`layerRows`).
-pub const LayerRows = union(enum) {
-    uniform,
-    offsets: Offsets,
-    /// Not `"uniform"` nor an array of integers within i16 (`Glm5NextExpertRowsByLayer`), an array longer than
-    /// `glm.max_layers` or of another length than the model's routed layers (`Glm5NextExpertRowsByLayerLength`), or one
-    /// whose entries do not sum to 0 (`Glm5NextExpertRowsByLayerSum`).
-    invalid: enum { setting, length, sum },
-
-    pub const Offsets = struct {
-        len: u8,
-        d: [glm.max_layers]i16 = @splat(0),
-
-        pub fn slice(o: *const Offsets) []const i16 {
-            return o.d[0..o.len];
-        }
-    };
-};
+pub const LayerRows = layer_rows.LayerRows;
 
 /// glm5_next's default decode split (`expert_rows_by_layer`): 42 integer offsets summing to 0, the calibration of the
 /// three NON-benchmark prompts (reports/.../mimo/cells/glm5next-calib-20261013/expert-rows-by-layer.json). The
@@ -330,42 +315,11 @@ comptime {
 /// the plan's decode rows can go up to `n_experts` under any offsets (before: n_experts - the largest offset, 225 for the
 /// default table). Refused by name when the plan's rows are over `n_experts` or the floor cannot be paid back.
 pub fn layerRows(split: LayerRows, rows: sdk.Rows, n_experts: u32, prompt: []u32, decode: []u32) !void {
-    if (prompt.len != decode.len) return error.Glm5NextExpertRowsByLayerLength;
-    switch (split) {
-        .uniform => {
-            @memset(prompt, rows.prompt);
-            @memset(decode, rows.decode);
-        },
-        .offsets => |*o| {
-            if (o.len != decode.len) return error.Glm5NextExpertRowsByLayerLength;
-            if (rows.decode > n_experts or rows.prompt > rows.decode) return error.Glm5NextExpertRowsByLayerRange;
-            var surplus: i64 = 0;
-            for (prompt, decode, o.slice()) |*p, *q, off| {
-                const dd = @as(i64, rows.decode) + off;
-                const held = std.math.clamp(dd, @as(i64, rows.prompt), @as(i64, n_experts));
-                surplus += held - dd;
-                q.* = @intCast(held);
-                p.* = rows.prompt;
-            }
-            while (surplus < 0) : (surplus += 1) {
-                var ni: usize = 0;
-                for (decode, 0..) |d, i| {
-                    if (d < decode[ni]) ni = i;
-                }
-                if (decode[ni] >= n_experts) return error.Glm5NextExpertRowsByLayerRange;
-                decode[ni] += 1;
-            }
-            while (surplus > 0) : (surplus -= 1) {
-                var wi: usize = 0;
-                for (decode, 0..) |d, i| {
-                    if (d > decode[wi]) wi = i;
-                }
-                if (decode[wi] <= rows.prompt) return error.Glm5NextExpertRowsByLayerRange;
-                decode[wi] -= 1;
-            }
-        },
-        .invalid => return error.Glm5NextExpertRowsByLayer,
-    }
+    layer_rows.layerRows(split, rows, n_experts, prompt, decode) catch |e| return switch (e) {
+        error.ExpertRowsByLayer => error.Glm5NextExpertRowsByLayer,
+        error.ExpertRowsByLayerLength => error.Glm5NextExpertRowsByLayerLength,
+        error.ExpertRowsByLayerRange => error.Glm5NextExpertRowsByLayerRange,
+    };
 }
 
 /// The longest dump directory a setting may name.
@@ -656,23 +610,9 @@ pub const Config = struct {
         return if (c.dump_dir_len == 0) null else c.dump_dir_buf[0..c.dump_dir_len];
     }
 
-    /// `"expert_rows_by_layer"`: "uniform", or integers (each within i16, at most `glm.max_layers`) summing to 0.
+    /// `"expert_rows_by_layer"`: "uniform", or integers (each within i16, at most `layer_rows.max_layers`) summing to 0.
     fn layerRowsSetting(v: std.json.Value) LayerRows {
-        switch (v) {
-            .string => |s| return if (std.mem.eql(u8, s, "uniform")) .uniform else .{ .invalid = .setting },
-            .array => |arr| {
-                for (arr.items) |item| if (item != .integer or item.integer < std.math.minInt(i16) or item.integer > std.math.maxInt(i16)) return .{ .invalid = .setting };
-                if (arr.items.len == 0 or arr.items.len > glm.max_layers) return .{ .invalid = .length };
-                var out: LayerRows.Offsets = .{ .len = @intCast(arr.items.len) };
-                var sum: i64 = 0;
-                for (arr.items, out.d[0..arr.items.len]) |item, *o| {
-                    o.* = @intCast(item.integer);
-                    sum += item.integer;
-                }
-                return if (sum == 0) .{ .offsets = out } else .{ .invalid = .sum };
-            },
-            else => return .{ .invalid = .setting },
-        }
+        return LayerRows.parse(v);
     }
 
     fn rowsSetting(c: *Config, v: std.json.Value) ?u32 {
