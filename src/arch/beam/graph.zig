@@ -42,6 +42,7 @@ const mimo = @import("../mimo_v2/config.zig");
 const kv = @import("../mimo_v2/kv.zig");
 const beam = @import("config.zig");
 const experts = @import("experts.zig");
+const mimo_route = @import("../mimo_v2/route.zig");
 
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
@@ -732,11 +733,6 @@ fn forcedRoute(g: *G, c: *const beam.Config, r: Router, x: T, f: *const ForcedRo
     return .{ .indices = inds, .weights = try weightsAt(g, c, s.scores, inds) };
 }
 
-/// Each expert's routed rows in `ids` (u32 [rows, k]) against every expert id (`all_ids`, u32 [1, n]): int32 [n].
-fn expertCounts(g: *G, ids: T, rows: c_int, k: c_int, all_ids: T) !T {
-    return g.sum(try g.equal(try g.reshape(ids, &.{ rows * k, 1 }), all_ids), 0, false);
-}
-
 /// P1's predictor of routed layer `lw` over `x` (the layer's input rows): its router on `x` under the layer's
 /// pre-feedforward norm, the chosen experts counted per expert on the GPU, u32 [experts], unevaluated.
 pub fn predictedCounts(g: *G, c: *const beam.Config, lw: *const Layer, x: T) !T {
@@ -744,17 +740,25 @@ pub fn predictedCounts(g: *G, c: *const beam.Config, lw: *const Layer, x: T) !T 
     const ne: c_int = @intCast(c.n_routed_experts);
     const r = try route(g, c, lw.router.?, try rmsNorm(g, x, lw.pre_ff_norm, c.rms_norm_eps));
     const all_ids = try g.reshape(try g.arange(0, @floatFromInt(c.n_routed_experts), 1, .uint32), &.{ 1, ne });
-    return g.astype(try expertCounts(g, r.indices, n, @intCast(c.n_experts_per_tok), all_ids), .uint32);
+    return g.astype(try mimo_route.expertCounts(G, g, r.indices, n, @intCast(c.n_experts_per_tok), all_ids), .uint32);
 }
 
 /// P1: routed layer `l`'s predicted experts (`predictedCounts`, one small read back), ranked hottest first and posted
-/// to the stream, which reads the seed into the layer's free persistent rows while the attention runs. The prediction
-/// only picks reads: token-exact.
-fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, src: anytype) !void {
+/// to the stream, which reads the seed into the layer's free persistent rows while the attention runs. P7: the counts
+/// were evaluated with the previous layer's tail (`ahead`, the shared route's prompt lever 5); a call's first routed
+/// layer with no layer before it in the call builds its own. The prediction only picks reads: token-exact.
+fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, src: anytype, ahead: *mimo_route.PromptAhead) !void {
     const m = g.mark();
     defer g.resetTo(m);
-    const counts = try predictedCounts(g, c, lw, x);
-    try g.evalAll(&.{counts});
+    defer ahead.release(g);
+    const counts = if (ahead.layer) |al| blk: {
+        std.debug.assert(al == l);
+        break :blk ahead.counts.?;
+    } else blk: {
+        const own = try predictedCounts(g, c, lw, x);
+        try g.evalAll(&.{own});
+        break :blk own;
+    };
     const host = try g.readU32(counts, src.ahead_counts[0..c.n_routed_experts]);
     try src.readAheadSeed(l, expert_policy.rankHottest(host, &src.ahead_ranked));
 }
@@ -806,6 +810,12 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
     const outs = try a.alloc(T, n_tiles);
     defer a.free(outs);
     if (prompt) try stageFirstRouted(g, c, w, x, src);
+    // P7 (the shared route's prompt levers): the next routed layer's predicted counts, built on each layer's output at
+    // its tail and evaluated with it (`PromptAhead`: no predictor round trip at the boundary), and a layer's purge after
+    // the next layer's first commit (`DeferredPurge`: the GPU starts that tile first).
+    var ahead: mimo_route.PromptAhead = .{};
+    defer ahead.release(g);
+    var purge: mimo_route.DeferredPurge = .{};
     for (w.layers, 0..) |*stored, li| {
         const l: u32 = @intCast(li);
         const m = g.mark();
@@ -814,7 +824,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         // reads them as stored.
         const view = if (prompt) try promptView(g, stored) else stored.*;
         const lw = &view;
-        if (prompt and lw.router != null) try postReadAhead(g, c, lw, l, x, src);
+        if (prompt and lw.router != null) try postReadAhead(g, c, lw, l, x, src, &ahead);
         // The attention, tile by tile (the rings and slabs carry from one tile to the next); in a prompt call each tile
         // is committed as built and the tile before it waited, so at most `tiles_in_flight` run at once.
         const xn = try rmsNorm(g, x, lw.input_norm, c.rms_norm_eps);
@@ -830,6 +840,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             g.resetTo(ms);
             if (!prompt) continue;
             try g.asyncEval(&.{outs[i]});
+            if (i == 0) purge.afterFirstCommit(src);
             if (i > 0) try g.evalAll(&.{outs[i - 1]});
         }
         const attn = if (n_tiles == 1) outs[0] else try g.concat(outs[0..n_tiles], 0);
@@ -841,9 +852,9 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             // P1: the next routed layer's early prediction, committed behind the router (the call's barrier waits for
             // the router alone); the call stages it once its reads are posted, so the drive reads on through this
             // layer's last groups, its tail and the next predictor.
-            const ahead = if (prompt) try nextAhead(g, c, w, l, x1, src) else null;
-            if (ahead) |nx| try g.asyncEval(&.{nx.counts});
-            const routed = try g.adopt(try src.forward(l, h, r.indices, r.weights, ahead));
+            const early = if (prompt) try nextAhead(g, c, w, l, x1, src) else null;
+            if (early) |nx| try g.asyncEval(&.{nx.counts});
+            const routed = try g.adopt(try src.forward(l, h, r.indices, r.weights, early));
             break :blk try scaled(g, c, routed, try g.scalar(c.routed_scaling, .float32));
         };
         const x2 = try depthAdd(g, c, try rmsNorm(g, f, lw.post_ff_norm, c.rms_norm_eps), x1, beam.Config.residualIndex(l, true));
@@ -851,15 +862,23 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         g.release(x);
         x = next;
         // MiMo's tail: a prompt layer's output evaluated before the next layer starts (bounding its graph), then the
-        // pooled scratch's purge. A decode step's stays lazy: the next routing barrier evaluates it.
+        // pooled scratch's purge. A decode step's stays lazy: the next routing barrier evaluates it. P7: the next routed
+        // layer's predictor built on the output and evaluated with it (the layer's own arrays released first: the
+        // boundary holds the stream and the predictor's arrays, bill.zig `promptWaveBytes`); the purge waits for the
+        // next layer's first commit.
         if (prompt) {
             g.resetTo(m);
             for (outs[0..n_kept]) |o| g.release(o);
             n_kept = 0;
-            try g.evalAll(&.{x});
-            src.promptLayerEnd();
+            if (li + 1 < w.layers.len and w.layers[li + 1].router != null) {
+                ahead.counts = g.keep(try predictedCounts(g, c, &w.layers[li + 1], x));
+                ahead.layer = l + 1;
+                try g.evalAll(&.{ x, ahead.counts.? });
+            } else try g.evalAll(&.{x});
+            purge.layerEnd();
         }
     }
+    purge.afterFirstCommit(src);
     cache.len = start + rows;
     if (head == .all) return g.keep(try logitsOf(g, c, w, x));
     const last = try g.slice(x, &.{ @intCast(rows - 1), 0 }, &.{ @intCast(rows), hidden }, &.{ 1, 1 });

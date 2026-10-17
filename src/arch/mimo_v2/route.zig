@@ -1,8 +1,10 @@
 //! MiMo's expert route as the NVFP4-streamed arches install it (glm5_next, beam): the construction routes of record
 //! (the read schedule, the drains, the bank view, the decode window, the read-ahead relocation, MLX's cache limits per
 //! phase), the stream's construction options over a bank's bridge (`streamOptionsOf`), a request's start on the stream,
-//! the decode lane's rule, the prompt combine the host's wired policy allows, the decode lane's stock combine and the
-//! lookahead's scores on a router's stored weight. Every route here is exact against its control (mimo.md, glm5-next.md).
+//! the decode lane's rule, the prompt combine the host's wired policy allows, the decode lane's stock combine, the
+//! lookahead's scores on a router's stored weight, and the prompt pass's host levers (P1's predicted counts across a
+//! layer boundary, the deferred purge, the expert counts). Every route here is exact against its control (mimo.md,
+//! glm5-next.md, beam.md).
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -97,6 +99,47 @@ pub fn scoresStored(_: *const mimo_math.Predictor, g: *ops.MlxOps, x: T, router:
     return g.add(try g.sigmoid(try g.astype(logits, .float32)), correction);
 }
 
+// ── The prompt pass's host levers (glm5_next's prompt levers 4 and 5; Beam's P7): host work off the critical path ──
+
+/// P1's predicted counts of one routed layer (u32 [experts], kept) across a prompt layer boundary (prompt lever 5):
+/// built on the previous layer's output at its tail, committed behind the tail and evaluated with it (no host round trip
+/// at the boundary), read at the layer's start. `layer`: the layer they predict (null: none built; the layer builds its
+/// own, as a call's first routed layer that no layer of the call precedes).
+pub const PromptAhead = struct {
+    layer: ?u32 = null,
+    counts: ?T = null,
+
+    pub fn release(a: *PromptAhead, g: *ops.MlxOps) void {
+        if (a.counts) |x| g.release(x);
+        a.* = .{};
+    }
+};
+
+/// Prefill host idle (glm5_next's g21c profile: 5.2 ms a layer of GPU idle while the host purged MLX's cache after the
+/// tail's evaluation): a prompt layer's purge (`Source.promptLayerEnd`: MLX's cache cleared once half full) runs after
+/// the next layer's first commit, so the GPU starts that work first. The cache stays under its limit (MLX frees on
+/// allocation past it), so no bill term moves; no value changes: exact.
+pub const DeferredPurge = struct {
+    pending: bool = false,
+
+    pub fn layerEnd(p: *DeferredPurge) void {
+        p.pending = true;
+    }
+
+    pub fn afterFirstCommit(p: *DeferredPurge, src: anytype) void {
+        if (!p.pending) return;
+        p.pending = false;
+        src.promptLayerEnd();
+    }
+};
+
+/// Each expert's routed rows in `ids` (u32 [rows, k]): the ids compared with every expert id (`all_ids`, u32 [1, n]) and
+/// summed per expert, int32 [n] (integer sums: exactly the host's tally of the same ids). P1's predictors count with it
+/// (glm5_next's spans, Beam's rows). `Ops`: an arch's MLX backend (glm5_next's CPU tests trace it).
+pub fn expertCounts(comptime Ops: type, g: *Ops, ids: Ops.T, rows: c_int, k: c_int, all_ids: Ops.T) !Ops.T {
+    return g.sum(try g.equal(try g.reshape(ids, &.{ rows * k, 1 }), all_ids), 0, false);
+}
+
 /// Once, at construction (every command retired, MLX's cache cleared): the footprint beside the bill's construction
 /// terms at the prompt rows, one line. A report, as MiMo's: an over-footprint past `tolerance` is the bill's bug for its
 /// tests and the window guard, logged as an under-bill; the load proceeds.
@@ -122,6 +165,28 @@ pub fn monotonicNs() u64 {
 }
 
 const testing = std.testing;
+
+test "mimo route: the deferred purge runs once, after the next layer's first commit, and at the pass's end" {
+    const Fake = struct {
+        purges: u32 = 0,
+        pub fn promptLayerEnd(f: *@This()) void {
+            f.purges += 1;
+        }
+    };
+    var src: Fake = .{};
+    var p: DeferredPurge = .{};
+    p.afterFirstCommit(&src); // layer 0's first commit: nothing pending
+    try testing.expectEqual(@as(u32, 0), src.purges);
+    p.layerEnd(); // layer 0's end: deferred
+    try testing.expectEqual(@as(u32, 0), src.purges);
+    p.afterFirstCommit(&src); // layer 1's first commit: layer 0's purge
+    try testing.expectEqual(@as(u32, 1), src.purges);
+    p.afterFirstCommit(&src); // no second purge
+    try testing.expectEqual(@as(u32, 1), src.purges);
+    p.layerEnd();
+    p.afterFirstCommit(&src); // the pass's end
+    try testing.expectEqual(@as(u32, 2), src.purges);
+}
 
 test "mimo route: the decode lane is one row in either phase and up to the lane's rows in decode" {
     try testing.expect(decodeLane(1, false, 4));
