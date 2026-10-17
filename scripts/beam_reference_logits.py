@@ -2,14 +2,21 @@
 """The reference logits of a Beam pack for the beam arch's parity test (src/arch/beam/parity.zig).
 
     python3 -B -I scripts/beam_reference_logits.py --pack PACK --out PREFIX [--prompt 40] [--decode 8] [--seed 7]
-        [--decode-ids greedy|seeded] [--cache-gb 4]
+        [--decode-ids greedy|seeded] [--ids-from REF.json] [--routes-from REF.json] [--cache-gb 4]
 
-Reads the pack as mlx-stream serves it (config.json, the BF16 residents in model.safetensors, the NVFP4 expert bank
+Reads the pack as mlx-stream serves it (config.json, the residents in model.safetensors, the NVFP4 expert bank
 experts.bin with expert-manifest.json: docs/nvfp4-pack.md) and runs modeling_beam.py's forward in numpy on the CPU:
 the prompt (PROMPT token ids from SEED), then DECODE tokens: greedy (each the argmax of the previous row, a forward a
-token) or seeded (drawn from SEED, one forward: the parity test forces the tokens, so any sequence serves). Every row's
+token) or seeded (drawn from SEED, one forward: the parity test forces the tokens, so any sequence serves), or the ids
+of another reference (`--ids-from`: its prompt and decode rows, so two packs' references share their rows). Every row's
 logits are those of one causal forward over the whole sequence (a decode step's row is the sequence's row at its
 position).
+
+A q8 pack's projections (`residents_format: affine8_g64`: U32 codes with BF16 scales and biases a group of 64) are
+dequantized in f32 as MLX's qmv reads them, s x q + b (an 8-bit code times a BF16 scale is exact in f32), and enter
+the forward in place of the BF16 weights. `--routes-from` takes every routed layer's experts from another reference of
+the same rows (the twin's forcing), so that two packs' references differ only in their trunks: the q8 tier's
+reference on the BF16 reference's routes is the parity test's bound for the q8 pack against the BF16 reference.
 
 The arithmetic follows the reference's dtypes: every tensor the reference holds in BF16 is rounded to BF16 (round to
 nearest even) where the reference rounds it, every reduction runs in f32. The routed experts are the bank's records
@@ -73,11 +80,11 @@ class Safetensors:
         self.data = np.memmap(path, np.uint8, mode="r")
         self.base = 8 + n
 
-    def raw(self, name: str) -> tuple[dict, np.ndarray]:
+    def raw(self, name: str, dtypes=("BF16", "F32")) -> tuple[dict, np.ndarray]:
         h = self.header[name]
         lo, hi = h["data_offsets"]
-        if h["dtype"] not in ("BF16", "F32"):
-            raise SystemExit(f"{name}: dtype {h['dtype']} (BF16 / F32 read)")
+        if h["dtype"] not in dtypes:
+            raise SystemExit(f"{name}: dtype {h['dtype']} ({' / '.join(dtypes)} read)")
         return h, self.data[self.base + lo : self.base + hi]
 
     @staticmethod
@@ -87,8 +94,19 @@ class Safetensors:
         return raw.view(np.float32).astype(np.float32)
 
     def get(self, name: str) -> np.ndarray:
+        """The tensor in f32; a q8 projection's weight (U32 codes beside its scales and biases) dequantized."""
+        if self.header[name]["dtype"] == "U32" and name.endswith(".weight"):
+            return self.q8(name[: -len(".weight")])
         h, raw = self.raw(name)
         return self.widen(h, raw).reshape(h["shape"])
+
+    def q8(self, prefix: str) -> np.ndarray:
+        """MLX's affine 8-bit group 64 projection `prefix` in f32: s x q + b (code j of a U32 word in bits 8 j)."""
+        h, words = self.raw(prefix + ".weight", ("U32",))
+        out = h["shape"][0]
+        q = np.asarray(words).reshape(out, -1).astype(np.float32)
+        s, b = self.get(prefix + ".scales"), self.get(prefix + ".biases")
+        return (q.reshape(out, s.shape[1], -1) * s[:, :, None] + b[:, :, None]).reshape(out, -1).astype(np.float32)
 
     def rows(self, name: str, ids) -> np.ndarray:
         """Rows `ids` of a 2-D tensor (the embedding's): only their bytes are read."""
@@ -307,6 +325,10 @@ def main() -> None:
     ap.add_argument("--decode-ids", choices=("greedy", "seeded"), default="greedy",
                     help="the decode tokens: each the argmax of the previous row (a forward per token), or drawn from "
                          "SEED (one forward; the parity test forces the tokens either way)")
+    ap.add_argument("--ids-from", type=Path, help="REF.json of another reference: its ids, prompt and decode rows (in "
+                                                  "place of --prompt, --decode, --seed and --decode-ids)")
+    ap.add_argument("--routes-from", type=Path, help="REF.json of a reference of the same rows: its experts forced at "
+                                                     "every routed layer (the weights this pack's router's scores)")
     ap.add_argument("--cache-gb", type=float, default=4.0, help="the dequantized experts' LRU (default 4 GB)")
     ap.add_argument("--twin", action="store_true",
                     help="also write PREFIX.twin.f32: the same forward on the same routes with no BF16 rounding (every "
@@ -314,21 +336,37 @@ def main() -> None:
     args = ap.parse_args()
     m = Beam(args.pack, int(args.cache_gb * 1e9))
     vocab = m.cfg["vocab_size"]
-    rng = np.random.default_rng(args.seed)
-    ids = rng.integers(0, vocab, size=args.prompt).tolist()
-    if args.decode_ids == "seeded":
-        ids += rng.integers(0, vocab, size=args.decode).tolist()
+    if args.ids_from is not None:
+        src = json.loads(args.ids_from.read_text())
+        ids = [int(t) for t in src["ids"]]
+        args.prompt, args.decode, args.seed = src["prompt_tokens"], src["decode_tokens"], src["seed"]
+        args.decode_ids = f"from {args.ids_from.name}"
+        if len(ids) != args.prompt + args.decode or src["vocab"] != vocab:
+            raise SystemExit(f"{args.ids_from}: its rows or vocabulary are not this pack's")
     else:
-        for _ in range(args.decode):
-            ids.append(int(np.argmax(m.forward(ids)[-1])))
+        rng = np.random.default_rng(args.seed)
+        ids = rng.integers(0, vocab, size=args.prompt).tolist()
+        if args.decode_ids == "seeded":
+            ids += rng.integers(0, vocab, size=args.decode).tolist()
+        else:
+            for _ in range(args.decode):
+                ids.append(int(np.argmax(m.forward(ids)[-1])))
     m.margins, m.routes = {}, {}
+    if args.routes_from is not None:
+        src = json.loads(args.routes_from.read_text())
+        if src["ids"] != ids:
+            raise SystemExit(f"{args.routes_from}: its ids are not these rows'")
+        routed = [l for l in range(m.L) if m.mlp_types[l] != "dense"]
+        r = np.array(src["routes"], np.int64).reshape(len(routed), len(ids), src["route_k"])
+        m.forced = {l: r[i] for i, l in enumerate(routed)}
     logits = m.forward(ids)
     srt = np.sort(logits, axis=-1)
     routed = sorted(m.margins)
     margins = np.stack([m.margins[l] for l in routed]) if routed else np.full((1, len(ids)), np.inf)
     meta = {
-        "pack": str(args.pack), "prompt_tokens": args.prompt, "decode_tokens": args.decode, "seed": args.seed,
-        "decode_ids": args.decode_ids,
+        "pack": str(args.pack), "residents_format": m.cfg.get("residents_format", "bf16"),
+        "routes_from": str(args.routes_from) if args.routes_from is not None else None,
+        "prompt_tokens": args.prompt, "decode_tokens": args.decode, "seed": args.seed, "decode_ids": args.decode_ids,
         "ids": ids, "rows": len(ids), "vocab": vocab,
         "argmax": np.argmax(logits, axis=-1).tolist(), "margin": (srt[:, -1] - srt[:, -2]).astype(float).tolist(),
         # Each row's routing margin: the least, over the routed layers, of its group and expert choice margins; and the

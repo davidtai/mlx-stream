@@ -1,6 +1,7 @@
-//! Beam's trunk on the GPU stream: the residents bound from the pack's BF16 shards by their original names, the decode
-//! state (each sliding layer's window ring, each full layer's slab), and the forward of rows at positions
-//! [start, start + rows) through every layer (modeling_beam.py `BeamDecoderLayer`):
+//! Beam's trunk on the GPU stream: the residents bound from the pack's shards by their original names (the release's
+//! BF16, or the q8 tier's affine 8-bit projections: `residents_format`), the decode state (each sliding layer's window
+//! ring, each full layer's slab), and the forward of rows at positions [start, start + rows) through every layer
+//! (modeling_beam.py `BeamDecoderLayer`):
 //!
 //!   h = post_attention_layernorm(attention(input_layernorm(x)));        x = depth_add(h, x, 2 (l + 1))
 //!   h = post_feedforward_layernorm(mlp(pre_feedforward_layernorm(x)));  x = depth_add(h, x, 2 (l + 1) + 1)
@@ -22,6 +23,14 @@
 //! headroom), the dense MLP in tiles, the MoE over every row at once (the wide lane), the layer's output evaluated at
 //! its end. A decode step is one row: its routed calls take the decode lane, whose routing barrier evaluates the layer up
 //! to its router; nothing else is evaluated before the logits.
+//!
+//! The residents route (`Linear`, `project`), fixed by the pack's `residents_format`: a BF16 projection is MLX's matmul
+//! on the transposed weight (the control). A q8 projection is MLX's `quantized_matmul` (affine, 8 bits, group 64) in a
+//! decode step: its qmv reads 1.0625 B a weight in place of 2 (the trunk's GEMVs 8.36 ms a step against BF16's 14.27 ms,
+//! residents-q8 microbench on the M5 Ultra). A prompt layer reads each q8 projection as its BF16 weight, dequantized once
+//! for the layer (`promptView`: MiMo's and glm5_next's prompt route, the stock GEMM over the dequantized weight): the
+//! prompt pass keeps BF16's GEMMs (the 16K prompt's projections 2,376 ms against BF16's 2,395 ms; MLX's quantized GEMM
+//! on every tile 2,474 ms).
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -48,8 +57,16 @@ comptime {
     if (experts.call_rows % tile_rows != 0) @compileError("beam: a prompt call is not whole attention tiles");
 }
 
-pub const Attention = struct { q: T, k: T, v: T, o: T, gate: T, gate_bias: T, q_norm: T, k_norm: T };
-pub const Mlp = struct { gate: T, up: T, down: T };
+/// A trunk projection [out, in] as the pack stores it (`beam.Config.residents_format`): the BF16 weight, or the q8 tier's
+/// MLX affine 8-bit group 64 (U32 codes [out, in / 4], BF16 scales and biases [out, in / 64]).
+pub const Linear = union(enum) {
+    bf16: T,
+    q8: Q8,
+};
+pub const Q8 = struct { w: T, scales: T, biases: T };
+
+pub const Attention = struct { q: Linear, k: Linear, v: Linear, o: Linear, gate: Linear, gate_bias: T, q_norm: T, k_norm: T };
+pub const Mlp = struct { gate: Linear, up: Linear, down: Linear };
 /// The router: the F32 weight [experts, hidden] (the reference keeps it f32) and the F32 correction bias [experts].
 pub const Router = struct { w: T, bias: T };
 
@@ -66,9 +83,19 @@ pub const Layer = struct {
     router: ?Router = null,
 };
 
-/// A tensor of the pack the trunk reads; every other one (a routed expert's, the quantizer's scales) is dropped from the
-/// weight map before the residents are read (module.zig) and never billed (bill.zig).
+/// A tensor of the pack the trunk reads; every other one (a routed expert's, the NVFP4 quantizer's scales) is dropped
+/// from the weight map before the residents are read (module.zig) and never billed (bill.zig). Under the q8 tier a
+/// projection's scales and biases are kept with its weight.
 pub fn keptResident(c: *const beam.Config, name: []const u8) bool {
+    if (c.residents_format == .affine8_g64) {
+        inline for (.{ ".scales", ".biases" }) |tail| {
+            if (std.mem.endsWith(u8, name, tail)) {
+                var buf: [192]u8 = undefined;
+                const w = std.fmt.bufPrint(&buf, "{s}.weight", .{name[0 .. name.len - tail.len]}) catch return false;
+                return isProjection(c, w);
+            }
+        }
+    }
     for ([_][]const u8{ "lm_head.weight", "model.embed_tokens.weight", "model.norm.weight" }) |n|
         if (std.mem.eql(u8, name, n)) return true;
     const pre = "model.layers.";
@@ -85,17 +112,39 @@ pub fn keptResident(c: *const beam.Config, name: []const u8) bool {
     return false;
 }
 
-const layer_suffixes = [_][]const u8{
-    "input_layernorm.weight",    "post_attention_layernorm.weight", "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
-    "self_attn.q_proj.weight",   "self_attn.k_proj.weight",         "self_attn.v_proj.weight",          "self_attn.o_proj.weight",
-    "self_attn.gate_proj.weight", "self_attn.gate_bias",            "self_attn.q_norm.weight",          "self_attn.k_norm.weight",
+/// Every layer's projections (the q8 tier's sites, with the dense layers' `dense_suffixes` and the head).
+const attn_projections = [_][]const u8{ "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.o_proj.weight", "self_attn.gate_proj.weight" };
+const layer_suffixes = attn_projections ++ [_][]const u8{
+    "input_layernorm.weight", "post_attention_layernorm.weight", "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
+    "self_attn.gate_bias",    "self_attn.q_norm.weight",         "self_attn.k_norm.weight",
 };
 const dense_suffixes = [_][]const u8{ "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight" };
 const moe_suffixes = [_][]const u8{ "mlp.gate.weight", "mlp.gate.e_score_correction_bias" };
 
-/// The tensors the trunk binds per layer kind (the bill's census).
+/// `name` is the weight of a trunk projection: the head, a layer's attention projection, a dense layer's MLP projection.
+fn isProjection(c: *const beam.Config, name: []const u8) bool {
+    if (std.mem.eql(u8, name, "lm_head.weight")) return true;
+    const pre = "model.layers.";
+    if (!std.mem.startsWith(u8, name, pre)) return false;
+    const rest = name[pre.len..];
+    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return false;
+    const l = std.fmt.parseInt(u32, rest[0..dot], 10) catch return false;
+    if (l >= c.n_layers) return false;
+    const suffix = rest[dot + 1 ..];
+    for (attn_projections) |s| if (std.mem.eql(u8, suffix, s)) return true;
+    if (!c.isMoe(l)) for (dense_suffixes) |s| if (std.mem.eql(u8, suffix, s)) return true;
+    return false;
+}
+
+/// The trunk's projections (the head, 5 a layer, 3 a dense layer).
+pub fn projections(c: *const beam.Config) u64 {
+    return 1 + @as(u64, c.n_layers) * attn_projections.len + @as(u64, c.first_k_dense) * dense_suffixes.len;
+}
+
+/// The tensors the trunk binds per layer kind (the bill's census): under the q8 tier each projection is three.
 pub fn residentTensors(c: *const beam.Config) u64 {
-    return 3 + @as(u64, c.n_layers) * layer_suffixes.len + @as(u64, c.first_k_dense) * dense_suffixes.len + @as(u64, c.moeLayers()) * moe_suffixes.len;
+    const bf16 = 3 + @as(u64, c.n_layers) * layer_suffixes.len + @as(u64, c.first_k_dense) * dense_suffixes.len + @as(u64, c.moeLayers()) * moe_suffixes.len;
+    return if (c.residents_format == .affine8_g64) bf16 + 2 * projections(c) else bf16;
 }
 
 /// The residents. The router tables converted to F32 (a pack that stores them BF16) and the gate biases in the gate's
@@ -103,7 +152,7 @@ pub fn residentTensors(c: *const beam.Config) u64 {
 pub const Weights = struct {
     embed: T,
     norm: T,
-    head: T,
+    head: Linear,
     layers: []Layer,
     owned: std.ArrayList(T) = .empty,
 
@@ -134,10 +183,11 @@ pub const Weights = struct {
         errdefer a.free(layers);
         const h: c_int = @intCast(c.hidden_size);
         const vocab: c_int = @intCast(c.vocab_size);
+        const fmt = c.residents_format;
         var w: Weights = .{
             .embed = try need(map, "model.embed_tokens.weight", &.{ vocab, h }, diag),
             .norm = try need(map, "model.norm.weight", &.{h}, diag),
-            .head = try need(map, "lm_head.weight", &.{ vocab, h }, diag),
+            .head = try linearOf(map, "lm_head", vocab, h, fmt, diag),
             .layers = layers,
         };
         errdefer {
@@ -157,27 +207,34 @@ pub const Weights = struct {
                 pre: []const u8,
                 map: *const sdk.Weights,
                 diag: ?*sdk.Diag,
+                fmt: beam.ResidentsFormat,
                 fn get(self: @This(), comptime suffix: []const u8, shape: []const c_int) !T {
                     var nb: [128]u8 = undefined;
                     return need(self.map, std.fmt.bufPrint(&nb, "{s}" ++ suffix, .{self.pre}) catch unreachable, shape, self.diag);
                 }
+                /// The projection `proj` ([out, in]) in the pack's format.
+                fn lin(self: @This(), comptime proj: []const u8, out: c_int, in: c_int) !Linear {
+                    var nb: [128]u8 = undefined;
+                    return linearOf(self.map, std.fmt.bufPrint(&nb, "{s}" ++ proj, .{self.pre}) catch unreachable, out, in, self.fmt, self.diag);
+                }
             };
-            const lg: L = .{ .pre = pre, .map = map, .diag = diag };
+            const lg: L = .{ .pre = pre, .map = map, .diag = diag, .fmt = fmt };
             const full = c.isFull(l);
-            const gate = try lg.get("self_attn.gate_proj.weight", &.{ hq, h });
+            // The gate bias in the dtype of the gate's output: the activations' BF16 under either format.
+            const gate_bias_dtype: mlx.mlx_dtype = .bfloat16;
             lw.* = .{
                 .input_norm = try lg.get("input_layernorm.weight", &.{h}),
                 .post_attn_norm = try lg.get("post_attention_layernorm.weight", &.{h}),
                 .pre_ff_norm = try lg.get("pre_feedforward_layernorm.weight", &.{h}),
                 .post_ff_norm = try lg.get("post_feedforward_layernorm.weight", &.{h}),
                 .attn = .{
-                    .q = try lg.get("self_attn.q_proj.weight", &.{ hq, h }),
-                    .k = try lg.get("self_attn.k_proj.weight", &.{ hk, h }),
-                    .v = try lg.get("self_attn.v_proj.weight", &.{ hk, h }),
-                    .o = try lg.get("self_attn.o_proj.weight", &.{ h, hq }),
-                    .gate = gate,
+                    .q = try lg.lin("self_attn.q_proj", hq, h),
+                    .k = try lg.lin("self_attn.k_proj", hk, h),
+                    .v = try lg.lin("self_attn.v_proj", hk, h),
+                    .o = try lg.lin("self_attn.o_proj", h, hq),
+                    .gate = try lg.lin("self_attn.gate_proj", hq, h),
                     // [heads] as [1, 1, heads, 1] in the gate's dtype (the reference adds it to the bf16 gate).
-                    .gate_bias = try w.own(a, try headBias(s, try lg.get("self_attn.gate_bias", &.{@intCast(c.n_heads)}), mlx.mlx_array_dtype(gate))),
+                    .gate_bias = try w.own(a, try headBias(s, try lg.get("self_attn.gate_bias", &.{@intCast(c.n_heads)}), gate_bias_dtype)),
                     .q_norm = try lg.get("self_attn.q_norm.weight", &.{hd}),
                     .k_norm = try lg.get("self_attn.k_norm.weight", &.{hd}),
                 },
@@ -194,9 +251,9 @@ pub const Weights = struct {
             } else {
                 const inter: c_int = @intCast(c.intermediate_size);
                 lw.dense = .{
-                    .gate = try lg.get("mlp.gate_proj.weight", &.{ inter, h }),
-                    .up = try lg.get("mlp.up_proj.weight", &.{ inter, h }),
-                    .down = try lg.get("mlp.down_proj.weight", &.{ h, inter }),
+                    .gate = try lg.lin("mlp.gate_proj", inter, h),
+                    .up = try lg.lin("mlp.up_proj", inter, h),
+                    .down = try lg.lin("mlp.down_proj", h, inter),
                 };
             }
         }
@@ -239,6 +296,27 @@ fn need(map: *const sdk.Weights, name: []const u8, shape: []const c_int, diag: ?
     const x = map.get(name) orelse return refuse(diag, error.BeamResidentMissing, "the residents lack {s}", .{name});
     if (!std.mem.eql(c_int, mlx.getShape(x), shape)) return refuse(diag, error.BeamResidentShape, "{s} is {any}, the served form's {any}", .{ name, mlx.getShape(x), shape });
     return x;
+}
+
+/// `need` with the dtype the format stores.
+fn needOf(map: *const sdk.Weights, name: []const u8, shape: []const c_int, dt: mlx.mlx_dtype, diag: ?*sdk.Diag) !T {
+    const x = try need(map, name, shape, diag);
+    if (mlx.mlx_array_dtype(x) != dt) return refuse(diag, error.BeamResidentDtype, "{s} is {s}, the served form's {s}", .{ name, @tagName(mlx.mlx_array_dtype(x)), @tagName(dt) });
+    return x;
+}
+
+/// The projection `prefix` [out, in] as `fmt` stores it: `bf16` the weight [out, in]; `affine8_g64` the codes U32
+/// [out, in / 4], the scales and biases BF16 [out, in / 64] (refused by name otherwise).
+fn linearOf(map: *const sdk.Weights, prefix: []const u8, out: c_int, in: c_int, fmt: beam.ResidentsFormat, diag: ?*sdk.Diag) !Linear {
+    var nb: [160]u8 = undefined;
+    if (fmt == .bf16) return .{ .bf16 = try need(map, std.fmt.bufPrint(&nb, "{s}.weight", .{prefix}) catch unreachable, &.{ out, in }, diag) };
+    const groups: c_int = @divExact(in, @as(c_int, beam.q8_group));
+    const words: c_int = @divExact(in * @as(c_int, beam.q8_bits), 32);
+    return .{ .q8 = .{
+        .w = try needOf(map, std.fmt.bufPrint(&nb, "{s}.weight", .{prefix}) catch unreachable, &.{ out, words }, .uint32, diag),
+        .scales = try needOf(map, std.fmt.bufPrint(&nb, "{s}.scales", .{prefix}) catch unreachable, &.{ out, groups }, .bfloat16, diag),
+        .biases = try needOf(map, std.fmt.bufPrint(&nb, "{s}.biases", .{prefix}) catch unreachable, &.{ out, groups }, .bfloat16, diag),
+    } };
 }
 
 /// `x` as f32 in a buffer of its own, evaluated: never the weight map's buffer.
@@ -361,6 +439,34 @@ pub fn linear(g: *G, x: T, w: T) !T {
     return g.matmul(x, try g.transpose(w));
 }
 
+/// x [.., in] -> [.., out] through the projection as stored: `bf16` x @ w^T (MLX's matmul, the control); `q8` MLX's
+/// `quantized_matmul` (affine, 8 bits, group 64, transposed weights: its qmv at decode's rows, its qmm on a wide call).
+pub fn project(g: *G, l: Linear, x: T) !T {
+    return switch (l) {
+        .bf16 => |w| linear(g, x, w),
+        .q8 => |q| g.quantizedMatmul(x, q.w, q.scales, q.biases, true, beam.q8_bits, beam.q8_group, .affine),
+    };
+}
+
+/// A prompt layer's view of `lw`: each q8 projection of its attention and its dense MLP as the BF16 weight MLX's
+/// `dequantize` writes (bf16(s x q + b)), a node of the layer's graph made here once: every tile of the layer reads it,
+/// the layer's end (the forward's mark) releases it. MiMo's and glm5_next's prompt route (the stock GEMM over a
+/// projection's BF16 weight, written once per prompt layer) with the forward's scope as its cache: one layer's set at a
+/// time (bill.zig `promptViewBytes`). A BF16 projection is its own view.
+pub fn promptView(g: *G, lw: *const Layer) !Layer {
+    var v = lw.*;
+    inline for (.{ "q", "k", "v", "o", "gate" }) |f| @field(v.attn, f) = try bf16View(g, @field(lw.attn, f));
+    if (lw.dense) |d| v.dense = .{ .gate = try bf16View(g, d.gate), .up = try bf16View(g, d.up), .down = try bf16View(g, d.down) };
+    return v;
+}
+
+fn bf16View(g: *G, l: Linear) !Linear {
+    return switch (l) {
+        .bf16 => l,
+        .q8 => |q| .{ .bf16 = try g.dequantizeWith(q.w, q.scales, q.biases, beam.q8_bits, beam.q8_group, .affine) },
+    };
+}
+
 pub fn rmsNorm(g: *G, x: T, w: T, eps: f32) !T {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_rms_norm(&o, x, w, eps, g.s));
@@ -433,9 +539,9 @@ pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const 
         }
     }.f;
     // [1, heads, n, d]: each head normed over its d (q_norm / k_norm), then RoPE on a sliding layer.
-    var q = try heads4(g, try rmsNorm(g, try g.reshape(try linear(g, xn, at.q), &.{ n, heads, hd }), at.q_norm, c.rms_norm_eps), n, heads, hd);
-    var k = try heads4(g, try rmsNorm(g, try g.reshape(try linear(g, xn, at.k), &.{ n, kvh, hd }), at.k_norm, c.rms_norm_eps), n, kvh, hd);
-    const v = try heads4(g, try linear(g, xn, at.v), n, kvh, hd);
+    var q = try heads4(g, try rmsNorm(g, try g.reshape(try project(g, at.q, xn), &.{ n, heads, hd }), at.q_norm, c.rms_norm_eps), n, heads, hd);
+    var k = try heads4(g, try rmsNorm(g, try g.reshape(try project(g, at.k, xn), &.{ n, kvh, hd }), at.k_norm, c.rms_norm_eps), n, kvh, hd);
+    const v = try heads4(g, try project(g, at.v, xn), n, kvh, hd);
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
     var out: T = undefined;
     if (lw.full) {
@@ -455,15 +561,15 @@ pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const 
     }
     // [1, n, heads, d], gated per head: attn * sigmoid(gate_proj(x) + gate_bias).
     const o = try g.transposeAxes(out, &.{ 0, 2, 1, 3 });
-    const gate = try g.sigmoid(try g.add(try g.reshape(try linear(g, xn, at.gate), &.{ 1, n, heads, hd }), at.gate_bias));
+    const gate = try g.sigmoid(try g.add(try g.reshape(try project(g, at.gate, xn), &.{ 1, n, heads, hd }), at.gate_bias));
     const gated = try g.mul(o, gate);
-    return linear(g, try g.reshape(gated, &.{ n, heads * hd }), at.o);
+    return project(g, at.o, try g.reshape(gated, &.{ n, heads * hd }));
 }
 
 /// The dense SwiGLU (f32 activation, `swiglu_f32`), then down.
 pub fn mlp(g: *G, m: Mlp, x: T) !T {
-    const act = try sdk_ext.quant.activation(G, g, .swiglu_f32, try linear(g, x, m.gate), try linear(g, x, m.up));
-    return linear(g, act, m.down);
+    const act = try sdk_ext.quant.activation(G, g, .swiglu_f32, try project(g, m.gate, x), try project(g, m.up, x));
+    return project(g, m.down, act);
 }
 
 /// A prompt call's dense MLP over `x` [rows, hidden] in tiles of `dense_tile_rows` rows: each tile committed as built
@@ -614,10 +720,14 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
     const n_tiles: usize = (rows + tile_rows - 1) / tile_rows;
     const outs = try a.alloc(T, n_tiles);
     defer a.free(outs);
-    for (w.layers, 0..) |*lw, li| {
+    for (w.layers, 0..) |*stored, li| {
         const l: u32 = @intCast(li);
         const m = g.mark();
         defer g.resetTo(m);
+        // A prompt layer reads its q8 projections as BF16 weights dequantized once here (`promptView`); a decode step
+        // reads them as stored.
+        const view = if (prompt) try promptView(g, stored) else stored.*;
+        const lw = &view;
         if (prompt and lw.router != null) try postReadAhead(g, c, lw, l, x, src);
         // The attention, tile by tile (the rings and slabs carry from one tile to the next); in a prompt call each tile
         // is committed as built and the tile before it waited, so at most `tiles_in_flight` run at once.
@@ -665,9 +775,10 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
     return g.keep(try logitsOf(g, c, w, last));
 }
 
-/// The head over `x` [r, hidden]: the final norm, lm_head (bf16), then the soft cap in f32: cap * tanh(logits / cap).
+/// The head over `x` [r, hidden]: the final norm, lm_head (its output bf16), then the soft cap in f32:
+/// cap * tanh(logits / cap).
 pub fn logitsOf(g: *G, c: *const beam.Config, w: *const Weights, x: T) !T {
-    const logits = try g.astype(try linear(g, try rmsNorm(g, x, w.norm, c.rms_norm_eps), w.head), .float32);
+    const logits = try g.astype(try project(g, w.head, try rmsNorm(g, x, w.norm, c.rms_norm_eps)), .float32);
     const cap: f64 = c.final_logit_softcapping;
     return g.mul(try tanh(g, try g.mul(logits, try g.scalar(1.0 / cap, .float32))), try g.scalar(cap, .float32));
 }
@@ -689,6 +800,22 @@ test "beam graph: the kept residents are the trunk's (no routed expert, no quant
     }) |n| try testing.expect(!keptResident(&c, n));
     // 3 + 52 x 12 + 3 x 3 + 49 x 2 tensors.
     try testing.expectEqual(@as(u64, 3 + 52 * 12 + 9 + 98), residentTensors(&c));
+    try testing.expectEqual(@as(u64, 734), residentTensors(&c));
+}
+
+test "beam graph: the q8 tier keeps each projection's scales and biases, and nothing else's; 270 projections of three tensors" {
+    const c: beam.Config = .{ .residents_format = .affine8_g64 };
+    for ([_][]const u8{
+        "lm_head.scales",                         "lm_head.biases",                            "model.layers.0.mlp.down_proj.scales",
+        "model.layers.51.self_attn.gate_proj.biases", "model.layers.7.self_attn.k_proj.scales", "model.layers.7.self_attn.o_proj.weight",
+    }) |n| try testing.expect(keptResident(&c, n));
+    for ([_][]const u8{
+        "model.embed_tokens.scales",             "model.layers.3.mlp.gate.scales",     "model.layers.3.mlp.gate_proj.scales",
+        "model.layers.5.self_attn.q_norm.scales", "model.layers.52.self_attn.q_proj.biases", "model.layers.3.mlp.experts.0.gate_proj.scales",
+    }) |n| try testing.expect(!keptResident(&c, n));
+    try testing.expect(!keptResident(&beam.Config{}, "lm_head.scales"));
+    try testing.expectEqual(@as(u64, 1 + 52 * 5 + 3 * 3), projections(&c));
+    try testing.expectEqual(@as(u64, 734 + 2 * 270), residentTensors(&c));
 }
 
 test "beam graph: the call geometry and the full layers' query scale" {

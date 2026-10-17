@@ -1,4 +1,5 @@
-//! beam's module: Reflection Beam 1.0 served from its pack (config.json, the BF16 residents, the NVFP4 expert bank).
+//! beam's module: Reflection Beam 1.0 served from its pack (config.json, the residents in BF16 or the q8 tier, the NVFP4
+//! expert bank).
 //! Construction, once: the bill and the rows (the fill, or the operator's pin), the trunk's residents (the kept ones read
 //! now, the rest dropped from the weight map unread), the owned tables, the expert source on MiMo's route at the plan's
 //! rows, the KV lanes allocated at the billed context, the rate tally, the usage record and seed, the receipt's lines.
@@ -103,8 +104,8 @@ pub const Module = struct {
         errdefer self.cache.deinit(&self.g);
         // The usage seed (`resident_seed`): before the first request; one line.
         try residency.seedResidents(gpa, io, "beam", &self.c.residency, dir, self.src);
-        log.info("beam routes: prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe=stock call_rows={d} tile_rows={d} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ @tagName(self.src.combine_route), @tagName(route.read_schedule), @tagName(route.drain), @tagName(route.bank_view), experts.call_rows, graph.tile_rows, @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
-        log.info("mlx-stream beam installed: {d} layers ({d} sliding, {d} full; {d} dense, {d} routed); residents BF16 {d} tensors read in {d:.2} s; experts NVFP4 g16 streamed, top-{d} of {d}, {d} resident expert rows/layer, call {d}\n", .{ model.n_layers, model.nSliding(), model.nFull(), model.first_k_dense, n_moe, weights.count(), @as(f64, @floatFromInt(read_ns)) / 1e9, model.n_experts_per_tok, model.n_routed_experts, plan.rows.prompt, experts.call_rows });
+        log.info("beam routes: residents={s} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe=stock call_rows={d} tile_rows={d} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ @tagName(model.residents_format), @tagName(self.src.combine_route), @tagName(route.read_schedule), @tagName(route.drain), @tagName(route.bank_view), experts.call_rows, graph.tile_rows, @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
+        log.info("mlx-stream beam installed: {d} layers ({d} sliding, {d} full; {d} dense, {d} routed); residents {s} {d} tensors read in {d:.2} s; experts NVFP4 g16 streamed, top-{d} of {d}, {d} resident expert rows/layer, call {d}\n", .{ model.n_layers, model.nSliding(), model.nFull(), model.first_k_dense, n_moe, @tagName(model.residents_format), weights.count(), @as(f64, @floatFromInt(read_ns)) / 1e9, model.n_experts_per_tok, model.n_routed_experts, plan.rows.prompt, experts.call_rows });
         log.info("beam memory: target={d} baseline={d} process_bound={d} prompt_rows={d} decode_rows={d} reserve_tokens={d} kv=bf16 phase_rows=on growth_rows={d} forced={s}\n", .{ plan.target, plan.baseline, plan.bill.processBound(plan.rows), plan.rows.prompt, plan.rows.decode, plan.reserve, plan.rows.decode - plan.rows.prompt, if (bill.isForced(cfg)) "yes" else "no" });
         // Once (every command retired, MLX's cache cleared): the footprint beside the bill's construction terms. A report.
         route.constructionCheck("beam", s, plan.bill, plan.rows.prompt, bill.construction_tolerance_bytes);

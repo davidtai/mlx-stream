@@ -4,7 +4,8 @@
 //! sigmoid output gate, on sliding-window layers with RoPE or on full-attention layers without positions and with the
 //! scalable-softmax query scale; then a dense SwiGLU MLP on the leading dense layers or a routed MoE (DeepSeek-V3's
 //! noaux_tc group top-k, sigmoid, normalized, the weighted sum times `routed_scaling_factor`). Every SwiGLU runs in f32.
-//! The head is untied and soft-capped. The served geometry is the config's own: the pack's and the test fixture's.
+//! The head is untied and soft-capped. The served geometry is the config's own: the pack's and the test fixture's. The
+//! residents are the release's BF16 or the q8 tier's (`residents_format`, docs/nvfp4-pack.md).
 
 const std = @import("std");
 
@@ -15,6 +16,16 @@ pub const default_expert_rows: u32 = 8;
 /// (1 + (position + 1) / ssmax_base) ^ ssmax_power.
 pub const ssmax_base: f32 = 2048;
 pub const ssmax_power: f32 = 0.1;
+
+/// The residents as the pack stores them (`residents_format`, read once at construction): `bf16` (absent: the release's
+/// BF16) or `affine8_g64`, the q8 tier (docs/nvfp4-pack.md): the weight of every linear of the trunk (the attention's
+/// q / k / v / gate / o, the dense MLP's gate / up / down) and the head as MLX's affine 8-bit group 64, U32 codes
+/// [out, in / 4] with BF16 scales and biases [out, in / 64]; the embedding, the norms, the gate biases and the routers
+/// as released.
+pub const ResidentsFormat = enum { bf16, affine8_g64 };
+/// The q8 tier's MLX affine quantization (`quantized_matmul` / `dequantize` mode affine).
+pub const q8_bits: u32 = 8;
+pub const q8_group: u32 = 64;
 
 pub const Diag = struct {
     buf: [320]u8 = undefined,
@@ -56,6 +67,7 @@ pub const Config = struct {
     first_k_dense: u32 = 3,
     /// Bit l set: layer l runs full attention (no RoPE, the query scale); the rest sliding attention.
     full_mask: u64 = beam_full_mask,
+    residents_format: ResidentsFormat = .bf16,
 
     /// Beam 1.0: every sixth layer and the last run full attention (5, 11, ..., 47, 51).
     pub const beam_full_mask: u64 = blk: {
@@ -146,6 +158,13 @@ pub const Config = struct {
         if (c.n_group == 0 or c.n_routed_experts % c.n_group != 0 or c.topk_group == 0 or c.topk_group > c.n_group) return refuse(diag, error.BeamConfigUnsupported, "n_group {d} / topk_group {d} over {d} experts", .{ c.n_group, c.topk_group, c.n_routed_experts });
         if (c.groupExperts() < 2 or c.topk_group * c.groupExperts() < c.n_experts_per_tok) return refuse(diag, error.BeamConfigUnsupported, "{d} groups of {d} experts, {d} kept: fewer than the top-{d}", .{ c.n_group, c.groupExperts(), c.topk_group, c.n_experts_per_tok });
         if (!(c.final_logit_softcapping > 0)) return refuse(diag, error.BeamConfigUnsupported, "final_logit_softcapping {d} (a positive cap served)", .{c.final_logit_softcapping});
+        if (t.get("residents_format")) |v| {
+            if (v != .string) return refuse(diag, error.BeamConfigField, "residents_format is not a string", .{});
+            c.residents_format = std.meta.stringToEnum(ResidentsFormat, v.string) orelse return refuse(diag, error.BeamConfigUnsupported, "residents_format {s} (bf16 / affine8_g64 served)", .{v.string});
+        }
+        // The q8 tier's groups: every projection's inputs whole groups of 64 (hidden, the heads' width, the dense MLP's).
+        if (c.residents_format == .affine8_g64 and (c.hidden_size % q8_group != 0 or (c.n_heads * c.head_dim) % q8_group != 0 or c.intermediate_size % q8_group != 0))
+            return refuse(diag, error.BeamConfigUnsupported, "residents_format affine8_g64: hidden {d} / heads x head_dim {d} / intermediate {d} (multiples of {d} served)", .{ c.hidden_size, c.n_heads * c.head_dim, c.intermediate_size, q8_group });
         try c.parseLayers(t, diag);
         try c.parseRope(t, diag);
         return c;
@@ -251,6 +270,37 @@ test "beam config: the release's config.json parses to Beam 1.0's served form" {
     try testing.expectEqual(@as(f32, 30), c.final_logit_softcapping);
     try testing.expectEqual(@as(u32, 2), Config.residualIndex(0, false));
     try testing.expectEqual(@as(u32, 105), Config.residualIndex(51, true));
+    try testing.expectEqual(ResidentsFormat.bf16, c.residents_format);
+}
+
+test "beam config: residents_format picks the q8 tier; a format outside bf16 / affine8_g64, or not a string, refuses by name" {
+    const a = testing.allocator;
+    for ([_]struct { extra: []const u8, want: ?ResidentsFormat }{
+        .{ .extra = "\"residents_format\":\"affine8_g64\",", .want = .affine8_g64 },
+        .{ .extra = "\"residents_format\":\"bf16\",", .want = .bf16 },
+        .{ .extra = "\"residents_format\":\"fp8_block128\",", .want = null },
+        .{ .extra = "\"residents_format\":8,", .want = null },
+    }) |case| {
+        const text = try beamConfigJson(a, case.extra);
+        defer a.free(text);
+        var diag: Diag = .{};
+        if (case.want) |want| {
+            try testing.expectEqual(want, (try Config.parse(a, text, &diag)).residents_format);
+        } else {
+            _ = Config.parse(a, text, &diag) catch {
+                try testing.expect(std.mem.indexOf(u8, diag.message(), "residents_format") != null);
+                continue;
+            };
+            return error.TestUnexpectedResult;
+        }
+    }
+    // The q8 tier's group: an intermediate width that is not whole groups of 64 refuses.
+    const text = try beamConfigJson(a, "\"residents_format\":\"affine8_g64\",");
+    defer a.free(text);
+    const odd = try std.mem.replaceOwned(u8, a, text, "\"intermediate_size\":20480", "\"intermediate_size\":20448");
+    defer a.free(odd);
+    var diag: Diag = .{};
+    try testing.expectError(error.BeamConfigUnsupported, Config.parse(a, odd, &diag));
 }
 
 test "beam config: the layer mask at every served depth, 64 layers included" {
