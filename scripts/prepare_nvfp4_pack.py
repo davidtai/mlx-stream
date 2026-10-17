@@ -48,10 +48,10 @@ it and read it back, so the shards never sit on disk at once. The parity keep se
 seeded) stays until `verify --delete-verified`.
 
 Refusals: every mismatch refuses by name with exit status 1: a source file's size or sha256 (the pin), the index's
-tensor set (a missing or an extra tensor), a tensor's dtype or shape, a NaN E4M3 block scale, the quantization config (NVFP4, group 16, every resident
-excluded, every expert quantized), a geometry bank.zig refuses. A global scale
-with no exact f32 g (one f32 rounding, about 9 % of ModelOpt's amax / 6 / 448) is not refused: the nearest g is
-taken, counted in the manifest (`global_scale_inexact`, with its tensors) and checked by verify within 1 ulp.
+tensor set (a missing or an extra tensor), a tensor's dtype or shape, a NaN E4M3 block scale, the quantization config
+(NVFP4, group 16, every resident excluded, every expert quantized), a geometry bank.zig refuses. A global scale with
+no exact f32 g (one f32 ulp, about 9 % of ModelOpt's amax / 6 / 448) is not refused: the nearest g is taken, counted
+in the manifest (`global_scale_inexact`, with its tensors) and checked by verify within 1 ulp.
 
 Requirements: Python 3.8+ and numpy (no torch, no mlx). Nothing runs on the GPU. Large files are read and written with
 F_NOCACHE on macOS. Set HF_TOKEN to send a Hugging Face token (to huggingface.co only).
