@@ -55,6 +55,7 @@ comptime {
     if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/exl3_forms_ref.zig");
     if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/exl3_kbench.zig");
     _ = @import("arch/mimo_v2/stream_source.zig");
+    _ = @import("arch/mimo_v2/route.zig");
     _ = @import("arch/deepseek_v41/deepseek_v41.zig");
     _ = @import("arch/deepseek_v41/ops.zig");
     _ = @import("arch/deepseek_v41/graph.zig");
