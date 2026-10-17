@@ -263,6 +263,12 @@ pub fn stored() Stored {
     return .{ .rows = rows[0..@min(counts()[0], max_buffers)], .verifies = verifies[0..cycles], .layers = layers[0..cycles], .n_layers = n_layers };
 }
 
+/// The read pool's event signals the stored decode logged (read after `settle`); empty outside profile builds.
+pub fn storedSignals() []const Signal {
+    if (comptime !enabled) return &.{};
+    return signals[0..n_signals];
+}
+
 /// A row's cycle (null: untagged) and phase (`Phase`'s value), as the summary reads its tag.
 pub fn rowCycle(r: Row) ?u32 {
     return tagCycle(r.tag);
