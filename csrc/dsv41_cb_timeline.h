@@ -45,6 +45,25 @@ void dsv41tl_tag(uint64_t tag);
 void dsv41tl_counts(uint32_t out[3]);
 uint64_t dsv41tl_now(void);
 
+/* The kernel log: one compute dispatch (its command buffer's row, its kernel's name offset in dsv41kl_names(), its
+ * threadgroups and threads per threadgroup). row 0xFFFFFFFF: an untagged buffer; 0xFFFFFFFE: past the rows' cap;
+ * 0xFFFFFFFD: not committed when read. */
+typedef struct {
+  uint32_t row;
+  uint32_t name;
+  uint32_t grid[3];
+  uint32_t group[3];
+} Dsv41klDispatch;
+/* Overrides the device's pipeline creation and the compute encoder's pipeline set and dispatches, once per process
+ * (before the model's first kernel): 0, or a negative step that failed. */
+int dsv41kl_hook(void);
+/* on: the calling thread's dispatches logged from index 0; off: none. */
+void dsv41kl_arm(int on);
+/* The log; out = {entries, dropped past the cap, the names' bytes, the pipelines named}. */
+const Dsv41klDispatch *dsv41kl_rows(uint32_t out[4]);
+/* The names, NUL-separated ("?" at 0: a pipeline made before the hook). */
+const char *dsv41kl_names(void);
+
 #ifdef __cplusplus
 }
 #endif
