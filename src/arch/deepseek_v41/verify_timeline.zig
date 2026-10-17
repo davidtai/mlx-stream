@@ -16,8 +16,9 @@ pub var active: bool = false;
 /// Cycles <= max_tokens - 1 (the cell's default cap: 1,024 ids).
 pub const max_cycles = 1024;
 pub const max_layers = @import("deepseek_v41.zig").max_layers;
-/// Buffers past this are counted (`dropped`), not recorded.
-pub const max_buffers = 1 << 18;
+/// Buffers past this are counted (`dropped`), not recorded. Beam's profile (beam/profile.zig) records ~100 serial steps
+/// with one MLX primitive per command buffer (MLX_MAX_OPS_PER_BUFFER=0): ~5,000 buffers a step.
+pub const max_buffers = 1 << 20;
 
 /// One committed command buffer (the shim's `Dsv41tlRow`). Times: mach_absolute_time ns.
 /// `queue`: 1 for the queue of the buffer the install saw (MLX's stream), 0 for another queue.
@@ -620,7 +621,7 @@ pub fn writeJson(w: *std.Io.Writer) !void {
 }
 
 test "dsv41 verify timeline: a default build stamps nothing and links no shim; the storage bound is static" {
-    try std.testing.expectEqual(@as(usize, (1 << 18) * 56 + 1024 * (64 * @sizeOf(Layer) + 16) + (1 << 17) * 32), storage_bytes);
+    try std.testing.expectEqual(@as(usize, (1 << 20) * 56 + 1024 * (64 * @sizeOf(Layer) + 16) + (1 << 17) * 32), storage_bytes);
     try std.testing.expectError(error.TimelineCycles, bound(1026, 40));
     try std.testing.expectError(error.TimelineLayers, bound(1024, 65));
     try bound(1024, 40);
