@@ -65,6 +65,11 @@ pub const decode_lane_rows: u32 = Math.decode_forward_rows;
 /// into their planned rows. Exact by construction.
 pub const prompt_stage_rows: u32 = 64;
 
+/// The shared scheduler's wide prompt route: the seed, the hot-first groups at MiMo's depth, P1's read-ahead, and P7's
+/// route-plan cut (glm5_next's prompt lever: the call's rows bucketed by group once, each group's bank passes over its
+/// own rows: the same plans and waves, host planning only; exact).
+pub const wide_route: shared_experts.Wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true, .route_cut = true };
+
 /// The stream's construction options: the shared route's (route.zig `streamOptionsOf`) and P6's staging rows.
 pub fn streamOptions(rows: []const u32, memory: B.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings) !B.Options {
     var opts = try route.streamOptionsOf(B, rows, memory, event, tally, false);
@@ -208,7 +213,7 @@ pub const Source = struct {
             .n_routed_experts = geo.num_experts,
             .n_experts_per_tok = k,
         };
-        self.ex = try Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true }, .banked = decode_moe != .stock, .devroute = decode_moe == .hitpass });
+        self.ex = try Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = gates, .event = event, .wide = wide_route, .banked = decode_moe != .stock, .devroute = decode_moe == .hitpass });
         errdefer self.ex.deinit();
         if (self.combine_route == .inplace) self.ex.setJoinlessBound(prefill_combine.inplace_sources);
         log.info("beam experts: NVFP4 g16 bank {d} x {d} records of {d} B (scale lines isolated, {d}-byte lines); decode_moe={s} ({s}); prompt_combine={s}; {s}\n", .{ geo.num_moe_layers, geo.num_experts, geo.record_bytes, bank.scale_line_bytes, @tagName(decode_moe), switch (decode_moe) {
@@ -434,6 +439,8 @@ test "beam experts: the stream's options are the shared route's: overlap schedul
     try testing.expectEqual(B.S.PromptReads.overlap, opts.prompt_reads);
     try testing.expectEqual(B.S.AheadPost.whole_trim, opts.prompt_ahead);
     try testing.expect(opts.prompt_relocate and opts.transient_release and !opts.pool.direct);
+    // P7: the wide route cuts its plans by group (host planning only).
+    try testing.expect(wide_route.route_cut and wide_route.read_ahead and wide_route.seed and wide_route.hot_first);
     try testing.expectEqual(mimo_stream.decodeRouteIds(route.decode_window), opts.decode_route_ids);
     // The prompt combine: the text at Beam's 5,120 (whole threadgroups), MiMo's stock reduction at a fixture's 256.
     try testing.expect(combineRouteOf(5120, 8) != .stock);
