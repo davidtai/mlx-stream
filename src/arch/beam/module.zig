@@ -44,6 +44,10 @@ pub const Module = struct {
     sampler: Sampler,
     /// The rate tally, the usage record and the usage seed (sdk_ext/expert/residency.zig).
     res: residency.Residency = .{},
+    /// A forward failed after it advanced the KV lanes (a sliding ring appends its rows before the forward ends, the
+    /// committed length only at its end): the request's state is lost and every step refuses by name
+    /// (`BeamDecodeStateLost`) until the next prompt pass restarts the lanes.
+    state_lost: bool = false,
 
     const Decode = struct { steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0, s0: sdk_ext.expert.Stats = .{}, active: bool = false, prompt_tokens: u64 = 0 };
 
@@ -156,6 +160,7 @@ pub const Module = struct {
         self.requestEnd();
         if (req.prompt_tokens != ids.len) return error.BeamPrefixNotKept;
         try self.beginPrompt(ids);
+        errdefer self.state_lost = true;
         const logits = try self.promptCalls(ids, .last, {});
         errdefer self.g.release(logits);
         try self.enterDecode(ids.len);
@@ -173,6 +178,7 @@ pub const Module = struct {
         try self.src.beginPrefill();
         _ = try self.src.chooseReadSchedule(ids.len);
         self.cache.restart();
+        self.state_lost = false;
     }
 
     /// The prompt's calls (at most `experts.call_rows` rows each, layer by layer): the last call's logits (every row's
@@ -208,9 +214,12 @@ pub const Module = struct {
 
     /// `step` with `force`: `{}` (served), or the parity test's routes (graph.zig `ForcedRoutes`).
     pub fn stepWith(self: *Module, ids: []const u32, force: anytype) !T {
+        if (self.state_lost) return error.BeamDecodeStateLost;
         if (ids.len == 0) return error.BeamEmptyStep;
         if (self.cache.len + ids.len > self.cache.cap) return error.ContextOverBill;
         try self.checkTokens(ids);
+        // Past the checks every failure leaves the lanes ahead of the committed length.
+        errdefer self.state_lost = true;
         if (!self.src.decodeLaneAt(@intCast(ids.len))) {
             try self.src.resumePrefill();
             const logits = try self.promptCalls(ids, .last, force);
@@ -261,4 +270,12 @@ pub fn admitted(io: std.Io, c: *const settings.Config, facts: *const sdk.LoadFac
         built.memory_baseline_bytes = try pagecache.admissionBaseline(io, dir, nonfile);
     };
     return built;
+}
+
+const testing = std.testing;
+
+test "beam module: a step after a failed forward refuses by name until the next prompt pass" {
+    var m: Module = undefined;
+    m.state_lost = true;
+    try testing.expectError(error.BeamDecodeStateLost, m.stepWith(&.{1}, {}));
 }
