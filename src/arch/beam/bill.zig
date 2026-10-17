@@ -584,7 +584,7 @@ test "beam bill: the draft lane adds the drafter's residents and rings from cons
     var in = try fixtureInputs(32_768);
     const off = try billOf(a, &in);
     defer off.free(a);
-    in.lane = .{ .drafter = drafter.beam_drafter, .resident_bytes = 3_855_000_000, .resident_arrays = 101, .depth = 7 };
+    in.lane = .{ .drafter = drafter.beam_drafter, .resident_bytes = 3_855_000_000, .resident_arrays = 121, .depth = 7 };
     const on = try billOf(a, &in);
     defer on.free(a);
     for ([_][]const u8{ "drafter_residents", "drafter_context", "draft_round" }) |n| try testing.expectEqual([2]u64{ 0, 0 }, termOf(off, n));
