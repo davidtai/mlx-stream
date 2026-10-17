@@ -291,22 +291,22 @@ pub const Source = struct {
         return route.decodeLane(nt, self.decoding(), decode_lane_rows);
     }
 
-    /// One routed call of absolute layer `layer`: x [nt, H] bf16, ids [nt, 8], f32 weights [nt, 8] -> the weighted sum
-    /// [nt, H] bf16, a KEPT handle the caller adopts. The decode lane's output is lazy (the next routing barrier or the
-    /// logits evaluate it); a wide call's is evaluated.
+    /// One routed call of absolute layer `layer`: x [nt, H] bf16, ids u32 [nt, 8] (the router's, read by the scheduler
+    /// as they are), f32 weights [nt, 8] -> the weighted sum [nt, H] bf16, a KEPT handle the caller adopts. The decode
+    /// lane's output is lazy (the next routing barrier or the logits evaluate it); a wide call's is evaluated.
     pub fn forward(self: *Self, layer: u32, x: T, expert_ids: T, route_weights: T) !T {
         const g = &self.g;
         defer g.reset();
         const nt: u32 = @intCast(g.shapeOf(x).d[0]);
         if (self.decodeLaneAt(nt)) {
-            const routed = try self.ex.at(layer).routedHoist(g, x, try g.astype(expert_ids, .int32), &.{});
+            const routed = try self.ex.at(layer).routedHoist(g, x, expert_ids, &.{});
             return g.keep(try route.combineStock(g, routed, route_weights, self.k));
         }
         // Decode's window 0 holds one decode-lane route: no decode-phase call is wide (the module resumes the prompt
         // phase for any wider forward). An invariant of the callers.
         std.debug.assert(!self.decoding());
         const hook = self.ex.at(layer);
-        const parts = try hook.routedParts(g, x, try g.astype(expert_ids, .int32));
+        const parts = try hook.routedParts(g, x, expert_ids);
         defer hook.releaseParts(g);
         // The tiles are evaluated; this evaluates the merged source, if any.
         try g.evalAll(parts.outs);

@@ -936,9 +936,12 @@ pub const MlxOps = struct {
         g.waits += 1;
         try mlx.check(mlx.mlx_array_eval(x));
         if (mlx.mlx_array_size(x) != out.len) return error.HostIdsSize;
-        // One producer dtype: the router's int32 indices (the arm's stand-in emits the same).
-        std.debug.assert(mlx.mlx_array_dtype(x) == .int32);
-        return readInPlace(i32, u16, x, mlx.mlx_array_data_int32(x), out);
+        // The routers' indices as they make them: int32 (DeepSeek's, the arm's stand-in) or uint32 (an argpartition's).
+        return switch (mlx.mlx_array_dtype(x)) {
+            .int32 => readInPlace(i32, u16, x, mlx.mlx_array_data_int32(x), out),
+            .uint32 => readInPlace(u32, u16, x, mlx.mlx_array_data_uint32(x), out),
+            else => error.HostIdsDtype,
+        };
     }
 
     /// Copies the evaluated `x`'s values, row-major, into `out`, reading its buffer through its own
@@ -1695,7 +1698,7 @@ pub const TraceOps = struct {
     /// The routing barrier: a marker, then the script's next ids.
     pub fn hostIds(g: *TraceOps, x: T, out: []u16) ![]const u16 {
         _ = try g.push(.host_read, .bool_, .{});
-        if (g.dtypeOf(x) != .int32) return error.HostIdsDtype;
+        if (g.dtypeOf(x) != .int32 and g.dtypeOf(x) != .uint32) return error.HostIdsDtype;
         if (g.shapeOf(x).numel() != @as(i64, @intCast(out.len))) return error.HostIdsSize;
         const hv = g.host_values orelse return error.NoHostValues;
         try hv.ids(hv.ctx, out);
