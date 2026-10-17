@@ -228,8 +228,18 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         // The plugin's sampler on a row it hands the host (`sdk_ext.sampler.chosen`): eight f32 vocab rows at most.
         .{ .name = "sampler", .bytes = @splat(8 * @as(u64, c.vocab_size) * f32b), .at_construction = false },
         .{ .name = "gpu_warm", .bytes = @splat(if (in.gpu_keep_warm == .waits) gpu_warm.bill_bytes else 0), .at_construction = in.gpu_keep_warm == .waits },
+        // P6's staging rows (experts.zig `prompt_stage_rows`): host pages in the prompt phase only (the phase change
+        // frees them with the transient scratch), each component's bank page-rounded.
+        .{ .name = "slot_stage", .bytes = .{ stageBytes(in), 0 }, .at_construction = true },
     };
     return a.dupe(Term, &terms);
+}
+
+/// P6's staging rows (`experts.prompt_stage_rows`): a slot row each, at the record stride or the line-isolated slot row,
+/// whichever is larger (the transient scratch's rule), and each component's bank rounded to a page.
+pub fn stageBytes(in: *const Inputs) u64 {
+    const g = in.geometry;
+    return @as(u64, experts.prompt_stage_rows) * @max(g.record_bytes, g.slot_row_bytes) + bank.n_components * in.page;
 }
 
 /// The shared route's inputs at this bill's geometry: the NVFP4 tile, the source's own sizes, no decode texts.
@@ -445,6 +455,15 @@ test "beam bill: the q8 tier bills its residents and a dense layer's prompt view
     const r8 = try sdk.fill(b8, baseline, target, 256, min_rows);
     try testing.expect(r8.decode >= r16.decode + 5 and r8.prompt >= r16.prompt + 5);
     std.debug.print("\nBEAM BILL q8 (baseline 35.06 GB, ctx 32,768): rows {d}/{d} against bf16's {d}/{d}; prompt_view {d} B\n", .{ r8.prompt, r8.decode, r16.prompt, r16.decode, view[0] });
+}
+
+test "beam bill: P6's staging rows bill the prompt phase only: 64 slot rows at the record stride and a page a component" {
+    const a = testing.allocator;
+    const in = try fixtureInputs(32_768);
+    const b = try billOf(a, &in);
+    defer b.free(a);
+    try testing.expectEqual(@as(u32, 64), experts.prompt_stage_rows);
+    try testing.expectEqual([2]u64{ 64 * 22_122_496 + bank.n_components * 16_384, 0 }, termOf(b, "slot_stage"));
 }
 
 test "beam bill: the keep-warm route bills MiMo's declared engine from construction; the control, none" {
