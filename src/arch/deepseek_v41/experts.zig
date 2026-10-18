@@ -81,6 +81,12 @@ const traceBank = expert_stream.traceBank;
 /// DEVROUTE's resident map of one layer from its policy (`expert_stream.lutOf`).
 const lutOf = expert_stream.lutOf;
 
+/// DEVROUTE's LUTs as a bill counts them: `layers` LUT pairs (`ExpertsWith.dev_lut`: u32 [experts] each, a host array in
+/// its own MLX buffer of at least a page), held from the first phase change to the end.
+pub fn devLutBytes(layers: u64, experts: u64, page: u64) u64 {
+    return layers * 2 * std.mem.alignForward(u64, @max(4 * experts, 1), page);
+}
+
 // ── StreamSource: the streamer's Stream, the EXL3 source's side of the contract (`expert_stream.StreamSource`) ──
 
 pub const StreamSource = expert_stream.StreamSource;
