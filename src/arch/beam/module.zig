@@ -50,7 +50,9 @@ pub const Module = struct {
     /// (`BeamDecodeStateLost`) until the next prompt pass restarts the lanes.
     state_lost: bool = false,
 
-    const Decode = struct { steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0, s0: sdk_ext.expert.Stats = .{}, active: bool = false, prompt_tokens: u64 = 0 };
+    /// `open_ns`: the start of the last serial step, whose wall ends at the next step's start or at the request's end
+    /// (`closeStep`).
+    const Decode = struct { steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0, s0: sdk_ext.expert.Stats = .{}, active: bool = false, prompt_tokens: u64 = 0, open_ns: ?u64 = null };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, ceiling: u64, stop: u64) !*Module {
         const model = &cfg.model;
@@ -106,7 +108,7 @@ pub const Module = struct {
         // The usage profile's record (`expert_usage_record`, off by default).
         try self.res.openUsage(gpa, io, "beam", &self.c.residency, self.src);
         errdefer self.res.closeUsage();
-        if (self.src.warm != null) log.info("beam gpu keep-warm installed: gpu_keep_warm=waits source={s} (MiMo X12; bill {d} B)\n", .{ if (self.c.gpu_keep_warm_requested) "setting" else "default", gpu_warm.bill_bytes });
+        if (self.src.warm != null) log.info("beam gpu keep-warm installed: gpu_keep_warm=waits source={s} (MiMo X12: the gated waits and every decode routing barrier; bill {d} B)\n", .{ if (self.c.gpu_keep_warm_requested) "setting" else "default", gpu_warm.bill_bytes });
         self.cache = try graph.Cache.init(gpa, &self.g, &self.c.model, @intCast(plan.reserve));
         errdefer self.cache.deinit(&self.g);
         // The usage seed (`resident_seed`): before the first request; one line.
@@ -228,6 +230,8 @@ pub const Module = struct {
         try self.checkTokens(ids);
         // Past the checks every failure leaves the lanes ahead of the committed length.
         errdefer self.state_lost = true;
+        const t0 = self.nowNs();
+        self.closeStep(t0);
         if (!self.src.decodeLaneAt(@intCast(ids.len))) {
             try self.src.resumePrefill();
             const logits = try self.promptCalls(ids, .last, force);
@@ -235,20 +239,32 @@ pub const Module = struct {
             try self.src.beginDecode();
             return logits;
         }
-        const t0 = self.nowNs();
         const logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids, self.cache.len, &self.cache, self.src, .last, force);
         errdefer self.g.release(logits);
-        try self.g.evalAll(&.{logits});
+        // Committed, not waited on: the host's read of the step's token (its eval of the sampler's row over these
+        // logits) is the step's one wait after its routing barriers, with the sampler queued behind the head.
+        try self.g.asyncEval(&.{logits});
+        // The last routed layer's released route: its reads settled, its rows unpinned. The next route that can refill
+        // those rows runs after the host has read this step's token, so after the GPU has read them.
         try self.src.flush();
         self.decode.steps += 1;
         self.decode.tokens += ids.len;
-        self.decode.wall_ns += self.nowNs() - t0;
+        self.decode.open_ns = t0;
         return logits;
+    }
+
+    /// The last serial step's wall: from its start to `now` (the next step's start, or the request's end), where the host
+    /// has read its token, so its GPU work, its sampler and that read are done.
+    fn closeStep(self: *Module, now: u64) void {
+        const t0 = self.decode.open_ns orelse return;
+        self.decode.wall_ns += now - t0;
+        self.decode.open_ns = null;
     }
 
     /// The request's end (the host's finish): its decode memory (MiMo's line) and its decode's rate and reads, once.
     pub fn requestEnd(self: *Module) void {
         if (!self.decode.active) return;
+        self.closeStep(self.nowNs());
         const d = self.decode;
         self.decode = .{};
         const footprint = sdk.memory.footprint().now;

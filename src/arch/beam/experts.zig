@@ -94,7 +94,8 @@ pub const Source = struct {
     prompt_residents: settings.PromptResidents = .keep,
     /// The usage seed ran and no request started since (`beginPrefill` keeps the seeded residents once).
     seeded_start: bool = false,
-    /// MiMo's X12 (`gpu_keep_warm: waits`): the warm engine; null on the control.
+    /// MiMo's X12 (`gpu_keep_warm: waits`): the warm engine (the gated waits and every decode routing barrier); null on the
+    /// control.
     warm: ?*gpu_warm.Warm = null,
     /// P1's host scratch (reused): the call's predicted counts (read back from the GPU), the ranking.
     ahead_counts: [max_experts]u32 = undefined,
@@ -141,10 +142,15 @@ pub const Source = struct {
         errdefer self.sdk_stream.deinit();
         self.stream_source = StreamSource.init(self.sdk_stream);
         try self.stream_source.installReadSchedule(route.read_schedule, mimo_stream.default_read_schedule_threshold);
-        // MiMo's X12 (`gpu_keep_warm`, the route the module resolved): installed once; `.off` installs nothing.
+        // MiMo's X12 (`gpu_keep_warm`, the route the module resolved): installed once; `.off` installs nothing. Beam's decode
+        // lane builds each hit wave on the host after the ids, so the engine also holds through every routing barrier.
         self.warm = try gpu_warm.install(a, keep_warm, stream, event.object);
         errdefer if (self.warm) |w| w.destroy();
-        if (self.warm) |w| self.stream_source.warm_arm = gpu_warm.Arm.of(gpu_warm.Warm, w);
+        if (self.warm) |w| {
+            const arm = gpu_warm.Arm.of(gpu_warm.Warm, w);
+            self.stream_source.warm_arm = arm;
+            self.stream_source.barrier_warm = arm;
+        }
         // The slot arrays are the format's, every routed layer's (base and transient banks), checked once.
         for (0..geo.num_moe_layers) |i| {
             const layer: u32 = geo.first_moe_layer + @as(u32, @intCast(i));

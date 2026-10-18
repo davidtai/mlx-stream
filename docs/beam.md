@@ -80,8 +80,13 @@ predictor posts the layer's predicted experts to the stream (MiMo's read-ahead).
 rows on the wide lane.
 
 Decode is serial: one row a step. The routed call takes MiMo's decode lane. Its routing barrier is the only host-GPU
-synchronization before the logits. There is no draft lane: `draft_lane.arm` binds the plugin's sampler and answers
-`off`.
+synchronization before the logits: the host reads the layer's expert ids, plans the hits and the misses, then builds
+and commits the hit wave. From the router's end to that commit the GPU has no model work. MiMo's keep-warm engine
+(`gpu_keep_warm: waits`) runs from the barrier's wait to the commit. Thus the hit wave starts beside a running warm
+chunk, not on an idle GPU. The step commits its logits and does not wait for them. The host's read of the drawn token
+is the step's last synchronization, and the sampler runs on the GPU right behind the head. The `beam decode` line
+times each step from its start to the next step's start (the last step to the request's end). There is no draft
+lane: `draft_lane.arm` binds the plugin's sampler and answers `off`.
 
 The module keeps no prefix. A prompt longer than the billed context refuses with `ContextOverBill`.
 
@@ -98,6 +103,33 @@ time on one row, so that MLX builds them at the load.
 
 The router's group top-k sums the kept groups' hits as bools (MLX sums them as int32: no cast) and masks the grouped
 scores (no [rows, 256] mask copy). The scheduler reads the router's u32 ids as they are (no cast to int32).
+
+### The routing barrier, measured
+
+A decode step has 49 routing barriers, one for each routed layer. At a barrier the router has ended and the hit wave
+is not on the GPU yet, so the GPU and the SSD can both be idle. Profile builds with the decode inventory's probes
+(branches `diag/beam-barriers-ctl` and `diag/beam-barriers-a`, not served) record each command buffer and the host's
+steps in each routed layer. The values are for the coding workload at the card's sampling, seed 1234, steps 100 to
+1,022, on the BF16 pack at 173/183. Each step value is the mean over the steps. Each barrier value is the median over
+the barriers.
+
+| Measure | feat/beam-stack 557e6f4 | With the hold |
+|---|---|---|
+| A step | 60.61 ms | 57.47 ms |
+| GPU and SSD both idle, a step | 8.16 ms | 5.29 ms |
+| Of which in the routing barriers | 7.16 ms | 4.77 ms |
+| A barrier's gap: the router's end to the hit wave's start | 191.8 us | 104.1 us |
+| Of which the host's wake and its read of the ids | 48.9 us | 45.4 us |
+| Of which the route | 2.00 us | 2.04 us |
+| Of which the hit wave's build, to its commit | 26.3 us | 28.2 us |
+| Of which the commit to the GPU's start | 107.8 us | 25.6 us |
+
+A commit to an idle GPU starts after about 108 us. With a warm chunk on the GPU it starts after about 26 us. The hold
+does not change the host's part of the gap: the wake, the route and the build take about 76 us at each barrier.
+
+The two changes together (the hold, and the logits committed without a wait; perf/beam-barriers 3f6ab6a) against
+557e6f4, A B B A on seeds 1234 and 4321: the host's decode goes from 16.37 to 17.35 tok/s (+6.0 %), and a step from
+60.25 to 57.66 ms (-4.3 %). Each seed gives the same text in the two arms, with the same SSD bytes a token.
 
 ## The residents
 
