@@ -30,8 +30,9 @@ The `expert_streaming` block in `config.json`:
 ```
 
 `--settings JSON` adds a `settings` object to the block. The script removes `quantization_config` because the
-residents are not quantized and the manifest holds the bank's quantization. mlx-serve sends a config with
-`quant_method: modelopt` to its resident ModelOpt loader, so the pack must not keep it.
+manifest holds the bank's quantization and `residents_format` names the residents' tier (absent for `bf16`).
+mlx-serve sends a config with `quant_method: modelopt` to its resident ModelOpt loader, so the pack must not keep
+it.
 
 ### The residents tiers
 
@@ -190,7 +191,8 @@ attention): 768 records, `experts.bin` 16,990,076,928 B, `model.safetensors` 6,2
 A family is a class in the script. It gives the model type, the tensor names, the residents' dtypes and shapes from
 `config.json`, the bank geometry, and the `config.json` rules. The shared code is in `scripts/packlib/`: `nocache`
 (uncached I/O), `st` (safetensors), `journal` (the run's journal and state), `fetch` (pinned downloads), `bank`
-(written and read-back payloads), `manifest` (the bank format), `verify` (the checks).
+(written and read-back payloads), `manifest` (the bank format), `affine` (the q8 tier), `usage` (the resident
+seed's file), `drafter` (the drafter sidecar), `verify` (the checks).
 
 ## The fixture
 
