@@ -114,6 +114,17 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
  *   needed before the drive reached them (P7 early_whole_trim: the read-ahead jobs still queued when the prompt call's
  *   plans exist).  It never touches the speculative class (no claim is released; the prompt pass issues none).
  *   Inject event kind 11 (withdrawn).
+ *
+ * CO-READ (beam/misspath M1, 2026-10-18; ABI 2026101801): a CLAIMED record's chunks that no thread has started are open
+ *   to every speculative thread, so a demand miss that a read-ahead covers is read by two calls at once, as a demand
+ *   record's gate/up and down ranges are (one call in flight read a record at 9.4 GB/s; two at 12.9 GB/s).  Each chunk
+ *   is still one preadv into its own place in the record's slot: `next` is the start of the next chunk to read, `done`
+ *   marks the chunks that finished, and `got` / `landed` are the prefix of finished chunks, so an adopting range still
+ *   copies only bytes that landed.  `running` counts the threads in the record; the last one out lands it (or fails it
+ *   after a failed chunk).  An UNCLAIMED record keeps one reader and its chunk boundaries (pause, park, abandon), and at
+ *   a boundary it parks while a claimed record has a chunk that no thread has started, so that its thread can help
+ *   (settle then drops it if it is not claimed).  The same bytes land in the same rows; only the schedule changes.
+ *   Counter SC_CO_READS: claimed chunks started while another thread read the same record.
  */
 #include <errno.h>
 #include <mach/mach_time.h>
@@ -209,6 +220,7 @@ enum {
     SC_EV_HOST_RELEASED,  /* gates the host released (error paths) */
     SC_EV_STOP_RELEASED,  /* live gates released at stop */
     SC_DIRECT_RANGES,     /* demand ranges read straight into their rows (q3ld_direct_config: no staging, no copy) */
+    SC_CO_READS,          /* CO-READ: claimed chunks started while another thread read the same record */
     SC_N
 };
 
@@ -248,7 +260,7 @@ typedef struct {
     int state;
     int claimed;        /* a demand submit needs its bytes: reads on, never abandoned */
     int abandon;        /* settle / re-validation: drop at the next chunk boundary (unless claimed) */
-    int running;        /* a speculative thread owns it right now (INFLIGHT && !running = parked) */
+    int running;        /* threads in it right now (INFLIGHT && !running = parked); more than one only when claimed */
     int prio;           /* horizon class: 0 = next layer, h - 1 = h layers ahead */
     int origin;         /* the horizon it was issued at (1..MAX_H) */
     int fd;
@@ -259,7 +271,10 @@ typedef struct {
     int64_t len;        /* EXL3_LANE_PORT: the record's payload bytes (<= spec_rec_len) */
     int64_t aligned;    /* page-floor of base: buf[0] holds file byte `aligned` */
     int64_t span;       /* physical bytes to read from `aligned` (page-aligned end, capped at EOF / slot) */
-    int64_t got;        /* physical bytes read so far (contiguous from `aligned`) */
+    int64_t got;        /* physical bytes landed so far (the finished chunks' prefix from `aligned`) */
+    int64_t next;       /* CO-READ: the start (from `aligned`) of the next chunk to read */
+    uint64_t done;      /* CO-READ: the chunks that finished (bit k = the chunk at k * spec_chunk) */
+    int failed;         /* CO-READ: a chunk's preadv failed: no chunk starts; the last reader fails the record */
     int64_t landed;     /* payload bytes from `base` present in buf */
     int32_t readers;    /* demand ranges copying out of buf */
     int32_t adopted;    /* ranges served since it was queued */
@@ -841,7 +856,7 @@ static int try_adopt(const job_t *job, const range_t *rg, int64_t *out) {
         int64_t need = rg->offset + total - s->base;
         if (s->landed >= need && (s->state == SP_LANDED || s->state == SP_INFLIGHT)) break;
         /* adoptable only if it will land: a landed-short record (EOF) or an unclaimed / queued one is not */
-        if (s->state != SP_INFLIGHT || !s->claimed) { pthread_mutex_unlock(&mu); return -1; }
+        if (s->state != SP_INFLIGHT || !s->claimed || s->failed) { pthread_mutex_unlock(&mu); return -1; }
         if (!waited) { waited = 1; sc[SC_ADOPT_WAITS] += 1; }
         if (job->deadline >= 0) {
             int64_t left = job->deadline - q3ld_monotonic_ns();
@@ -1071,8 +1086,17 @@ static int nearer_queued(int prio) {   /* QUEUED records of a nearer horizon cla
     return n;
 }
 
-static int pickable(const spec_t *s) {   /* queued, or parked (in flight, unowned) */
-    return s->state == SP_QUEUED || (s->state == SP_INFLIGHT && !s->running);
+static int pickable(const spec_t *s) {   /* queued, parked (in flight, unowned), or CO-READ: claimed with a chunk to start */
+    return s->state == SP_QUEUED || (s->state == SP_INFLIGHT && (!s->running || (s->claimed && !s->failed && s->next < s->span)));
+}
+
+/* CO-READ: a claimed record in flight with a chunk that no thread has started (caller holds mu) */
+static int claimed_open(void) {
+    for (int i = 0; i < nspec; i++) {
+        const spec_t *s = &spec[i];
+        if (s->state == SP_INFLIGHT && s->claimed && !s->failed && s->next < s->span) return 1;
+    }
+    return 0;
 }
 
 /* caller holds mu: claimed (parked) first, then the nearest class, then the oldest; -1 if none */
@@ -1095,11 +1119,38 @@ static int startable(const spec_t *s, int ti) {   /* caller holds mu */
     return rule_ok(ti) && (s->prio == 0 || nearer_queued(s->prio) == 0);
 }
 
-static void spec_end(spec_t *s, int state) {   /* caller holds mu; s is running */
+static void spec_end(spec_t *s, int state) {   /* caller holds mu; this thread is s's one reader (an unclaimed record) */
     s->state = state;
-    s->running = 0;
+    s->running -= 1;
     spec_inflight -= 1;
     EV(4, s->base);
+    pthread_cond_broadcast(&land_cv);
+    pthread_cond_broadcast(&done_cv);
+}
+
+/* CO-READ: got and landed from the finished chunks' prefix (caller holds mu) */
+static void spec_prefix(spec_t *s) {
+    while (s->got < s->span && ((s->done >> (s->got / spec_chunk)) & 1)) {
+        int64_t end = (s->got / spec_chunk + 1) * spec_chunk;
+        s->got = end < s->span ? end : s->span;
+    }
+    int64_t payload = s->aligned + s->got - s->base;
+    if (payload > s->len) payload = s->len;               /* EXL3_LANE_PORT */
+    s->landed = payload > 0 ? payload : 0;
+}
+
+/* CO-READ: this thread leaves s, every chunk of it started (caller holds mu).  The last reader out ends it: LANDED when
+ * the prefix spans the record and holds payload, else FAILED (a failed chunk, or nothing of the record in the file). */
+static void spec_leave(spec_t *s) {
+    s->running -= 1;
+    spec_inflight -= 1;
+    if (s->running == 0) {
+        int ok = !s->failed && s->got >= s->span && s->landed > 0;
+        if (!ok) s->landed = 0;
+        sc[ok ? SC_LANDED : SC_FAILED] += 1;
+        s->state = ok ? SP_LANDED : SP_FAILED;
+        EV(4, s->base);
+    }
     pthread_cond_broadcast(&land_cv);
     pthread_cond_broadcast(&done_cv);
 }
@@ -1154,9 +1205,12 @@ static void *spec_worker(void *arg) {
             if (s->span > spec_slot_bytes) s->span = spec_slot_bytes;
             if (s->file_size - s->aligned < s->span) s->span = s->file_size - s->aligned;
             s->got = 0;
+            s->next = 0;
+            s->done = 0;
+            s->failed = 0;
             s->landed = 0;
         }
-        s->running = 1;
+        s->running += 1;
         spec_inflight += 1;
         for (;;) {
             /* chunk boundary (also before the first chunk) */
@@ -1166,15 +1220,12 @@ static void *spec_worker(void *arg) {
                 spec_end(s, SP_FREE);
                 break;
             }
-            if (s->got >= s->span) {
-                if (s->landed > 0) { sc[SC_LANDED] += 1; spec_end(s, SP_LANDED); }
-                else { sc[SC_FAILED] += 1; spec_end(s, SP_FAILED); }
-                break;
-            }
-            if (!s->claimed && !stopping && s->prio > 0 && (!rule_ok(ti) || nearer_queued(s->prio))) {
-                /* PARK: free this thread for demand-nearer work; any thread resumes the record later */
+            if (s->next >= s->span) { spec_leave(s); break; }   /* every chunk started: the last reader out lands it */
+            if (!s->claimed && !stopping && (claimed_open() || (s->prio > 0 && (!rule_ok(ti) || nearer_queued(s->prio))))) {
+                /* PARK: free this thread for a claimed record's open chunk (CO-READ) or demand-nearer work; any thread
+                 * resumes the record later */
                 sc[SC_PARKS] += 1;
-                s->running = 0;
+                s->running -= 1;
                 spec_inflight -= 1;
                 pthread_cond_broadcast(&done_cv);
                 pthread_cond_broadcast(&spec_cv);
@@ -1198,11 +1249,15 @@ static void *spec_worker(void *arg) {
             }
             EV(s->claimed ? 7 : (ti > 0 ? 8 : 3), s->claimed ? s->base : nq);
             SPEC_HOLD(s);
-            int64_t n = s->span - s->got;
+            if (s->next >= s->span) continue;                 /* CO-READ: another reader took the last chunk */
+            int64_t at = s->next;
+            int64_t n = s->span - at;
             if (n > spec_chunk) n = spec_chunk;
-            char *dst = s->buf + s->got;
+            s->next = at + n;
+            if (s->claimed && s->running > 1) sc[SC_CO_READS] += 1;
+            char *dst = s->buf + at;
             int fd = s->fd;
-            off_t off = (off_t)(s->aligned + s->got);
+            off_t off = (off_t)(s->aligned + at);
             pthread_mutex_unlock(&mu);
             SPEC_DELAY();
             int64_t done = 0;
@@ -1217,17 +1272,17 @@ static void *spec_worker(void *arg) {
             pthread_mutex_lock(&mu);
             sc[SC_SPEC_CHUNKS] += 1;
             sc[SC_SPEC_BYTES] += done;
-            if (err) { s->landed = 0; sc[SC_FAILED] += 1; spec_end(s, SP_FAILED); break; }
-            s->got += done;
-            int64_t payload = s->aligned + s->got - s->base;
-            if (payload > s->len) payload = s->len;               /* EXL3_LANE_PORT */
-            s->landed = payload > 0 ? payload : 0;
-            if (done < n) {                                   /* EOF: what landed is all there is */
-                if (s->landed > 0) { sc[SC_LANDED] += 1; spec_end(s, SP_LANDED); }
-                else { sc[SC_FAILED] += 1; spec_end(s, SP_FAILED); }
-                break;
+            if (err) { s->failed = 1; s->landed = 0; s->next = s->span; spec_leave(s); break; }
+            if (done < n) {                                   /* EOF: the record ends inside this chunk */
+                if (at + done < s->span) s->span = at + done;
+                if (s->next > s->span) s->next = s->span;
+            }
+            if (!s->failed) {                                 /* a failed record serves nothing (landed stays 0) */
+                s->done |= (uint64_t)1 << (at / spec_chunk);
+                spec_prefix(s);
             }
             pthread_cond_broadcast(&land_cv);
+            if (done < n) { spec_leave(s); break; }           /* what landed is all there is */
         }
     }
     pthread_mutex_unlock(&mu);
@@ -1281,7 +1336,7 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     if (tb_denom == 0 && q3ld_init() != 0) return -1;
     pthread_mutex_lock(&mu);
     if (running || !spec_configured || nw < 1 || nw > MAX_WORKERS || psize <= 0 || sbytes % psize
-        || (nspec && (spec_slot_bytes % psize || spec_chunk % psize))) { pthread_mutex_unlock(&mu); return -1; }
+        || (nspec && (spec_slot_bytes % psize || spec_chunk % psize || spec_slot_bytes > 64 * spec_chunk))) { pthread_mutex_unlock(&mu); return -1; }
     for (int i = 0; i < nspec; i++) {
         if (((uintptr_t)spec[i].buf) % (uintptr_t)psize) { pthread_mutex_unlock(&mu); return -1; }
     }
@@ -1483,7 +1538,9 @@ static int32_t issue(int32_t fd, int64_t file_size, int64_t cur, int64_t tag, in
         s->base = b;
         s->len = len;                                   /* EXL3_LANE_PORT */
         s->aligned = b / page_size * page_size;
-        s->span = s->got = s->landed = 0;
+        s->span = s->got = s->landed = s->next = 0;
+        s->done = 0;
+        s->failed = 0;
         s->adopted = 0;
         sc[SC_SUBMITTED] += 1;
         sc[SC_H_SUBMITTED + origin - 1] += 1;
@@ -2038,7 +2095,7 @@ int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {
 }
 #endif
 
-int32_t q3ld_abi(void) { return 2026101401; }              /* DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
+int32_t q3ld_abi(void) { return 2026101801; }              /* CO-READ of claimed records, SC_CO_READS; 2026101401 DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
 int32_t q3ld_max_gates(void) { return MAX_GATES; }
 int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
 int32_t q3ld_max_pre(void) { return MAX_PRE; }
