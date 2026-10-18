@@ -503,3 +503,146 @@ test "beam parity: the real-weight slice at 64 of 256 rows (BEAM_PARITY_SLICE, B
     const refs = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE_REF") orelse return error.SkipZigTest);
     try parityRun(dir, refs, slice_rows);
 }
+
+/// P5's one prompt call against the chunked calls it replaced: one prompt of `long_rows` ids (the coding prompt's
+/// length, past the old call of `old_call_rows`) served as one call (`experts.call_rows`), and as the calls of 16,384
+/// and 61 rows that the module made before P5; then `long_steps` decode steps. Both paths take the same forced routes
+/// (a fixed spread of experts a row: a near tie of the tiny model's router moves no row) and record the router's own
+/// choices beside them.
+pub const long_rows: usize = 16_445;
+pub const old_call_rows: usize = 16_384;
+pub const long_steps: usize = 4;
+
+const LongRun = struct { logits: []f32, chosen: []u32 };
+
+/// One construction of the pack at `dir` (`rows`: null, the fill's) through the long prompt in calls of `chunk` rows
+/// (each call: `Module.promptCalls`, which also cuts at `experts.call_rows`), then the decode steps: the last prompt
+/// row's logits and each step's, and the router's own choices at every position. Caller frees both.
+fn longRun(a: std.mem.Allocator, dir: []const u8, rows: ?u32, ids: []const u32, routes: []const u32, chunk: usize) !LongRun {
+    const io = testing.io;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const old_wired = try wireAsServed();
+    defer unwire(old_wired);
+    var pack_dir = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+    const text = try pack_dir.readFileAlloc(io, "config.json", a, .limited(1 << 20));
+    pack_dir.close(io);
+    defer a.free(text);
+    var diag: beam.Diag = .{};
+    const model = try beam.Config.parse(a, text, &diag);
+    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = @as(u64, ids.len), .gpu_keep_warm = .off, .expert_rows = rows, .expert_prefill_rows = rows };
+    try cfg.validate();
+    var weights = try sdk.loader.dir(io, a, dir, .{});
+    defer weights.deinit();
+    const m = try module.Module.init(a, io, &cfg, &weights, s, 64 << 30, 2 << 30);
+    defer m.deinit();
+    const vocab: usize = model.vocab_size;
+    const chosen = try a.alloc(u32, routes.len);
+    errdefer a.free(chosen);
+    const fr: graph.ForcedRoutes = .{ .ids = routes, .chosen = chosen, .positions = ids.len, .k = model.n_experts_per_tok };
+    const out = try a.alloc(f32, (1 + long_steps) * vocab);
+    errdefer a.free(out);
+    const prompt = ids[0..long_rows];
+    try m.beginPrompt(prompt);
+    var last: ?mlx.mlx_array = null;
+    defer if (last) |x| m.g.release(x);
+    var at: usize = 0;
+    while (at < prompt.len) {
+        const end = @min(prompt.len, at + chunk);
+        if (last) |x| m.g.release(x);
+        last = null;
+        last = try m.promptCalls(prompt[at..end], .last, &fr);
+        at = end;
+    }
+    @memcpy(out[0..vocab], try hostRows(m, last.?, 1, vocab));
+    try m.enterDecode(prompt.len);
+    for (0..long_steps) |i| {
+        const x = try m.stepWith(ids[long_rows + i ..][0..1], &fr);
+        defer m.g.release(x);
+        @memcpy(out[(1 + i) * vocab ..][0..vocab], try hostRows(m, x, 1, vocab));
+    }
+    m.requestEnd();
+    return .{ .logits = out, .chosen = chosen };
+}
+
+/// The long case on one pack: its ids (a fixed sequence over the vocabulary) and its forced routes (row p of routed
+/// layer l takes the k experts from (p x 2,654,435,761 + l x 40,503) mod E on), served in one call and in the old calls;
+/// the logits compared bit for bit, their largest difference, the argmax on every row whose top-2 margin is past twice
+/// `abs_tol`, and the router's own choices (as sets) by position: before the old call's end, after it, in decode.
+/// `bounded`: the logits hold `abs_tol` and the argmax (the fixture); else a report (the slice's bound needs a twin).
+fn longCase(dir: []const u8, rows: ?u32, bounded: bool) !void {
+    const a = testing.allocator;
+    const io = testing.io;
+    var pack_dir = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+    const text = try pack_dir.readFileAlloc(io, "config.json", a, .limited(1 << 20));
+    pack_dir.close(io);
+    defer a.free(text);
+    var diag: beam.Diag = .{};
+    const model = try beam.Config.parse(a, text, &diag);
+    try testing.expect(@import("experts.zig").call_rows >= long_rows);
+    const positions = long_rows + long_steps;
+    const n_moe: usize = model.moeLayers();
+    const e: u64 = model.n_routed_experts;
+    const k: usize = model.n_experts_per_tok;
+    const vocab: usize = model.vocab_size;
+    const ids = try a.alloc(u32, positions);
+    defer a.free(ids);
+    for (ids, 0..) |*id, i| id.* = @intCast((@as(u64, i) * 2_654_435_761 + 12_345) % @as(u64, vocab));
+    const routes = try a.alloc(u32, n_moe * positions * k);
+    defer a.free(routes);
+    for (0..n_moe) |l| for (0..positions) |p| {
+        const base = (@as(u64, p) * 2_654_435_761 + @as(u64, l) * 40_503) % e;
+        for (0..k) |j| routes[(l * positions + p) * k + j] = @intCast((base + @as(u64, j)) % e);
+    };
+    const one = try longRun(a, dir, rows, ids, routes, long_rows);
+    defer {
+        a.free(one.logits);
+        a.free(one.chosen);
+    }
+    const two = try longRun(a, dir, rows, ids, routes, old_call_rows);
+    defer {
+        a.free(two.logits);
+        a.free(two.chosen);
+    }
+    var differ: usize = 0;
+    var max_diff: f32 = 0;
+    var decisive: usize = 0;
+    var argmax_differ: usize = 0;
+    for (0..1 + long_steps) |r| {
+        const x = one.logits[r * vocab ..][0..vocab];
+        const y = two.logits[r * vocab ..][0..vocab];
+        for (x, y) |p, q| {
+            differ += @intFromBool(@as(u32, @bitCast(p)) != @as(u32, @bitCast(q)));
+            max_diff = @max(max_diff, @abs(p - q));
+        }
+        if (margin(x) > 2 * abs_tol) {
+            decisive += 1;
+            argmax_differ += @intFromBool(argmax(x) != argmax(y));
+        }
+    }
+    var choice_differ = [3]usize{ 0, 0, 0 };
+    var choices = [3]usize{ 0, 0, 0 };
+    for (0..n_moe) |l| for (0..positions) |p| {
+        const span: usize = if (p < old_call_rows) 0 else if (p < long_rows) 1 else 2;
+        const x = one.chosen[(l * positions + p) * k ..][0..k];
+        const y = two.chosen[(l * positions + p) * k ..][0..k];
+        var same = true;
+        for (x) |ex| same = same and std.mem.indexOfScalar(u32, y, ex) != null;
+        choices[span] += 1;
+        choice_differ[span] += @intFromBool(!same);
+    };
+    std.debug.print("BEAM PARITY {s} one call vs calls of {d} rows ({d} prompt rows, {d} decode steps, forced routes): {d} logits, {d} differ, max_diff {d:.5} (abs_tol {d:.4}), argmax {d} of {d} decisive rows differ; router choices differ: {d} of {d} before row {d}, {d} of {d} after, {d} of {d} in decode\n", .{ std.fs.path.basename(dir), old_call_rows, long_rows, long_steps, one.logits.len, differ, max_diff, abs_tol, argmax_differ, decisive, choice_differ[0], choices[0], old_call_rows, choice_differ[1], choices[1], choice_differ[2], choices[2] });
+    if (bounded) {
+        try testing.expect(max_diff <= abs_tol);
+        try testing.expectEqual(@as(usize, 0), argmax_differ);
+    }
+}
+
+test "beam parity: a prompt past the old 16,384-row call: P5's one call against the chunked calls (BEAM_PARITY, BEAM_PARITY_SLICE)" {
+    const fixture = std.c.getenv("BEAM_PARITY");
+    const slice = std.c.getenv("BEAM_PARITY_SLICE");
+    if (fixture == null and slice == null) return error.SkipZigTest;
+    if (fixture) |d| try longCase(std.mem.span(d), null, true);
+    if (slice) |d| try longCase(std.mem.span(d), slice_rows, false);
+}
