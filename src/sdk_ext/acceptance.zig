@@ -721,6 +721,7 @@ test "sdk_ext acceptance: speculative sampling keeps a draft drawn from q with p
         kept_mode += @intFromBool(specStep(&p, 1, null, drawU(sm.seed, pos), drawV(sm.seed, pos)).accept);
     }
     // sum min(p, q) = 0.716 here; the point mass at q's mode (token 1) is kept with p(1) = 0.269.
+    std.debug.print("\nSDK_EXT ACCEPTANCE speculative: kept {d:.4} of {d} drafts drawn from q (sum min(p, q) {d:.4}); a point mass at q's mode kept {d:.4} (p {d:.4})\n", .{ @as(f64, @floatFromInt(kept)) / n, n, overlap, @as(f64, @floatFromInt(kept_mode)) / n, p[1] });
     try testing.expectApproxEqAbs(overlap, @as(f64, @floatFromInt(kept)) / n, 0.015);
     try testing.expectApproxEqAbs(p[1], @as(f64, @floatFromInt(kept_mode)) / n, 0.015);
     try testing.expect(overlap > p[1] + 0.3);
