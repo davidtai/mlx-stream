@@ -326,6 +326,12 @@ fn parityRun(dir: []const u8, refs: []const u8, rows: ?u32) !void {
     defer weights.deinit();
     const m = try module.Module.init(a, io, &cfg, &weights, s, 64 << 30, 2 << 30);
     defer m.deinit();
+    // The test packs carry no usage file: the load fills each layer's prompt rows with its lowest-index experts (usage.zig
+    // `NoUsage.lowest_index`), never empty rows.
+    for (m.src.sdk_stream.layers, m.src.rows) |*ls, r| {
+        try testing.expectEqual(r, ls.policy.occupancy);
+        for (0..r) |e| try testing.expect(ls.policy.slotOf(@intCast(e)) != null);
+    }
     var it = std.mem.splitScalar(u8, refs, ',');
     while (it.next()) |prefix| {
         var ref = try readRef(a, io, prefix, model.moeLayers());

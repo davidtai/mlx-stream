@@ -479,7 +479,7 @@ pub const Module = struct {
     /// `resident_seed` at construction (residency.zig `seedResidents`): one line, with the load's cost.
     fn seedResidents(self: *Module, dir: []const u8) !void {
         switch (self.src) {
-            inline else => |x| try residency.seedResidents(self.gpa, self.io, "glm5_next", &self.c.residency, dir, x),
+            inline else => |x| try residency.seedResidents(self.gpa, self.io, "glm5_next", &self.c.residency, dir, x, .empty),
         }
     }
 

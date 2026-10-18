@@ -108,12 +108,14 @@ pub const Residency = struct {
 };
 
 /// `resident_seed` at construction (usage.zig `decide`): `usage` when the pack has `expert-usage-v1.json` (or by name),
-/// the prompt rows filled from it (`src.seedResidents`); `none` otherwise. A malformed file, or one of another model or
-/// geometry, refuses the load by name. One line, with the load's cost.
-pub fn seedResidents(gpa: std.mem.Allocator, io: std.Io, comptime arch: []const u8, settings: *const usage.Settings, dir: []const u8, src: anytype) !void {
+/// the prompt rows filled from it (`src.seedResidents`); `none` otherwise. Without a usage seed the arch's `no_usage`
+/// applies: empty rows, or each layer's lowest-index experts (`usage.NoUsage`). A malformed file, or one of another
+/// model or geometry, refuses the load by name. One line, with the load's cost.
+pub fn seedResidents(gpa: std.mem.Allocator, io: std.Io, comptime arch: []const u8, settings: *const usage.Settings, dir: []const u8, src: anytype, no_usage: usage.NoUsage) !void {
     const shape = src.tallyShape();
     var d = try usage.decide(gpa, io, settings, dir, arch, shape.layers, shape.experts);
     defer if (d.profile) |*p| p.deinit();
+    try d.fill(gpa, no_usage, shape.layers, shape.experts);
     var lb: [768]u8 = undefined;
     const p = if (d.profile) |*x| x else {
         log.info("{s}\n", .{usage.seedLine(&lb, arch, &d, .{ .min = 0, .max = 0, .rows_min = 0, .rows_max = 0, .records = 0 }, 0, 0)});

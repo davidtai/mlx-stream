@@ -66,7 +66,10 @@ At construction the module does these steps one time:
    then reads them.
 3. It opens the bank and checks its geometry against the model (`Geometry.require`). It installs the expert source at
    the plan's rows.
-4. It opens the rate tally, the usage record and the usage seed, as glm5_next does.
+4. It opens the rate tally, the usage record and the usage seed, as glm5_next does. Without a usage seed (the pack
+   has no `expert-usage-v1.json`, or `resident_seed: none`), it fills each routed layer's prompt rows with the layer's
+   lowest-index experts. A load never leaves the prompt rows empty, so the first request never starts cold. The line
+   `beam expert residents seeded: ...` names the seed: the file and its source, or the lowest-index experts and why.
 5. It allocates the KV lanes at the billed context: a ring of the window (MiMo's `SlidingRing`) for each sliding
    layer, a slab of the context for each full layer.
 6. It writes the receipt lines (`beam routes`, `mlx-stream beam installed`, `beam memory`) and compares the
@@ -242,7 +245,8 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 | `expert_prefill_rows` | prompt rows a routed layer, at most the decode rows | the fill |
 | `expert_rows_by_layer` | `uniform`, or 49 offsets that sum to 0 | the calibrated offsets on Beam 1.0; `uniform` on another geometry |
 | `expert_resident_ratio`, `expert_tally_window`, `expert_tally_file` | the rate tally (sdk_ext/expert/tally.zig) | ratio 0 (off) |
-| `resident_seed`, `expert_usage_record`, `expert_usage_label` | the usage seed and record (sdk_ext/expert/usage.zig) | off |
+| `resident_seed` | `usage`, `none`: the usage seed (sdk_ext/expert/usage.zig); `none` takes the lowest-index experts | `usage` when the pack has `expert-usage-v1.json`, else the lowest-index experts |
+| `expert_usage_record`, `expert_usage_label` | the usage record (sdk_ext/expert/usage.zig) | off |
 | `prompt_residents` | `keep`, `forget` | `keep` |
 | `gpu_keep_warm` | `waits`, `off` | `waits` on a GPU stream |
 | `decode_moe` | `hitpass`, `fused`, `stock` | `hitpass` where registered, on a GPU stream |
@@ -438,9 +442,10 @@ MLX_SERVE_GPU_CEILING_MB=245760 mlx-serve --model <pack> --serve --port 11391 --
   --no-warmup-eager --prefix-cache-entries 0 --metrics --log-file off --kv-quant off --wired-margin-gib 2
 ```
 
-5. To seed the residents, run one request with `expert_usage_record` set to an absolute path. Then put that
-   `expert-usage-v1.json` beside the pack (or in a copy of the pack with hard links). The next load reads it
-   (`resident_seed: usage`, the default when the file is there).
+5. The pack ships its `expert-usage-v1.json` (the NVFP4 pack converter's `--usage`), or you put the file beside the
+   pack. The load reads it (`resident_seed: usage`, the default when the file is there). To make the file, run
+   general traffic, never the benchmark's own prompt, with `expert_usage_record` set to an absolute path. A pack
+   without the file loads with the lowest-index experts in each layer's prompt rows.
 
 The server lines of the first load:
 
