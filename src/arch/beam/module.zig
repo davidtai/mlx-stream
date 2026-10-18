@@ -78,16 +78,17 @@ pub const Module = struct {
         const read_ns: u64 = @intCast(t_read.untilNow(io, .awake).nanoseconds);
         self.gates = try self.w.gates(gpa);
         errdefer gpa.free(self.gates);
-        // The expert source at the plan's rows: every routed layer alike (`expert_rows_by_layer: uniform`, the default),
-        // or the operator's offsets of the decode rows at the same total.
+        // The expert source at the plan's rows, split between the routed layers at the same total (`layerSplit`: the
+        // setting, else the calibrated offsets on Beam 1.0, `uniform` on another geometry).
         const n_moe = model.moeLayers();
         const prompt_rows = try arena.allocator().alloc(u32, n_moe);
         const decode_rows = try arena.allocator().alloc(u32, n_moe);
-        settings.layerRows(self.c.expert_rows_by_layer, plan.rows, model.n_routed_experts, prompt_rows, decode_rows) catch |e| {
+        const split = self.c.layerSplit();
+        settings.layerRows(split, plan.rows, model.n_routed_experts, prompt_rows, decode_rows) catch |e| {
             log.err("beam: load refused: expert_rows_by_layer does not fit the plan's rows {d}/{d} ({s})\n", .{ plan.rows.prompt, plan.rows.decode, @errorName(e) });
             return e;
         };
-        if (self.c.expert_rows_by_layer == .offsets) log.info("beam expert rows by layer installed: decode {any}, prompt {any}; bill unchanged\n", .{ decode_rows, prompt_rows });
+        if (split == .offsets) log.info("beam expert rows by layer installed: decode {any}, prompt {any}; bill unchanged\n", .{ decode_rows, prompt_rows });
         // `gpu_keep_warm` (MiMo's X12): the DEFAULT on a CPU stream resolves to the control, once, with one line.
         const warm_route = self.c.warmRoute(gpu_warm.gpuStream(s));
         if (warm_route != self.c.gpu_keep_warm) log.info("beam route gpu_keep_warm=off reason=default {s} on a CPU stream (its waits are host waits)\n", .{@tagName(self.c.gpu_keep_warm)});
