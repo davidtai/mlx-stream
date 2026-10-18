@@ -392,6 +392,8 @@ pub const Module = struct {
         if (self.armedLane()) |l| if (l.stats.base.rounds > 0) {
             var pb: [512]u8 = undefined;
             log.info("beam draft lane: lane=\"{s}\" rounds={d} accepted_by_position={s}\n", .{ l.name(), l.stats.base.rounds, l.stats.positions(&pb) });
+            // DIAG: lane_asize's line.
+            if (lane_mod.lane_asize.armed()) lane_mod.lane_asize.report(&l.asize, l.name());
         };
     }
 };

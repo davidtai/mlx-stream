@@ -33,6 +33,8 @@ const settings = @import("settings.zig");
 const graph = @import("graph.zig");
 const experts = @import("experts.zig");
 const drafter = @import("drafter.zig");
+/// DIAG (not for merge): the rules' acceptance at the same positions (`BEAM_LANE_ASIZE=1`).
+pub const lane_asize = @import("lane_asize.zig");
 
 const G = graph.G;
 const T = graph.T;
@@ -139,6 +141,8 @@ pub const Lane = struct {
     /// The decision graphs' and the draft's backend (its own scope, reset every round).
     g: G,
     stats: Stats = .{},
+    /// DIAG: lane_asize's sums over the request.
+    asize: lane_asize.Sums = .{},
     /// The host armed the next request (`arm`), and the running request is armed (`begin`): its prompt pass captures
     /// the context and every serial step appends to it.
     pending: bool = false,
@@ -194,6 +198,7 @@ pub const Lane = struct {
         self.active = self.pending;
         self.pending = false;
         self.stats = .{};
+        self.asize = .{};
         self.dr.restart();
     }
 
@@ -234,6 +239,13 @@ pub fn roundWith(m: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, s
     const params = acc.Params.of(sampling);
     var ids: [drafter.max_block]u32 = undefined;
     ids[0] = t1;
+    // DIAG: the selector's host copies outlive the draft's block (lane_asize reads them after the verify).
+    var sb: [(drafter.max_block - 1) * drafter.max_top_k * drafter.max_top_k]f32 = undefined;
+    var cb: [(drafter.max_block - 1) * drafter.max_top_k]u32 = undefined;
+    var path: [drafter.max_block]u32 = undefined;
+    var pick: [drafter.max_block]u32 = undefined;
+    var scores: []const f32 = &.{};
+    var cand: []const u32 = &.{};
     if (k > 0) {
         if (comptime @TypeOf(oracle) == void) {
             // The draft's arrays (its rings' views among them) go once the host holds the path: before the verify and
@@ -243,13 +255,9 @@ pub fn roundWith(m: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, s
             const d = try dr.draft(g, a, &m.w, t1, p, self.depth, self.gate > 0);
             var roots: [3]T = undefined;
             try g.evalAll(d.roots(&roots));
-            var sb: [(drafter.max_block - 1) * drafter.max_top_k * drafter.max_top_k]f32 = undefined;
-            var cb: [(drafter.max_block - 1) * drafter.max_top_k]u32 = undefined;
             const n_sc = @as(usize, self.depth) * c.top_k * c.top_k;
-            const scores = try g.hostF32(d.scores, sb[0..n_sc]);
-            const cand = try g.hostU32(d.cand, cb[0 .. @as(usize, self.depth) * c.top_k]);
-            var path: [drafter.max_block]u32 = undefined;
-            var pick: [drafter.max_block]u32 = undefined;
+            scores = try g.hostF32(d.scores, sb[0..n_sc]);
+            cand = try g.hostU32(d.cand, cb[0 .. @as(usize, self.depth) * c.top_k]);
             // A sampled request under `draft_path: sampled` draws the path at the target's uniforms; else the greedy walk.
             const drawn: ?acc.Params = if (self.path == .sampled) acc.Params.active(params) else null;
             if (drawn) |sm|
@@ -293,6 +301,9 @@ pub fn roundWith(m: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, s
         try g.evalAll(&.{ dec.targets, dec.flags orelse dec.targets });
         try m.flushVerify();
         const pre = try mimo_draft.readDecisionRows(g, dec, cd, end - start);
+        // DIAG: the three rules' acceptance at this round's positions (a sampled request, the point-mass path, no gate).
+        if (start == 0 and scores.len > 0 and k == self.depth and self.path == .greedy and lane_asize.armed()) if (acc.Params.active(params)) |sm|
+            lane_asize.observe(&self.asize, g, logits, sm, scores, cand, pick[0..k], k, c.top_k, pre.accepted) catch |e| log.warn("beam lane asize: {s}\n", .{@errorName(e)});
         if (self.rule == .typical and pre.accepted > 0) {
             var tb: [chunk_rows]u32 = undefined;
             const targets = try g.hostU32(dec.targets, tb[0 .. end - start]);

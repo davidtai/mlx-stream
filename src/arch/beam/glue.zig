@@ -825,3 +825,98 @@ test "beam glue GPU bench: a step's routers, the stock ops against the texts at 
         std.debug.print("BEAM GLUE BENCH {s} R={d}: {d} layers (router + predictor) in {d:.1} us (median of 12), {d:.2} us a layer, {d:.0} GB/s of router weights\n", .{ if (r_rows == 0) "stock" else "texts", r_rows, layers, med / 1e3, med / 1e3 / layers, bytes / med });
     }
 }
+
+test "beam glue GPU bench (DIAG, not for merge): a forward's q / k heads and sublayer boundaries, the stock ops at 1, 4 and 8 rows against the texts at 1 row (Beam 1.0's geometry, one dependency chain)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const graph = @import("graph.zig");
+    const geo = registered_geometries[0];
+    const c = configOf(geo);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    try graph.prepareFused(&g, &c);
+    const d: c_int = @intCast(geo.hidden);
+    const e: c_int = @intCast(geo.experts);
+    const hd: c_int = @intCast(geo.head_dim);
+    const qd: c_int = @intCast(geo.heads * geo.head_dim);
+    const kd: c_int = @intCast(geo.kv_heads * geo.head_dim);
+    const w = try testF32(a, &g, &.{ e, d }, 1.0 / @sqrt(@as(f32, @floatFromInt(geo.hidden))), 11);
+    const bias = try testF32(a, &g, &.{e}, 0.01, 12);
+    const qn = try testBf16(a, &g, &.{hd}, 0.5, 15);
+    const kn = try testBf16(a, &g, &.{hd}, 0.5, 16);
+    const pn = try testBf16(a, &g, &.{d}, 0.5, 17);
+    const fnw = try testBf16(a, &g, &.{d}, 0.5, 18);
+    try g.evalAll(&.{ w, bias, qn, kn, pn, fnw });
+    var diag: sdk.Diag = .{};
+    var k = install(a, s, &c, .{ .w = w, .bias = bias, .next_w = w, .next_bias = bias, .q_norm = qn, .k_norm = kn, .post_attn_norm = pn, .pre_ff_norm = fnw }, &diag) catch |err| {
+        std.debug.print("beam glue install refused: {s}\n", .{diag.message()});
+        return err;
+    };
+    defer k.deinit();
+    const zero = g.keep(try g.scalar(0, .bfloat16));
+    defer g.release(zero);
+    // The 16K workload's decode positions: every sliding layer ropes, every full layer scales (Beam's layer pattern).
+    const pos: u32 = 16_445;
+    // `ops`: 0 the chain's shared ops alone (no heads, no boundaries), 1 the stock ops, 2 the texts. Each layer: the
+    // attention's q / k sources made from the chain's normed row (one product with zero, an add each: shared by every
+    // arm), the heads, the attention's output made from the heads' first key element (a product with zero and an add:
+    // shared), then the layer's two boundaries (sublayer indices 2l + 2 and 2l + 3), each boundary's normed row and
+    // residual feeding the next.
+    const Arm = struct { rows: c_int, ops: u8 };
+    for ([_]Arm{ .{ .rows = 1, .ops = 0 }, .{ .rows = 1, .ops = 1 }, .{ .rows = 1, .ops = 2 }, .{ .rows = 4, .ops = 0 }, .{ .rows = 4, .ops = 1 }, .{ .rows = 8, .ops = 0 }, .{ .rows = 8, .ops = 1 } }) |arm| {
+        const n = arm.rows;
+        const q0 = g.keep(try testBf16(a, &g, &.{ n, qd }, 1.0, 2000));
+        const k0 = g.keep(try testBf16(a, &g, &.{ n, kd }, 1.0, 2001));
+        const y0 = g.keep(try testBf16(a, &g, &.{ n, d }, 1.0, 2002));
+        const r0 = g.keep(try testBf16(a, &g, &.{ n, d }, 4.0, 2003));
+        defer for ([_]T{ q0, k0, y0, r0 }) |x| g.release(x);
+        try g.evalAll(&.{ q0, k0, y0, r0 });
+        var times: [15]u64 = undefined;
+        for (&times) |*tm| {
+            const m = g.mark();
+            defer g.resetTo(m);
+            var y = y0;
+            var r = r0;
+            for (0..c.n_layers) |l| {
+                const li: u32 = @intCast(l);
+                const full = c.isFull(li);
+                const dep = try g.mul(try g.slice(y, &.{ 0, 0 }, &.{ 1, 1 }, &.{ 1, 1 }), zero);
+                const qs = try g.add(q0, dep);
+                const ks = try g.add(k0, dep);
+                var first: T = ks;
+                if (arm.ops == 1) {
+                    const h = try graph.qkStock(&g, &c, qn, kn, qs, ks, n, pos, full);
+                    first = try g.reshape(try g.slice(h.k, &.{ 0, 0, 0, 0 }, &.{ 1, 1, 1, 1 }, &.{ 1, 1, 1, 1 }), &.{ 1, 1 });
+                } else if (arm.ops == 2) {
+                    const h = try qkNorm(&g, &k, qs, ks, qn, kn, pos, full, graph.ssmaxAt(pos));
+                    first = try g.reshape(try g.slice(h.k, &.{ 0, 0, 0, 0 }, &.{ 1, 1, 1, 1 }, &.{ 1, 1, 1, 1 }), &.{ 1, 1 });
+                } else first = try g.slice(ks, &.{ 0, 0 }, &.{ 1, 1 }, &.{ 1, 1 });
+                const ya = try g.add(y, try g.mul(first, zero));
+                if (arm.ops == 0) {
+                    y = ya;
+                    continue;
+                }
+                var yi = ya;
+                for ([_]u32{ 2 * li + 2, 2 * li + 3 }) |i| {
+                    const b = if (arm.ops == 1) try graph.boundaryStock(&g, &c, yi, r, pn, fnw, i) else try addNorm(&g, &k, yi, r, pn, fnw, i);
+                    r = b.res;
+                    yi = b.out;
+                }
+                y = yi;
+            }
+            const t0 = std.Io.Timestamp.now(testing.io, .awake);
+            try g.evalAll(&.{ y, r });
+            tm.* = @intCast(t0.untilNow(testing.io, .awake).nanoseconds);
+        }
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        const med: f64 = @floatFromInt(times[times.len / 2]);
+        std.debug.print("BEAM GLUE BENCH CHAIN rows={d} {s}: {d} layers' q / k heads and {d} boundaries in {d:.1} us (median of {d}; min {d:.1} us)\n", .{ n, switch (arm.ops) {
+            0 => "shared-ops-only",
+            1 => "stock",
+            else => "texts",
+        }, c.n_layers, 2 * c.n_layers, med / 1e3, times.len, @as(f64, @floatFromInt(times[0])) / 1e3 });
+    }
+}
