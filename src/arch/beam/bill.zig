@@ -374,7 +374,7 @@ fn laneOf(a: std.mem.Allocator, io: std.Io, dir: []const u8, cfg: *const setting
     var m = try drafter.readManifest(a, io, dir, &cfg.model);
     defer m.deinit();
     const r = drafter.residentBytes(&m, page);
-    return .{ .drafter = m.config, .resident_bytes = r.bytes, .resident_arrays = r.arrays, .depth = cfg.draft_depth, .sampled = cfg.draft_path == .sampled };
+    return .{ .drafter = m.config, .resident_bytes = r.bytes, .resident_arrays = r.arrays, .depth = cfg.draft_depth, .sampled = cfg.draftPath() == .sampled };
 }
 
 pub fn completeBill(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, reserve: u64) !sdk.MemoryBill {

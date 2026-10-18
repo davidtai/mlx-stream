@@ -226,6 +226,8 @@ test "beam lane: a seeded sampled request draws the same ids through the lane as
     // The lane: the same seed, with the greedy path (sample-then-verify: the serial ids where the rows agree) and with
     // the sampled path (`draft_path: sampled`: the drafts drawn from q, speculative sampling; distributed as the target,
     // not the serial path's draws).
+    const installed = m.lane.?.path;
+    defer m.lane.?.path = installed;
     for ([_]settings.DraftPath{ .greedy, .sampled }) |dp| {
         m.lane.?.path = dp;
         try testing.expectEqual(sdk.DraftArm.stochastic, root.draft_lane.arm(m, .{ .greedy = false, .clean = true, .sampling = sp }));
@@ -252,7 +254,6 @@ test "beam lane: a seeded sampled request draws the same ids through the lane as
         // The first token is the prompt pass's draw on every path.
         try testing.expectEqual(ser[0], got[0]);
     }
-    m.lane.?.path = .greedy;
 }
 
 test "beam lane: the speculative verify's device rows give the host reference's decisions and tokens (drafts drawn from a 16-candidate q; BEAM_LANE)" {

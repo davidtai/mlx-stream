@@ -265,15 +265,16 @@ draft is kept when it is its verify row's argmax; on a sampled request each row'
 at its position, and a draft is kept when it is that draw. `typical` (Medusa's typical acceptance) also keeps a draft
 that the target gives enough probability. It is lossy: an opt-in.
 
-`draft_path` sets the drafter's path on a sampled request. `greedy` (the default) is the selector's greedy walk, and
-the verify is sample-then-verify: each emitted token is the target's draw at its position. With `sampled` the lane draws
-each draft from the selector's distribution q over its 16 candidates (the softmax of their scores at the request's
-temperature, at the drafter's own uniform `acceptance.drawQ`: drafter.zig `sampledPathOf`). The verify is then
-speculative sampling (`acceptance.speculativeRows`): a draft x is kept when u x q(x) < p(x) (u = `acceptance.drawU`
-at its position), and a rejected row emits a draw from the residual (p - q)+. Each emitted token is distributed as the
-target, and a draft is kept with probability sum min(p, q). A seeded request is reproducible, but its tokens are not the
-serial path's draws. `sampled` takes the `exact` rule only (`BeamDraftPathTypical`). A greedy request takes the greedy
-walk.
+`draft_path` sets the drafter's path on a sampled request. With `sampled` (the default under `exact`: the measured and
+kept path) the lane draws each draft from the selector's distribution q over its 16 candidates (the softmax of their
+scores at the request's temperature, at the drafter's own uniform `acceptance.drawQ`: drafter.zig `sampledPathOf`).
+The verify is then speculative sampling (`acceptance.speculativeRows`): a draft x is kept when u x q(x) < p(x) (u =
+`acceptance.drawU` at its position), and a rejected row emits a draw from the residual (p - q)+. Each emitted token is
+distributed as the target, and a draft is kept with probability sum min(p, q). A seeded request is reproducible, but
+its tokens are not the serial path's draws. `greedy` is the selector's greedy walk (a point mass), and the verify is
+sample-then-verify: each emitted token is the target's draw at its position. `sampled` takes the `exact` rule only:
+under `typical` the path is `greedy` unless named, and `sampled` named with `typical` refuses (`BeamDraftPathTypical`).
+A greedy request takes the greedy walk.
 
 A request's end adds two lines: `[spec-stats] lane=... rounds= drafted= accepted= tokens_per_round= ...
 draft_ms_per_round= verify_ms_per_round= commit_ms_per_round=` and `beam draft lane: lane=... rounds=
@@ -295,6 +296,20 @@ Both seeds are faster in both ABBAs (`exact`: +17.2 % and +22.5 %; `typical` 0.2
 texts differ from the serial texts: a verify of 4 rows rounds differently from a serial step at a near tie. A round is
 a draft of 5.9 ms and a verify of 83 to 95 ms. The serial runs of ABBA 2 prefill at 720 tok/s and those of ABBA 1 at
 694 tok/s (the same bundle and settings); the lane's runs prefill at 689 to 691 tok/s in both.
+
+`draft_path: sampled` against `greedy`, one ABBA on the bundle of perf/beam-dflash-spec a081bf3 over the stack's
+fold 5 (88d903e), the q8 pack with the drafter's sidecar, both arms `exact` depth 3 at 179 / 189 rows (the same
+workload and sampling; means of the two seeds):
+
+| Arm | Decode | Tokens a round | Accepted at draft 1 / 2 / 3 | ms a round | SSD read a decode token | Prefill | TTFT | Peak footprint |
+|---|---|---|---|---|---|---|---|---|
+| `greedy` | 26.24 tok/s | 2.54, 2.41 | 68.6 / 46.6 / 32.4 % | 94.34 | 237 MB | 681.2 tok/s | 24.63 s | 221.5 GB |
+| `sampled` | 27.45 tok/s (+4.6 %) | 2.69, 2.57 | 74.3 / 52.1 / 36.3 % | 95.70 | 235 MB | 679.4 tok/s | 24.74 s | 221.5 GB |
+
+Both seeds are faster (+6.8 % and +2.4 %); tokens a round +6.1 %. The verify's speculative rows cost no measurable time
+(a verify of 89.5 to 90.0 ms against 86.3 to 90.5 ms). Before the build, a diagnostic at the same served positions of
+the greedy lane gave sum min(p, q) 7.0 % more tokens a round than the greedy draft's p(d). The host reference keeps
+0.7163 of 20,000 drafts drawn from q against sum min(p, q) 0.7163 on the test's row.
 
 Depth and delta, on the lane over the stack's fold 1 (5df1fc9), the BF16 pack, 168 / 178 rows, seed 1234: `exact`
 depth 3 is the fastest exact depth (18.97 tok/s against 15.58 serial; depths 1 to 8, 11 and 15 measured);
@@ -334,7 +349,7 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 | `draft_gate` | theta in [0, 1): verify the leading drafts whose cumulative drafter probability stays at theta or more | 0 (off) |
 | `mtp_acceptance` | `exact`, `typical` (lossy) | `exact` |
 | `mtp_typical_delta` | (0, 1], named only with `typical` | 0.5 |
-| `draft_path` | `greedy`, `sampled` (drafts drawn from q, speculative sampling): the drafter's path on a sampled request | `greedy` |
+| `draft_path` | `sampled` (drafts drawn from q, speculative sampling), `greedy`: the drafter's path on a sampled request | `sampled` (`greedy` under `typical`) |
 
 One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV quantization must be off
 (`BeamKvQuantUnsupported`). `decode_moe: hitpass` or `fused` named for a model where the texts are not registered
