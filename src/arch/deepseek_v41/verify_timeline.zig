@@ -142,7 +142,8 @@ pub fn cycleBegin() void {
 pub fn verifyBegin() void {
     if (comptime !enabled) return;
     if (!active or cycles == 0) return;
-    verifies[cur].begin = now();
+    // A cycle of several verify chunks (Beam's draft lane past 4 rows) keeps its first chunk's begin.
+    if (verifies[cur].begin == 0) verifies[cur].begin = now();
     in_verify = true;
     tag(.verify);
 }
