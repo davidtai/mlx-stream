@@ -495,8 +495,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// read has completed (one still in flight: the load reads the record itself); the waits of the load's part and
             /// its gate hold until the copy is done. Needs `overlap` and one slot geometry. The plans,
             /// slots and kernels are the control's, and a planned row holds its record's bytes before a kernel reads it:
-            /// exact by construction. P1's cold schedule (`stageAhead`) stages a layer with empty rows before its read-ahead;
-            /// that read-ahead's admissions of landed staged records copy them too (`postAheadJobs`).
+            /// exact by construction.
             prompt_stage_rows: u32 = 0,
             /// The rate tally (`expert.tally`, `LayerPolicy.setTally`) on every layer: null, off.
             tally: ?Tally = null,
@@ -618,8 +617,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             n_reads: u32 = 0,
             settled: bool = false,
             /// P6: the copier's batch that copies this part's staged records into their rows (0: none); its waits and
-            /// its gate hold until the copier has done it. A read-ahead job's (P1's admissions of staged records): its
-            /// landing waits for it (`landAheadJob`).
+            /// its gate hold until the copier has done it.
             copy_seq: u64 = 0,
         };
 
@@ -784,8 +782,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             ahead_job: []u8 = &.{},
             /// P6 (`Options.prompt_stage_rows`): the prompt's staging scratch; empty when the option is 0.
             stage: Stage = .{},
-            /// P1: the stage that waits for the next prompt call to post its last read (`stageAfterCall`).
-            stage_next: StageNext = .{},
 
             /// P1's read-ahead of one layer: `loads[0..n]` (expert, slot) in file order, `reads[i]` false when the
             /// slot still held the record; its pool jobs `parts[0..n_parts]` over them (a Route's tickets).
@@ -806,20 +802,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 landed: []bool,
             };
 
-            /// P1: a layer's stage that waits for the next prompt call's posts (`stageAfterCall`): the layer, its ranking (a
-            /// copy, at most the bank's experts) and whether it skips the layer's empty rows.
-            const StageNext = struct {
-                live: bool = false,
-                layer: u32 = 0,
-                past_rows: bool = false,
-                n: u32 = 0,
-                experts: []u16 = &.{},
-            };
-
-            /// P6 and P1 (`Options.prompt_stage_rows`): the prompt's staging scratch: host rows at the transient geometry
-            /// that hold one layer's predicted records (`stageMisses`, in batches: P1's, then P6's), their pool jobs (each
-            /// row's in `job_of`), and per expert of the bank its staged row. The rows go at the phase change with the
-            /// transient scratch and come back with it (`releaseTransient`, `regrowTransient`).
+            /// P6 (`Options.prompt_stage_rows`): the prompt's staging scratch: host rows at the transient geometry that
+            /// hold one layer's predicted records (`stageMisses`), their pool jobs (staged rows [`per x j`, `per x (j +
+            /// 1)`) for job j, `per` = the records of one job), and per expert of the bank its staged row. The rows go at
+            /// the phase change with the transient scratch and come back with it (`releaseTransient`, `regrowTransient`).
             const Stage = struct {
                 rows: Rows = .{},
                 /// The rows when allocated (`Options.prompt_stage_rows`).
@@ -827,10 +813,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 layer: u32 = 0,
                 /// The staged records: rows [0, n).
                 n: u32 = 0,
-                /// Per staged row: its expert, whether a load copied it out, and its pool job.
+                /// Per staged row: its expert, and whether a load copied it out.
                 expert: []u16 = &.{},
                 used: []bool = &.{},
-                job_of: []u16 = &.{},
                 /// Per expert of the bank: its row of `layer` (`no_row`: none).
                 row_of: []u16 = &.{},
                 parts: []Part = &.{},
@@ -843,7 +828,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     st.rows.deinit();
                     a.free(st.expert);
                     a.free(st.used);
-                    a.free(st.job_of);
                     a.free(st.row_of);
                     a.free(st.parts);
                     a.free(st.landed);
@@ -1032,21 +1016,17 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
                 var stage: Stage = .{};
                 errdefer stage.deinit(a);
-                var stage_next_experts: []u16 = &.{};
-                errdefer a.free(stage_next_experts);
                 if (opt.prompt_stage_rows > 0) {
                     const s_rows = opt.prompt_stage_rows;
                     stage.capacity = s_rows;
                     stage.rows = try Rows.init(&bank.layers[widest], s_rows, .host);
                     stage.expert = try a.alloc(u16, s_rows);
                     stage.used = try a.alloc(bool, s_rows);
-                    stage.job_of = try a.alloc(u16, s_rows);
                     stage.row_of = try a.alloc(u16, bank.n_experts);
                     @memset(stage.row_of, Stage.no_row);
-                    // A job a staged record at most (P1's and P6's batches of one layer round up apart).
-                    stage.parts = try a.alloc(Part, s_rows);
+                    const per = expert_io.max_items / minis;
+                    stage.parts = try a.alloc(Part, (s_rows + per - 1) / per);
                     stage.landed = try a.alloc(bool, stage.parts.len);
-                    stage_next_experts = try a.alloc(u16, bank.n_experts);
                 }
                 const p7_rows: []P7Row = if (opt.prompt_reads == .overlap) try a.alloc(P7Row, bank.n_experts + opt.transient_rows) else &.{};
                 errdefer if (p7_rows.len > 0) a.free(p7_rows);
@@ -1096,7 +1076,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .p7_rows = p7_rows,
                     .ahead_job = ahead_job,
                     .stage = stage,
-                    .stage_next = .{ .experts = stage_next_experts },
                 };
                 // Relocation's copies (`p7Relocate`): at most every persistent row's components per call, reserved once.
                 if (opt.prompt_relocate) try self.promote_copies.ensureTotalCapacity(a, @as(usize, n_components) * bank.n_experts);
@@ -1136,7 +1115,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.p7_rows.len > 0) a.free(self.p7_rows);
                 if (self.ahead_job.len > 0) a.free(self.ahead_job);
                 self.stage.deinit(a);
-                a.free(self.stage_next.experts);
                 a.destroy(self);
             }
 
@@ -1331,14 +1309,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     c.mutex.lockUncancelable(io);
                     defer c.mutex.unlock(io);
                     while (c.done < seq) c.cond.waitUncancelable(io, &c.mutex);
-                }
-
-                /// Whether batch `seq` is done (never blocks on the copies).
-                fn copied(c: *Copier, seq: u64) bool {
-                    if (c.thread == null) return true;
-                    c.mutex.lockUncancelable(io);
-                    defer c.mutex.unlock(io);
-                    return c.done >= seq;
                 }
             };
 
@@ -1959,70 +1929,15 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// first `wide_depth x max_route_ids` records now (the groups the call routes at its start); the rest wait for
             /// the call's plans (`planCall`: `p7Tail`), or for the layer's await (every record then). `whole` and
             /// `whole_trim`: every record now (`whole_trim` withdraws the jobs still queued at the plans: `p7Withdraw`).
-            /// P6 (`Options.prompt_stage_rows`): when the layer had no empty persistent row, or the stage already holds its
-            /// records (P1's `stageAhead`), its predicted records that are neither resident nor staged are then read into
-            /// the staging rows (`stageMisses`).
+            /// P6 (`Options.prompt_stage_rows`): when the layer has no empty persistent row, its predicted records that are
+            /// not resident are then read into the staging rows (`stageMisses`).
             pub fn readAheadSeed(self: *Stream, layer: u32, experts: []const u16) !void {
                 if (self.failed) return error.StreamFailed;
                 if (self.phase != .prefill) return error.NotPrefill;
-                // P1: a stage of this layer still waiting (no prompt call posted since) is dropped.
-                if (self.stage_next.live and self.stage_next.layer == layer) self.stage_next.live = false;
                 const pol = &self.layers[layer].policy;
                 const full = pol.occupancy >= pol.capacity;
                 try self.readAheadRows(layer, experts);
-                const ahead = self.stage.n > 0 and self.stage.layer == layer;
-                if (self.stage.capacity > 0 and (full or ahead)) try self.stageMisses(layer, experts, false);
-            }
-
-            /// P1 (the cold prompt's read schedule across layers): layer `layer`'s predicted records (`experts`, hottest
-            /// first, an early prediction) read into the staging rows before its read-ahead, so that the drive reads them
-            /// while the host and the GPU finish the previous layer (its last groups, its tail, the next predictor) or run
-            /// the dense layers before the first routed layer. `past_rows`: the first as many records as the layer's empty
-            /// rows are skipped (its read-ahead admits about those), so the staged records are about the call's misses,
-            /// which its posts copy long after they land (`p7Submit`). Otherwise the hottest are staged (the first routed
-            /// layer at a call's start: they land before its read-ahead, whose admissions copy them: `postAheadJobs`). The
-            /// admissions, the plans and the kernels stay the control's. Only when `stagesAhead`; a live call must have
-            /// posted every read (no post of it reads the stage again: `stageMisses` settles it), and the layer's own
-            /// read-ahead must not have run.
-            pub fn stageAhead(self: *Stream, layer: u32, experts: []const u16, past_rows: bool) Error!void {
-                if (self.failed) return error.StreamFailed;
-                if (!self.stagesAhead(layer)) return;
-                if (self.p7.live and self.p7.post_g < self.p7.n_groups) return self.fail(error.RoutesLive);
-                if (self.ahead.live and self.ahead.layer == layer) return self.fail(error.RoutesLive);
-                const before = self.counters.staged;
-                try self.stageMisses(layer, experts, past_rows);
-                self.counters.staged_ahead += self.counters.staged - before;
-            }
-
-            /// P1: whether `stageAhead` stages layer `layer`: a prompt stream with staging rows, the layer with an empty
-            /// persistent row (cold: its read-ahead admits records, and the drive bounds the prompt). A layer whose rows
-            /// are all held (the usage seed's residents, a later call of a prompt) stages at its read-ahead (P6).
-            pub fn stagesAhead(self: *const Stream, layer: u32) bool {
-                if (self.phase != .prefill or self.stage.rows.rows == 0 or layer >= self.layers.len) return false;
-                const pol = &self.layers[layer].policy;
-                return pol.occupancy < pol.capacity;
-            }
-
-            /// P1: `stageAhead` of layer `layer` once the next prompt call (`planCall`) has posted its last read
-            /// (`p7Post`): the staged reads queue behind the call's, so that the drive reads on through the call's last
-            /// groups, its tail and the next predictor. Called before that call is planned; the ranking is copied. The
-            /// layer's read-ahead drops it if no call posted before it.
-            pub fn stageAfterCall(self: *Stream, layer: u32, experts: []const u16, past_rows: bool) Error!void {
-                if (self.failed) return error.StreamFailed;
-                if (!self.stagesAhead(layer)) return;
-                if (self.p7.live) return self.fail(error.RoutesLive);
-                const sn = &self.stage_next;
-                const n = @min(experts.len, sn.experts.len);
-                @memcpy(sn.experts[0..n], experts[0..n]);
-                sn.* = .{ .live = true, .layer = layer, .past_rows = past_rows, .n = @intCast(n), .experts = sn.experts };
-            }
-
-            /// P1: the waiting stage, now (the call has posted every read).
-            fn fireStageNext(self: *Stream) Error!void {
-                const sn = &self.stage_next;
-                if (!sn.live) return;
-                sn.live = false;
-                try self.stageAhead(sn.layer, sn.experts[0..sn.n], sn.past_rows);
+                if (full and self.stage.capacity > 0) try self.stageMisses(layer, experts);
             }
 
             /// P1's admission and posts alone (`readAheadSeed` without P6's staging): the usage seed and the self-check.
@@ -2075,10 +1990,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 try self.postAheadJobs(layer, now);
             }
 
-            /// The read-ahead's jobs over its admitted records [`posted`, `to`): pool jobs of `max_items` records each. P1:
-            /// an admitted record whose staged read has landed is copied from its staged row into its slot on the copier
-            /// (the job's `copy_seq`), not read again; the slot is the record's at once, and the job's landing waits for
-            /// the copy (every reader of the slot lands the job first).
+            /// The read-ahead's jobs over its admitted records [`posted`, `to`): pool jobs of `max_items` records each.
             fn postAheadJobs(self: *Stream, layer: u32, to: u32) Error!void {
                 const ah = &self.ahead;
                 const lens = &self.layers[layer].lens;
@@ -2092,31 +2004,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     var down: [expert_io.max_items]u64 = undefined;
                     var nr: u32 = 0;
                     var posted: u32 = 0;
-                    var copies: [expert_io.max_items * n_components]Copy = undefined;
-                    var n_copies: usize = 0;
-                    var copy_bytes: u64 = 0;
-                    for (ah.loads[start..end], ah.reads[start..end]) |l, *rd| {
+                    for (ah.loads[start..end], ah.reads[start..end]) |l, rd| {
                         if (self.ahead_job.len > 0) self.ahead_job[l.slot] = @intCast(ah.n_parts);
-                        if (!rd.*) continue;
-                        if (self.stagedRow(layer, l.expert)) |srow| if (self.stageJobDone(self.stage.job_of[srow])) {
-                            try self.landStageJob(self.stage.job_of[srow]);
-                            const loc = self.locate(layer, l.slot);
-                            for (0..n_components) |c| {
-                                const dst = loc.rows.row(@fromBackingInt(@intCast(c)), loc.row);
-                                copies[n_copies] = .{ .dst = dst, .src = self.stage.rows.row(@fromBackingInt(@intCast(c)), srow) };
-                                n_copies += 1;
-                                copy_bytes += dst.len;
-                            }
-                            if (!self.stage.used[srow]) self.counters.stage_admits += 1;
-                            self.stage.used[srow] = true;
-                            loc.meta.state = .ready;
-                            rd.* = false;
-                            continue;
-                        };
+                        if (!rd) continue;
                         nr = self.entries(layer, l.slot, l.expert, &rows, &gu, &down, nr);
                         posted += 1;
                     }
-                    if (copy_bytes > 0) part.copy_seq = self.submitCopies(layer, copies[0..n_copies], copy_bytes, &.{});
                     if (nr > 0) {
                         part.ticket = B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], lens) catch |e| return self.fail(e);
                         part.n_reads = nr;
@@ -2133,25 +2026,17 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             // ── P6: the seeded prompt's read-ahead into the staging rows, copied into the call's rows at its posts ──
 
-            /// P6 and P1: layer `layer`'s predicted records that are neither resident nor staged (`experts`, hottest first)
-            /// read into the free staging rows, after the ones the stage holds for the layer (another layer's stage settled
-            /// first). `past_rows` (P1's `stageAhead`): the first as many as the layer's empty rows are skipped. Pool jobs
-            /// of `max_items` records.
-            fn stageMisses(self: *Stream, layer: u32, experts: []const u16, past_rows: bool) Error!void {
+            /// P6: layer `layer`'s predicted records that are not resident (`experts`, hottest first), as many as the staging
+            /// rows hold, read into them (the previous layer's stage settled first): pool jobs of `max_items` records.
+            fn stageMisses(self: *Stream, layer: u32, experts: []const u16) Error!void {
                 const st = &self.stage;
                 if (st.rows.rows == 0) return;
-                if (st.n > 0 and st.layer != layer) try self.settleStage();
+                try self.settleStage();
                 const pol = &self.layers[layer].policy;
-                var free: u32 = if (past_rows) pol.capacity -| pol.occupancy else 0;
-                const first = st.n;
-                var n: u32 = st.n;
+                var n: u32 = 0;
                 for (experts) |e| {
                     if (n == st.rows.rows) break;
                     if (e >= pol.n_experts or pol.slotOf(e) != null or st.row_of[e] != Stage.no_row) continue;
-                    if (free > 0) {
-                        free -= 1;
-                        continue;
-                    }
                     st.expert[n] = e;
                     st.used[n] = false;
                     st.row_of[e] = @intCast(n);
@@ -2161,7 +2046,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 st.n = n;
                 const geom = &self.bank.layers[layer];
                 const per = expert_io.max_items / minisOf(geom);
-                var start: u32 = first;
+                var start: u32 = 0;
                 while (start < n) {
                     const end = @min(start + per, n);
                     var rows: [expert_io.max_items][n_components]u64 = undefined;
@@ -2172,7 +2057,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const ticket = B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &self.layers[layer].lens) catch |e| return self.fail(e);
                     st.parts[st.n_parts] = .{ .first = start, .n = end - start, .ticket = ticket, .n_reads = nr };
                     st.landed[st.n_parts] = false;
-                    for (start..end) |i| st.job_of[i] = @intCast(st.n_parts);
                     st.n_parts += 1;
                     self.counters.staged += end - start;
                     start = end;
@@ -2187,18 +2071,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return if (r == Stage.no_row) null else r;
             }
 
-            /// P1: whether staging job `j` has landed or its reads have all completed (never blocks).
+            /// P6: whether staging job `j` has landed, without a wait: a load copies a staged record only then (`p7Submit`).
             fn stageJobDone(self: *Stream, j: u32) bool {
                 const st = &self.stage;
                 if (st.landed[j]) return true;
                 const p = st.parts[j];
                 self.pool.wait(p.ticket, 2 * p.n_reads, 0) catch return false;
                 return true;
-            }
-
-            /// P1: every staging job landed (its reads waited and counted), the stage kept (a test's, a diagnostic's).
-            pub fn awaitStage(self: *Stream) Error!void {
-                for (0..self.stage.n_parts) |j| try self.landStageJob(@intCast(j));
             }
 
             /// P6: lands staging job `j` once: its reads waited and counted; a read that failed fails the stream.
@@ -2262,8 +2141,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (ah.landed[j]) return;
                 ah.landed[j] = true;
                 const p = &ah.parts[j];
-                // P1: its admissions copied from the stage are in their slots once the copier has done the job's batch.
-                if (p.copy_seq != 0) self.copier.waitFor(p.copy_seq);
                 const policy = &self.layers[ah.layer].policy;
                 var failure: ?Error = null;
                 if (!p.settled) {
@@ -2289,13 +2166,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (failure) |e| return self.fail(e);
             }
 
-            /// Whether read-ahead job `j` has landed or its reads and its copies (P1) have all completed (never blocks).
+            /// Whether read-ahead job `j` has landed or its reads have all completed (never blocks).
             fn aheadJobDone(self: *Stream, j: u32) bool {
                 const ah = &self.ahead;
-                if (ah.landed[j]) return true;
+                if (ah.landed[j] or ah.parts[j].settled) return true;
                 const p = ah.parts[j];
-                if (p.copy_seq != 0 and !self.copier.copied(p.copy_seq)) return false;
-                if (p.settled) return true;
                 self.pool.wait(p.ticket, 2 * p.n_reads, 0) catch return false;
                 return true;
             }
@@ -2407,8 +2282,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     first = j;
                 }
                 if (first == ah.n_parts) return;
-                // P1: a forgotten job's copies done first (its copied records stay in their slots: held, no read).
-                for (ah.parts[first..ah.n_parts]) |p| if (p.copy_seq != 0) self.copier.waitFor(p.copy_seq);
                 const from = ah.parts[first].first;
                 // Their rows wait for the plans again: no job writes them (`p7Tail` posts the kept ones anew).
                 for (ah.loads[from..ah.n]) |l| self.ahead_job[l.slot] = no_job;
@@ -2636,8 +2509,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         try self.p7Submit(r, pi);
                     }
                 }
-                // P1: every read of the call posted: the next layer's stage queues behind them.
-                try self.fireStageNext();
             }
 
             /// P7 overlap: one part's loads as the stock route takes them (a row a live route still serves from is never
@@ -2654,27 +2525,27 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 var copies: [expert_io.max_items * n_components]Copy = undefined;
                 var n_copies: usize = 0;
                 var copy_bytes: u64 = 0;
+                const per = expert_io.max_items / minisOf(&self.bank.layers[r.layer]);
                 for (r.order[part.first..][0..part.n]) |li| {
                     const l = plan.loads[li];
                     const loc = self.locate(r.layer, l.slot);
                     const m = loc.meta;
                     if (m.pins != 0 or m.state == .loading) return self.fail(error.SlotStillPinned);
-                    if (r.reads[li]) if (self.stagedRow(r.layer, l.expert)) |srow| if (self.stageJobDone(self.stage.job_of[srow])) {
+                    if (r.reads[li]) if (self.stagedRow(r.layer, l.expert)) |srow| if (self.stageJobDone(srow / per)) {
                         // Its job has completed (landed here without a wait); the row is the load's own once the copy is
                         // done. A staged read still in flight is not waited for: the load reads the record itself, and the
                         // staged record stays unused (the host never stalls the call's posts on the stage).
-                        try self.landStageJob(self.stage.job_of[srow]);
+                        try self.landStageJob(srow / per);
                         for (0..n_components) |c| {
                             const dst = loc.rows.row(@fromBackingInt(@intCast(c)), loc.row);
                             copies[n_copies] = .{ .dst = dst, .src = self.stage.rows.row(@fromBackingInt(@intCast(c)), srow) };
                             n_copies += 1;
                             copy_bytes += dst.len;
                         }
-                        // A staged record counts once (P1: an admission copied it, the plans evicted it, a load takes it).
-                        if (!self.stage.used[srow]) self.counters.stage_copies += 1;
                         self.stage.used[srow] = true;
                         m.* = .{ .state = .ready, .layer = @intCast(r.layer), .expert = l.expert };
                         r.reads[li] = false;
+                        self.counters.stage_copies += 1;
                     };
                     if (r.reads[li]) {
                         m.* = .{ .state = .loading, .layer = @intCast(r.layer), .expert = l.expert };
@@ -2922,7 +2793,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.failed) return error.StreamFailed;
                 if (self.transient_released) return error.TransientAlreadyReleased;
                 if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
-                self.stage_next.live = false;
                 try self.settleStage();
                 try self.flush();
                 for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
@@ -3111,7 +2981,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (std.Thread.getCurrentId() != self.owner) return error.NotInferenceThread;
                 if (self.failed) return error.StreamFailed;
                 if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
-                self.stage_next.live = false;
                 try self.settleStage();
                 for (&self.routes) |*r| if (r.state == .live) self.release(r);
                 self.releaseHeld();

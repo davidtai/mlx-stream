@@ -960,29 +960,6 @@ fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, s
     try src.readAheadSeed(l, expert_policy.rankHottest(host, &src.ahead_ranked));
 }
 
-/// P1 (the cold prompt's read schedule across layers): the first routed layer's predicted records staged at a prompt
-/// call's start, from the call's embeddings (its router under its pre-feedforward norm, `predictedCounts`): the drive
-/// reads them while the dense layers run, and the layer's read-ahead copies the ones it admits. Only for a cold layer
-/// (`stagesAhead`). The prediction only picks reads: token-exact.
-fn stageFirstRouted(g: *G, c: *const beam.Config, w: *const Weights, x: T, src: anytype) !void {
-    const l: u32 = for (w.layers, 0..) |*lw, li| {
-        if (lw.router != null) break @intCast(li);
-    } else return;
-    if (!src.stagesAhead(l)) return;
-    const m = g.mark();
-    defer g.resetTo(m);
-    try src.stageCounts(l, try predictedCounts(g, c, &w.layers[l], x), .start);
-}
-
-/// P1: routed layer `l + 1`'s early prediction over layer `l`'s residual after its attention (`x1`), unevaluated, for
-/// the call of layer `l` to stage once it has posted its reads (`Source.forward`'s `ahead`). Null: the last layer, a
-/// dense next layer, or a next layer that is not cold (`stagesAhead`).
-fn nextAhead(g: *G, c: *const beam.Config, w: *const Weights, l: u32, x1: T, src: anytype) !?experts.Source.Ahead {
-    const next = l + 1;
-    if (next >= w.layers.len or w.layers[next].router == null or !src.stagesAhead(next)) return null;
-    return .{ .layer = next, .counts = try predictedCounts(g, c, &w.layers[next], x1) };
-}
-
 /// The head's rows: the last row's logits (served), or every row's (the parity test's).
 pub const Head = enum { last, all };
 
@@ -1013,7 +990,6 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
     const boundary_glue: ?*const glue.Kernels = if (rows == 1) routes.glue else null;
     var xn_next: ?T = null;
     defer if (xn_next) |v| g.release(v);
-    if (prompt) try stageFirstRouted(g, c, w, x, src);
     // P7 (the shared route's prompt levers): the next routed layer's predicted counts, built on each layer's output at
     // its tail and evaluated with it (`PromptAhead`: no predictor round trip at the boundary), and a layer's purge after
     // the next layer's first commit (`DeferredPurge`: the GPU starts that tile first).
@@ -1054,12 +1030,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, h, rows) else try mlp(g, d, h)) else blk: {
             const r = if (comptime @TypeOf(force) == void) try routeOf(g, c, routes, lw.router.?, h, !prompt) else try forcedRoute(g, c, routes, lw.router.?, h, force, l, start, !prompt);
             if (prompt) try g.asyncEval(&.{ r.indices, r.weights });
-            // P1: the next routed layer's early prediction, committed behind the router (the call's barrier waits for
-            // the router alone); the call stages it once its reads are posted, so the drive reads on through this
-            // layer's last groups, its tail and the next predictor.
-            const early = if (prompt) try nextAhead(g, c, w, l, x1, src) else null;
-            if (early) |nx| try g.asyncEval(&.{nx.counts});
-            const routed = try g.adopt(try src.forward(l, h, r.indices, r.weights, early));
+            const routed = try g.adopt(try src.forward(l, h, r.indices, r.weights));
             break :blk try scaled(g, c, routed, try g.scalar(c.routed_scaling, .float32));
         };
         const x2 = if (boundary_glue) |k| blk: {

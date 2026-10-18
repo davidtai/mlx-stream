@@ -119,8 +119,7 @@ pub const Source = struct {
     /// MiMo's X12 (`gpu_keep_warm: waits`): the warm engine (the gated waits and every decode routing barrier); null on the
     /// control.
     warm: ?*gpu_warm.Warm = null,
-    /// P1's host scratch (reused): the call's predicted counts (read back from the GPU), the ranking; the read-ahead's
-    /// and the stage's (`stageCounts`) in turn.
+    /// P1's host scratch (reused): the call's predicted counts (read back from the GPU), the ranking.
     ahead_counts: [max_experts]u32 = undefined,
     ahead_ranked: [max_experts]u16 = undefined,
 
@@ -337,20 +336,10 @@ pub const Source = struct {
         return route.decodeLane(nt, self.decoding(), decode_lane_rows);
     }
 
-    /// P1 (the cold prompt's read schedule): the next routed layer's early prediction (`graph.predictedCounts` over
-    /// this layer's residual, u32 [experts]) that a wide call stages once it has posted every read (`stageCounts`).
-    pub const Ahead = struct { layer: u32, counts: T };
-
-    /// P1: when `stageCounts` stages. `start`: now, the hottest (the first routed layer at a call's start). `behind`:
-    /// once the next prompt call has posted its last read, past the layer's empty rows (`Stream.stageAfterCall`).
-    pub const StageWhen = enum { start, behind };
-
     /// One routed call of absolute layer `layer`: x [nt, H] bf16, ids u32 [nt, 8] (the router's, read by the scheduler
     /// as they are), f32 weights [nt, 8] -> the weighted sum [nt, H] bf16, a KEPT handle the caller adopts. The decode
-    /// lane's output is lazy (the next routing barrier or the logits evaluate it); a wide call's is evaluated. `ahead`
-    /// (a wide call only): P1's next layer, read back before the call's plans and staged by the stream once the call
-    /// has posted its last read (before the call's last groups, its tail and the next predictor).
-    pub fn forward(self: *Self, layer: u32, x: T, expert_ids: T, route_weights: T, ahead: ?Ahead) !T {
+    /// lane's output is lazy (the next routing barrier or the logits evaluate it); a wide call's is evaluated.
+    pub fn forward(self: *Self, layer: u32, x: T, expert_ids: T, route_weights: T) !T {
         const g = &self.g;
         defer g.reset();
         const nt: u32 = @intCast(g.shapeOf(x).d[0]);
@@ -361,7 +350,6 @@ pub const Source = struct {
         // Decode's window 0 holds one decode-lane route: no decode-phase call is wide (the module resumes the prompt
         // phase for any wider forward). An invariant of the callers.
         std.debug.assert(!self.decoding());
-        if (ahead) |nx| try self.stageCounts(nx.layer, nx.counts, .behind);
         const hook = self.ex.at(layer);
         const parts = try hook.routedParts(g, x, expert_ids);
         defer hook.releaseParts(g);
@@ -390,25 +378,6 @@ pub const Source = struct {
     /// P1: layer `layer`'s predicted experts, hottest first, read into its free persistent rows ahead of its call.
     pub fn readAheadSeed(self: *Self, layer: u32, ranked: []const u16) !void {
         try self.ex.at(layer).readAheadSeed(ranked);
-    }
-
-    /// P1 (the cold prompt's read schedule): whether routed layer `layer` is staged before its read-ahead
-    /// (`Stream.stagesAhead`: the staging rows, the layer with an empty prompt row).
-    pub fn stagesAhead(self: *const Self, layer: u32) bool {
-        return self.sdk_stream.stagesAhead(self.stream_source.relativeLayer(layer));
-    }
-
-    /// P1: routed layer `layer`'s early prediction (`counts`, u32 [experts]) read back, ranked hottest first and staged
-    /// `when` (`Stream.stageAhead`, `Stream.stageAfterCall`).
-    pub fn stageCounts(self: *Self, layer: u32, counts: T, when: StageWhen) !void {
-        try self.g.evalAll(&.{counts});
-        const host = try self.g.readU32(counts, self.ahead_counts[0..self.bank.geometry.num_experts]);
-        const ranked = sdk_ext.expert.policy.rankHottest(host, &self.ahead_ranked);
-        const rel = self.stream_source.relativeLayer(layer);
-        switch (when) {
-            .start => try self.sdk_stream.stageAhead(rel, ranked, false),
-            .behind => try self.sdk_stream.stageAfterCall(rel, ranked, true),
-        }
     }
 
     pub fn stats(self: *Self) sdk_ext.expert.Stats {

@@ -101,29 +101,6 @@ the copier thread and reads nothing; the load's waits and its gate hold until th
 and the kernels do not change, and each planned row holds its record's bytes before a kernel reads it: the change is
 exact. The staging rows go at the phase change with the prompt's transient rows and come back with them.
 
-### The cold read schedule (P1)
-
-Without the usage seed, the first call of a prompt reads every record of every routed layer once (277.5 GB for the
-16,445-token coding prompt), and the drive is its bound. In the cold profile the drive stops at each layer boundary:
-from the last read of layer l to the read-ahead of layer l + 1, the host and the GPU run the last groups of layer l,
-its tail and the predictor of layer l + 1 (about 27 ms a boundary, 1.37 s in 49 boundaries). The drive also stops
-while the dense layers 0 to 2 run (1.64 s), because they read no record.
-
-When a routed layer has an empty prompt row, the staging rows also do this work:
-
-- At the start of a prompt call, the predictor of the first routed layer runs on the call's embeddings. The hottest
-  predicted records go into the staging rows while the dense layers run.
-- At the router stage of routed layer l, the predictor of layer l + 1 runs on the residual of layer l after its
-  attention. When the call of layer l has posted all its reads, the predicted records of layer l + 1 past its empty
-  rows go into the staging rows. The drive reads them after the reads of layer l, while the host and the GPU finish
-  layer l.
-
-The read-ahead of layer l + 1 and its plans do not change. When the read-ahead admits a staged record whose read is
-complete, the copier copies the staged row into the record's slot and the read-ahead reads nothing for it. When the
-call loads a staged record, the copier copies it (as in P6). The change is exact. The early predictor of layer l + 1
-runs beside the MoE stage of layer l: the bill's prompt wave adds it. A layer with no empty prompt row (the usage
-seed's residents, a later call) stages at its read-ahead (P6).
-
 ### The host work off the critical path (P7)
 
 Three host steps of each prompt layer ran while the GPU had no work. The shared route (`mimo_v2/route.zig`) now holds
@@ -139,8 +116,7 @@ glm5_next's levers for them, and Beam uses them:
 The values and the reads do not change: the change is exact.
 
 The prompt pass's end writes one line: `beam prompt: tokens= wall_s= ssd_bytes= ahead_posted= ahead_dropped= staged=
-staged_ahead= stage_copies= stage_admits= stage_unused= loads= skipped=`. The staged records are the copies, the
-admissions and the unused records.
+stage_copies= stage_unused= loads= skipped=`.
 
 Decode is serial: one row a step. The routed call takes MiMo's decode lane. Its routing barrier is the only host-GPU
 synchronization before the logits: the host reads the layer's expert ids and plans the hits and the misses. Under
@@ -351,7 +327,7 @@ at 173 / 183 rows, temperature 0.7, top_p 0.99, seeds 1234 and 4321. Each seed g
 | `mlx_cache`, `mlx_cache_overshoot` | MLX's cache limit of the phase. The phase's largest single buffer. |
 | `compiler_runtime`, `host_runtime` | MiMo's declared host runtime and compiled kernels (no Beam reading yet). |
 | `resident_wiring`, `buffer_allowance` | The wiring of the wired bytes. DeepSeek's measured cost for each live buffer. |
-| `request`, `request_wiring` | The prompt wave at the widest call (with P1's early predictor beside the MoE stage), the decode wave, and their wiring. |
+| `request`, `request_wiring` | The prompt wave at the widest call, the decode wave, and their wiring. |
 | `prompt_view` | The q8 tier only, prompt phase: the BF16 weights of the widest layer's projections (a dense layer: 838,860,800 B) and their wiring. |
 | `sampler`, `gpu_warm` | The plugin's sampler. MiMo's keep-warm engine when it is on. |
 | `decode_kernels` | The fused texts' set, its pipelines and prepared launches under `decode_moe: hitpass` and `fused`: 20 MiB declared. At the pack's load the fused route's construction footprint is 18.6 MB more than the stock route's (host side 416.1 MB against 397.5 MB; MLX active the same). |

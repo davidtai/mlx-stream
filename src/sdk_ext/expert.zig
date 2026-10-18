@@ -147,14 +147,10 @@ pub const Stats = struct {
     promoted_bytes: u64 = 0,
     /// P6 (`Options.prompt_stage_rows`): records read into the staging rows and their bytes (in `expert_bytes_read`
     /// too), the call's loads copied from a staged row in place of a read, and the staged records no load copied.
-    /// P1 (`Stream.stageAhead`): the staged records read before their layer's read-ahead (in `staged`), and the
-    /// read-ahead's admissions copied from a staged row. staged = stage_copies + stage_admits + stage_unused.
     staged: u64 = 0,
     staged_bytes: u64 = 0,
     stage_copies: u64 = 0,
     stage_unused: u64 = 0,
-    staged_ahead: u64 = 0,
-    stage_admits: u64 = 0,
 
     /// The counters since `prev`, an earlier snapshot of the same stream: each field's difference, at least zero.
     pub fn since(s: Stats, prev: Stats) Stats {
