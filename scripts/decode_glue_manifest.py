@@ -13,7 +13,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 KDIR = os.path.join(HERE, "..", "src", "kernels", "decode_glue")
 
-HEADERS = [("decode_glue", "header_decode_glue.metal"), ("decode_glue_combine", "header_decode_glue_combine.metal")]
+HEADERS = [("decode_glue", "header_decode_glue.metal"), ("decode_glue_combine", "header_decode_glue_combine.metal"),
+           ("decode_glue_q8", "header_decode_glue_q8.metal")]
 # The decode lane's rows (beam experts.zig `decode_lane_rows`): the select text's launches at M = 1 .. 4.
 LANE_ROWS = 4
 
@@ -60,6 +61,20 @@ def combine(instances):
             "instances": instances}
 
 
+def q8_gemv(instances):
+    return {"name": "glue_q8_gemv", "headers": ["decode_glue", "decode_glue_q8"], "template": ["K", "ROWS", "SPT", "PF"],
+            "inputs": [arg("x", "bfloat16", [1, "K"]), arg("w", "uint32", ["N", "K/4"]), arg("scales", "bfloat16", ["N", "K/64"]),
+                       arg("biases", "bfloat16", ["N", "K/64"])],
+            "outputs": [arg("y", "bfloat16", [1, "N"])], "grid": [32, "N/ROWS", 1], "threadgroup": [32, "SPT", 1],
+            "instances": instances}
+
+
+# The q8 GEMV's plans (beam glue.zig `q8_plans`: rows a simdgroup, simdgroups a threadgroup, the next block's codes
+# first) at the trunk's K (hidden 5,120, the attention's 6,144, the dense intermediate 20,480).
+Q8_PLANS = [(4, 2, 0), (4, 2, 1), (8, 2, 1), (8, 1, 1), (4, 4, 1), (2, 4, 1), (8, 4, 1), (2, 2, 1)]
+Q8_K = [5120, 6144, 20480]
+
+
 # The q / k norm text's heads a threadgroup (beam glue.zig `heads_per_group`).
 HEADS_PER_GROUP = 8
 # The combine text's columns a threadgroup (beam glue.zig `combine_threads`).
@@ -102,7 +117,8 @@ def build(case):
     cv = [i for _, _, _, _, x in CASES[case] for i in x]
     m = {"format": "mlx-stream-decode-glue-kernels-v1", "case": case, "headers": [dict(id=i, **text(f)) for i, f in HEADERS],
          "kernels": []}
-    for k in (gemv(gv), select(sv), qk_norm(qv), add_norm(av), combine(cv)):
+    q8v = [{"K": k, "ROWS": r, "SPT": t, "PF": f} for k in Q8_K for r, t, f in Q8_PLANS] if case == "beam" else []
+    for k in (gemv(gv), select(sv), qk_norm(qv), add_norm(av), combine(cv), q8_gemv(q8v)):
         m["kernels"].append(dict(k, source=text(k["name"] + ".metal")))
     return (json.dumps(m, separators=(",", ":"), sort_keys=True) + "\n").encode()
 
