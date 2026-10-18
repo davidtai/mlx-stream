@@ -412,6 +412,30 @@ The slice runs `decode_moe: fused` (the default at its geometry) and gives the n
 gave before. A second test serves the slice on each route, with the reference's routes forced, and compares every
 logit: 106,962,944 logits (704 rows), 0 differ.
 
+### The long call (P5) against the reference
+
+P5's calls of 17,408 rows make the 16,445-token coding prompt one call. Before P5 the prompt ran as a 16,384-row call
+and a 61-row call. The parity gate compares both paths with an f32-accumulated reference of the same rows on the
+real-weight slice (`BEAM_PARITY_SLICE_LONG_REF`; `scripts/beam_reference_logits.py --long-case`: 16,445 prompt rows
+and 16 decode rows on forced routes; 144 s and 40 GB on the box's CPU):
+
+| Path | RMS | Mean abs diff | Logits past 0.05 | Decisive argmax differ | Router choices off the reference |
+|---|---|---|---|---|---|
+| One call (P5) | 0.06266 | 0.04504 | 42.14 % | 0 of 15 | 2,752 of 49,383 |
+| 16,384 + 61 | 0.05760 | 0.04195 | 40.21 % | 0 of 15 | 2,746 of 49,383 |
+
+The rule (`long_rule`) needs the one call's RMS and mean each at most 1.05 x the chunked path's. P5 fails it (x 1.088
+and x 1.074), so P5 is not in the stack. The largest difference is not in the rule: the reference's own f32 sum order
+moves this slice's logits by up to 0.996.
+
+Per layer (the diag on diag/beam-p5-layers, which probes 109 rows): the two paths are equal at every probed row
+through layer 3's attention. The first difference is layer 3's routed experts for the 61 rows past row 16,384. In the
+one call those rows run in the call's sorted `gather_qmm` (NAX GEMM tiles of 1,024 pairs). In the 61-row call they run
+in per-row `gather_qmv` (488 pairs over about 256 slots: MLX takes the GEMM only when B >= 16 and B / E >= 4). Their
+MoE output is 1.0 % farther from the reference in the one call (layer 4: 2.0 %). The later layers carry the
+difference to every row. Per logit row the two paths' distances differ by -14 % to +51 %, so a few decode rows decide
+the 17 rows' total.
+
 ### The q8 tier
 
 A q8 pack runs in two cases. The script dequantizes the q8 residents (s x q + b in f32), as MLX's qmv reads them.
