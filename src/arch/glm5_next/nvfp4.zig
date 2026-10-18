@@ -17,48 +17,10 @@ const T = mlx.mlx_array;
 pub const Format = shared.FormatOf(.{ .Fused = FusedDecode, .max_call_tokens = 16_384 });
 
 /// The decode lane's fused NVFP4 texts (decode_kernels.zig, MiMo's k1 family over the NVFP4 bank) as MiMo's math binds
-/// a format's fused route (`MathOf`'s `F.Fused`): installed once at construction (`install`: the set built on the
-/// module's GPU stream, its compile self-check, the launches prepared per wave width), each wave one launch of each
-/// text over the three banks (`ids` packed `bank << 24 | slot row`).
-pub const FusedDecode = struct {
-    installed: decode_kernels.Installed,
-
-    pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, hidden: u32, inter: u32, top_k: u32, limit: f64, diag: *sdk.Diag) !FusedDecode {
-        try decode_kernels.checkModel(hidden, inter, top_k, limit, diag);
-        return .{ .installed = try decode_kernels.install(a, s, diag) };
-    }
-
-    pub fn deinit(f: *FusedDecode) void {
-        f.installed.deinit();
-    }
-
-    pub fn kernelBanks(banks: *const [decode_kernels.n_banks]bank.BankArrays) [decode_kernels.n_banks]decode_kernels.BankArrays {
-        var out: [decode_kernels.n_banks]decode_kernels.BankArrays = undefined;
-        for (&out, banks) |*o, b| o.* = .{
-            .gate = .{ .w = b.gate.w, .scales = b.gate.scales, .global_scale = b.gate.global_scale },
-            .up = .{ .w = b.up.w, .scales = b.up.scales, .global_scale = b.up.global_scale },
-            .down = .{ .w = b.down.w, .scales = b.down.scales, .global_scale = b.down.global_scale },
-        };
-        return out;
-    }
-
-    /// x bf16 [P, hidden] (each pair's token row) -> the clamped SwiGLU rows bf16 [P, inter].
-    pub fn gateUp(f: *const FusedDecode, g: *ops.MlxOps, x: T, ids: T, banks: *const [decode_kernels.n_banks]bank.BankArrays) !T {
-        const kb = kernelBanks(banks);
-        return g.adopt(try f.installed.fused.gateUp(x, ids, &kb));
-    }
-
-    /// h bf16 [P, inter] -> each pair's down row bf16 [P, hidden].
-    pub fn down(f: *const FusedDecode, g: *ops.MlxOps, h: T, ids: T, banks: *const [decode_kernels.n_banks]bank.BankArrays) !T {
-        const kb = kernelBanks(banks);
-        return g.adopt(try f.installed.fused.down(h, ids, &kb));
-    }
-};
-
-comptime {
-    // Every decode wave the shared scheduler forms (at most one route's ids) has a prepared launch.
-    if (decode_kernels.max_pairs < @import("../../sdk_ext.zig").expert.policy.max_route_ids) @compileError("glm5_next: the fused decode texts' widest wave is narrower than the scheduler's route");
-}
+/// a format's fused route (`MathOf`'s `F.Fused`; the shared format's `FusedDecodeOf`): installed once at construction
+/// (`install`: the set built on the module's GPU stream, its compile self-check, the launches prepared per wave width),
+/// each wave one launch of each text over the three banks (`ids` packed `bank << 24 | slot row`).
+pub const FusedDecode = shared.FusedDecodeOf(decode_kernels.Kernels);
 
 /// A projection's slot arrays as the gathers take them (the shared format's check), refused as `Glm5NextSlotArrays`.
 pub fn checkArrays(g: *ops.MlxOps, which: []const u8, w: bank.Arrays(T), in: u32, out: u32) !void {
@@ -78,5 +40,3 @@ test "glm5_next nvfp4 format: the fused route's banks are the kernels' (gate, up
         try testing.expectEqual(b.down.scales.ctx, k.down.scales.ctx);
     }
 }
-
-

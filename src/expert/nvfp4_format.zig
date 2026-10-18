@@ -9,8 +9,9 @@
 //! gather route MLX picks (gather_qmv / gather_qmv_fast for the decode rows, the sorted NAX GEMM for the prompt tiles)
 //! has its nvfp4 global-scale (`_hgs`) instances at the pinned MLX, at any geometry.
 //!
-//! An arch takes `FormatOf(.{ ... })`: with its fused decode texts (`Fused`, geometry-checked at their install:
-//! glm5_next's `decode_kernels.zig`) or without (`Fused = null`: the stock gathers on every route, beam's).
+//! An arch takes `FormatOf(.{ ... })`: with its fused decode texts (`Fused`: `FusedDecodeOf` over its set of the shared
+//! NVFP4 decode texts, nvfp4_decode_kernels.zig, geometry-checked at their install) or without (`Fused = null`: the stock
+//! gathers on every route).
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -95,6 +96,53 @@ pub fn FormatOf(comptime params: Params) type {
                     return .{ .w = out[0], .scales = out[1], .global_scale = out[2] };
                 }
             };
+        }
+    };
+}
+
+/// A set of the shared NVFP4 decode texts (`K`: nvfp4_decode_kernels.zig `KernelsOf`) as MiMo's math binds a format's
+/// fused route (`MathOf`'s `F.Fused`): installed once at construction (`install`: the model's routed geometry and
+/// activation checked against the set's, the set built on the module's GPU stream, its compile self-check, the launches
+/// prepared per wave width), each wave one launch of each text over the three banks (`ids` packed `bank << 24 | slot
+/// row`).
+pub fn FusedDecodeOf(comptime K: type) type {
+    comptime {
+        // Every decode wave the shared scheduler forms (at most one route's ids) has a prepared launch.
+        if (K.max_pairs < @import("../sdk_ext.zig").expert.policy.max_route_ids) @compileError(K.prefix ++ ": the fused decode texts' widest wave is narrower than the scheduler's route");
+    }
+    return struct {
+        const Self = @This();
+        installed: K.Installed,
+
+        pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, hidden: u32, inter: u32, top_k: u32, act: @import("../sdk_ext.zig").quant.Activation, diag: *sdk.Diag) !Self {
+            try K.checkModel(hidden, inter, top_k, act, diag);
+            return .{ .installed = try K.install(a, s, diag) };
+        }
+
+        pub fn deinit(f: *Self) void {
+            f.installed.deinit();
+        }
+
+        pub fn kernelBanks(banks: *const [K.n_banks]bank.BankArrays) [K.n_banks]K.BankArrays {
+            var out: [K.n_banks]K.BankArrays = undefined;
+            for (&out, banks) |*o, b| o.* = .{
+                .gate = .{ .w = b.gate.w, .scales = b.gate.scales, .global_scale = b.gate.global_scale },
+                .up = .{ .w = b.up.w, .scales = b.up.scales, .global_scale = b.up.global_scale },
+                .down = .{ .w = b.down.w, .scales = b.down.scales, .global_scale = b.down.global_scale },
+            };
+            return out;
+        }
+
+        /// x bf16 [P, hidden] (each pair's token row) -> the SwiGLU rows bf16 [P, inter].
+        pub fn gateUp(f: *const Self, g: *ops.MlxOps, x: T, ids: T, banks: *const [K.n_banks]bank.BankArrays) !T {
+            const kb = kernelBanks(banks);
+            return g.adopt(try f.installed.fused.gateUp(x, ids, &kb));
+        }
+
+        /// h bf16 [P, inter] -> each pair's down row bf16 [P, hidden].
+        pub fn down(f: *const Self, g: *ops.MlxOps, h: T, ids: T, banks: *const [K.n_banks]bank.BankArrays) !T {
+            const kb = kernelBanks(banks);
+            return g.adopt(try f.installed.fused.down(h, ids, &kb));
         }
     };
 }

@@ -124,7 +124,7 @@ pub fn missReadsLine(buf: []u8, miss_reads: settings.MissReads, block: u64, prer
     var fb: [96]u8 = undefined;
     const f = if (forms) |x| std.fmt.bufPrint(&fb, "gateup={s} down={s}", .{ @tagName(x.gateup), @tagName(x.down) }) catch "" else "-";
     return std.fmt.bufPrint(buf, "glm5_next experts: miss_reads={s} block={d} preread={s} records={d}x{d}x{d}B forms {s} ({s})", .{
-        @tagName(miss_reads), block, if (preread) "on" else "off", layers, experts, record_bytes, f,
+        @tagName(miss_reads),                                                                                                                                                                              block, if (preread) "on" else "off", layers, experts, record_bytes, f,
         if (miss_reads == .direct) "demand ranges preadv straight into the slot rows, no staging copy; ranges and rows checked on the block" else "demand ranges through the staging buffer and the copy",
     }) catch buf[0..0];
 }
@@ -326,9 +326,9 @@ pub fn SourceOf(comptime fam: Family) type {
                 // per wave width), refused by name, under `fused` and `hitpass`; the stock gathers otherwise.
                 if (decode_moe != .stock) {
                     var diag: sdk.Diag = .{};
-                    math_n.fused = nvfp4.FusedDecode.install(a, stream, geo.hidden_size, geo.intermediate_size, top_k, 10.0, &diag) catch |e| {
-                            log.err("glm5_next: the fused decode route refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
-                            return e;
+                    math_n.fused = nvfp4.FusedDecode.install(a, stream, geo.hidden_size, geo.intermediate_size, top_k, .{ .swiglu_clamped = 10.0 }, &diag) catch |e| {
+                        log.err("glm5_next: the fused decode route refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
+                        return e;
                     };
                 }
                 break :blk math_n;
@@ -375,9 +375,9 @@ pub fn SourceOf(comptime fam: Family) type {
             log.info("{s}\n", .{promptResidentsLine(prompt_residents)});
             if (comptime fam != .exl3) {
                 switch (decode_moe) {
-                .stock => {},
-                .fused => log.info("glm5_next decode experts installed: decode_moe=fused (the NVFP4 k1 texts over the three banks, one launch of each per wave; the hit wave routed on the host)\n", .{}),
-                .hitpass => log.info("glm5_next decode experts installed: decode_moe=hitpass (the NVFP4 k1 texts over the three banks; each call's hit wave from the layer's resident slot LUT behind the routing barrier, the miss parts after the route)\n", .{}),
+                    .stock => {},
+                    .fused => log.info("glm5_next decode experts installed: decode_moe=fused (the NVFP4 k1 texts over the three banks, one launch of each per wave; the hit wave routed on the host)\n", .{}),
+                    .hitpass => log.info("glm5_next decode experts installed: decode_moe=hitpass (the NVFP4 k1 texts over the three banks; each call's hit wave from the layer's resident slot LUT behind the routing barrier, the miss parts after the route)\n", .{}),
                 }
             }
             try self.beginPrefill();
