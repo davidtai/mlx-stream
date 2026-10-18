@@ -42,7 +42,7 @@ The published EXL3 K=3 pack is
 (MIT, 130.8 GB): `experts.bin` (114.6 GB, 42 x 288 records), its two manifests, the FP8 residents in five safetensors
 shards with `residents-fp8-manifest.json`, the NVFP4 MTP draft bank (`mtp-experts-nvfp4.bin` and its manifest), the
 usage profile `expert-usage-v1.json`, and the release's config, tokenizer and chat template. It declares the EXL3 block
-above and ships without a settings block.
+above and, since 2026-10-18, ships the settings block below (downloads before that date have none).
 
 ```sh
 hf download OpensourceWTF/GLM-5.3-Flash-streaming-repack-exl3-3.05bpw \
@@ -52,9 +52,10 @@ MLX_SERVE_GPU_CEILING_MB=114688 mlx-serve serve --model ~/models/GLM-5.3-Flash-s
   --kv-quant off --wired-margin-gib 2
 ```
 
-The recommended settings block (`expert_streaming.settings` in the pack's `config.json`):
-`{"expert_prefill_rows": 190, "expert_rows": 217, "mtp_lane": true, "draft_depth": 3, "draft_gate": 0.5}`; add
-`"draft_head": "q8"` for the q8 head. The serve recipe and the rows pin by box baseline are in
+The pack's settings block (`expert_streaming.settings` in its `config.json`):
+`{"mtp_lane": true, "draft_depth": 3, "draft_gate": 0.5}`, the exact stack with the rows filled from the bill at load. The
+measured cells pinned the rows as well (`"expert_prefill_rows": 190, "expert_rows": 217`); add `"draft_head": "q8"` for the
+q8 head. The serve recipe and the rows pin by box baseline are in
 [benchmarks/glm53-flash](benchmarks/glm53-flash/README.md#serve-recipe).
 
 ### Settings

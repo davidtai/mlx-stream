@@ -564,7 +564,8 @@ MLX_SERVE_GPU_CEILING_MB=114688 nice -n 19 mlx-serve serve --model <pack> \
 ```
 
 - **Settings block** in the pack's `config.json` (`expert_streaming.settings`), with the request's `"enable_mtp": true`.
-  The published pack ships without a settings block; add this one:
+  The published pack ships `{"mtp_lane": true, "draft_depth": 3, "draft_gate": 0.5}` (since 2026-10-18; a download before that
+  has no block), with the rows filled from the bill at load. The measured cells pinned the rows as well:
 
 ```json
 {"expert_prefill_rows": 190, "expert_rows": 217, "mtp_lane": true, "draft_depth": 3, "draft_gate": 0.5}
