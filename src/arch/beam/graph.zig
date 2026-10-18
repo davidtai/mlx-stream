@@ -1133,14 +1133,14 @@ const testing = std.testing;
 test "beam graph: the kept residents are the trunk's (no routed expert, no quantizer scale)" {
     const c: beam.Config = .{};
     for ([_][]const u8{
-        "lm_head.weight",                                  "model.embed_tokens.weight",                     "model.norm.weight",
-        "model.layers.0.mlp.gate_proj.weight",             "model.layers.3.mlp.gate.weight",                "model.layers.51.mlp.gate.e_score_correction_bias",
-        "model.layers.5.self_attn.gate_bias",              "model.layers.5.post_feedforward_layernorm.weight",
+        "lm_head.weight",                      "model.embed_tokens.weight",                        "model.norm.weight",
+        "model.layers.0.mlp.gate_proj.weight", "model.layers.3.mlp.gate.weight",                   "model.layers.51.mlp.gate.e_score_correction_bias",
+        "model.layers.5.self_attn.gate_bias",  "model.layers.5.post_feedforward_layernorm.weight",
     }) |n| try testing.expect(keptResident(&c, n));
     for ([_][]const u8{
-        "model.layers.3.mlp.experts.0.gate_proj.weight",       "model.layers.3.mlp.experts.0.gate_proj.weight_scale",
-        "model.layers.3.mlp.gate_proj.weight",                 "model.layers.0.mlp.gate.weight",
-        "model.layers.52.input_layernorm.weight",              "model.layers.x.input_layernorm.weight",
+        "model.layers.3.mlp.experts.0.gate_proj.weight",      "model.layers.3.mlp.experts.0.gate_proj.weight_scale",
+        "model.layers.3.mlp.gate_proj.weight",                "model.layers.0.mlp.gate.weight",
+        "model.layers.52.input_layernorm.weight",             "model.layers.x.input_layernorm.weight",
         "model.layers.3.mlp.experts.0.down_proj.input_scale",
     }) |n| try testing.expect(!keptResident(&c, n));
     // 3 + 52 x 12 + 3 x 3 + 49 x 2 tensors.
@@ -1151,11 +1151,11 @@ test "beam graph: the kept residents are the trunk's (no routed expert, no quant
 test "beam graph: the q8 tier keeps each projection's scales and biases, and nothing else's; 270 projections of three tensors" {
     const c: beam.Config = .{ .residents_format = .affine8_g64 };
     for ([_][]const u8{
-        "lm_head.scales",                         "lm_head.biases",                            "model.layers.0.mlp.down_proj.scales",
+        "lm_head.scales",                             "lm_head.biases",                         "model.layers.0.mlp.down_proj.scales",
         "model.layers.51.self_attn.gate_proj.biases", "model.layers.7.self_attn.k_proj.scales", "model.layers.7.self_attn.o_proj.weight",
     }) |n| try testing.expect(keptResident(&c, n));
     for ([_][]const u8{
-        "model.embed_tokens.scales",             "model.layers.3.mlp.gate.scales",     "model.layers.3.mlp.gate_proj.scales",
+        "model.embed_tokens.scales",              "model.layers.3.mlp.gate.scales",          "model.layers.3.mlp.gate_proj.scales",
         "model.layers.5.self_attn.q_norm.scales", "model.layers.52.self_attn.q_proj.biases", "model.layers.3.mlp.experts.0.gate_proj.scales",
     }) |n| try testing.expect(!keptResident(&c, n));
     try testing.expect(!keptResident(&beam.Config{}, "lm_head.scales"));
