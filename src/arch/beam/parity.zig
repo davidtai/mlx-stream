@@ -512,7 +512,7 @@ test "beam parity: the real-weight slice at 64 of 256 rows (BEAM_PARITY_SLICE, B
 /// 16,384 rows (`MimoCombineTokens`), so it cannot serve P5's call.
 pub const long_rows: usize = 16_445;
 pub const old_call_rows: usize = 16_384;
-pub const long_steps: usize = 4;
+pub const long_steps: usize = 16;
 
 const LongRun = struct { logits: []f32, chosen: []u32 };
 
@@ -610,12 +610,15 @@ fn readLongRef(a: std.mem.Allocator, prefix: []const u8, ids: []const u32, route
     return .{ .logits = logits, .own = own, .margins = try a.dupe(f32, v.route_margins) };
 }
 
-/// One path's distance to the long reference: the largest logit difference, the logits past `abs_tol`, the argmax on
-/// each row whose reference top-2 margin is past twice `abs_tol`, and the router's own choices (as sets) against the
-/// reference router's by span (before the old call's end, after it, in decode) and where the reference's margin is at
-/// least `route_tol` (decisive).
+/// One path's distance to the long reference: over every logit of the last prompt row and the decode steps, the RMS and
+/// the mean of |logit - reference| (f64 sums), the largest difference (reported, not ruled: below), the logits past
+/// `abs_tol`; the argmax on each row whose reference top-2 margin is past twice `abs_tol`; and the router's own choices
+/// (as sets) against the reference router's by span (before the old call's end, after it, in decode) and where the
+/// reference's margin is at least `route_tol` (decisive).
 const LongDistance = struct {
     max_diff: f32 = 0,
+    sum_sq: f64 = 0,
+    sum_abs: f64 = 0,
     logits: usize = 0,
     over: usize = 0,
     decisive_rows: usize = 0,
@@ -631,8 +634,11 @@ const LongDistance = struct {
             const x = run.logits[r * vocab ..][0..vocab];
             const y = ref.logits[r * vocab ..][0..vocab];
             for (x, y) |p, q| {
-                d.max_diff = @max(d.max_diff, @abs(p - q));
-                d.over += @intFromBool(@abs(p - q) > abs_tol);
+                const e = @abs(p - q);
+                d.max_diff = @max(d.max_diff, e);
+                d.sum_sq += @as(f64, e) * e;
+                d.sum_abs += e;
+                d.over += @intFromBool(e > abs_tol);
             }
             d.logits += vocab;
             if (margin(y) > 2 * abs_tol) {
@@ -658,24 +664,55 @@ const LongDistance = struct {
         return d;
     }
 
-    /// Whether `d` (P5's one call) is no farther from the reference than `chunked`: its largest difference within the
-    /// chunked path's plus `abs_tol`, and no more decisive argmax or decisive router choices off.
+    fn rms(d: LongDistance) f64 {
+        return @sqrt(d.sum_sq / @as(f64, @floatFromInt(d.logits)));
+    }
+
+    fn mean(d: LongDistance) f64 {
+        return d.sum_abs / @as(f64, @floatFromInt(d.logits));
+    }
+
+    fn overFraction(d: LongDistance) f64 {
+        return @as(f64, @floatFromInt(d.over)) / @as(f64, @floatFromInt(d.logits));
+    }
+
+    fn off(d: LongDistance) usize {
+        return d.choice_differ[0] + d.choice_differ[1] + d.choice_differ[2];
+    }
+
+    fn total(d: LongDistance) usize {
+        return d.choices[0] + d.choices[1] + d.choices[2];
+    }
+
+    /// Whether `d` (P5's one call) is no farther from the reference than `chunked` (`long_rule`).
     fn within(d: LongDistance, chunked: LongDistance) bool {
-        return d.max_diff <= chunked.max_diff + abs_tol and d.argmax_differ <= chunked.argmax_differ and d.decisive_differ <= chunked.decisive_differ;
+        const off_gap = @as(f64, @floatFromInt(@max(d.off(), chunked.off()) - @min(d.off(), chunked.off())));
+        return d.rms() <= long_rule.ratio * chunked.rms() and d.mean() <= long_rule.ratio * chunked.mean() and
+            d.overFraction() <= chunked.overFraction() + long_rule.over_points and d.argmax_differ == 0 and
+            off_gap <= long_rule.route_share * @as(f64, @floatFromInt(d.total()));
     }
 
     fn print(d: LongDistance, label: []const u8) void {
-        std.debug.print("{s}: max_diff {d:.5}, {d} of {d} logits over abs_tol, argmax {d} of {d} decisive rows differ; router choices off the reference's {d} of {d} before row {d}, {d} of {d} after, {d} of {d} in decode, {d} of {d} decisive", .{ label, d.max_diff, d.over, d.logits, d.argmax_differ, d.decisive_rows, d.choice_differ[0], d.choices[0], old_call_rows, d.choice_differ[1], d.choices[1], d.choice_differ[2], d.choices[2], d.decisive_differ, d.decisive_choices });
+        std.debug.print("{s}: RMS {d:.5}, mean |diff| {d:.5}, max_diff {d:.5}, {d} of {d} logits over abs_tol ({d:.2} %), argmax {d} of {d} decisive rows differ; router choices off the reference's {d} of {d} before row {d}, {d} of {d} after, {d} of {d} in decode, {d} of {d} decisive", .{ label, d.rms(), d.mean(), d.max_diff, d.over, d.logits, 100 * d.overFraction(), d.argmax_differ, d.decisive_rows, d.choice_differ[0], d.choices[0], old_call_rows, d.choice_differ[1], d.choices[1], d.choice_differ[2], d.choices[2], d.decisive_differ, d.decisive_choices });
     }
 };
+
+/// The long call's rule against the reference: P5's one call passes if its RMS and its mean |diff| are each at most
+/// `ratio` x the chunked calls', its logits past `abs_tol` at most `over_points` (a share) above theirs, no decisive
+/// argmax differs, and its router choices off the reference differ from theirs by at most `route_share` of every
+/// choice. Not the largest difference: the reference's own f32 sum order moves this slice's logits by up to 0.996 (the
+/// committed 704-row reference rerun with only its attention's sum order changed: median row max 0.304, 28 % of the
+/// logits past 0.05, 4 of 704 argmax flipped), so a max over a few rows is not a statistic. The first run (4 decode
+/// steps) had max_diff 0.696 against 0.590, logits past abs_tol 38.6 % against 37.4 %, router choices off 2,737 against
+/// 2,730 of 49,152 before row 16,384.
+const long_rule = .{ .ratio = 1.05, .over_points = 0.02, .route_share = 0.001 };
 
 /// The long case on one pack: its ids (a fixed sequence over the vocabulary) and its forced routes (row p of routed
 /// layer l takes the k experts from (p x 2,654,435,761 + l x 40,503) mod E on), served in one call and in the old calls;
 /// the logits compared bit for bit, their largest difference, the argmax on every row whose top-2 margin is past twice
 /// `abs_tol`, and the router's own choices (as sets) by position: before the old call's end, after it, in decode. With
 /// `ref` (the f32-accumulated reference of the same rows), each path's distance to it, and the gate: P5's one call is
-/// no farther from the reference than the chunked calls it replaced (its largest difference within theirs plus
-/// `abs_tol`; no more decisive argmax or decisive router choices off). Without `ref`, a report.
+/// no farther from the reference than the chunked calls it replaced (`long_rule`). Without `ref`, a report.
 fn longCase(dir: []const u8, rows: ?u32, ref_prefix: ?[]const u8) !void {
     const a = testing.allocator;
     const io = testing.io;
@@ -747,7 +784,7 @@ fn longCase(dir: []const u8, rows: ?u32, ref_prefix: ?[]const u8) !void {
     std.debug.print("BEAM PARITY {s} long call against the f32-accumulated reference ({s}): ", .{ std.fs.path.basename(dir), std.fs.path.basename(prefix) });
     d1.print("one call (P5)");
     d2.print("; calls of 16384 + 61 (stock)");
-    std.debug.print("; P5 within the chunked distance + abs_tol: {s}\n", .{if (ok) "yes" else "NO"});
+    std.debug.print("; P5 within the long rule (RMS and mean x 1.05, over-abs_tol +2 points, 0 decisive argmax, router choices within 0.1 %): {s}\n", .{if (ok) "yes" else "NO"});
     if (!ok) return error.BeamParityLongCall;
 }
 

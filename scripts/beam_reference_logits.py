@@ -13,7 +13,7 @@ of another reference (`--ids-from`: its prompt and decode rows, so two packs' re
 logits are those of one causal forward over the whole sequence (a decode step's row is the sequence's row at its
 position).
 
-`--long-case` takes parity.zig's long case instead (`longCase`: 16,445 prompt ids and 4 decode ids
+`--long-case` takes parity.zig's long case instead (`longCase`: 16,445 prompt ids and 16 decode ids
 (i x 2,654,435,761 + 12,345) mod vocab, and at routed layer l, row p, the 8 experts from (p x 2,654,435,761 + l x 40,503)
 mod E on, forced), the reference for P5's one long prompt call; its logits only from the last prompt row on
 (`--head-from`). The test checks that the reference's ids and routes are its own.
@@ -80,7 +80,7 @@ E4M3 = e4m3_table()
 # The attention's query block: one head's scores over the keys a block of rows may see, at most 1,024 x rows f32.
 ATTN_ROWS = 1024
 # parity.zig's long case (`longCase`): its rows, and its ids' and forced routes' formulas.
-LONG_PROMPT, LONG_DECODE, LONG_MUL, LONG_ADD, LONG_LAYER = 16_445, 4, 2_654_435_761, 12_345, 40_503
+LONG_PROMPT, LONG_DECODE, LONG_MUL, LONG_ADD, LONG_LAYER = 16_445, 16, 2_654_435_761, 12_345, 40_503
 E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], np.float32)
 
 
@@ -354,7 +354,7 @@ def main() -> None:
                                                      "every routed layer (the weights this pack's router's scores)")
     ap.add_argument("--cache-gb", type=float, default=4.0, help="the dequantized experts' LRU (default 4 GB)")
     ap.add_argument("--long-case", action="store_true",
-                    help="parity.zig's long case: its 16,445 + 4 ids and forced routes (in place of --prompt, --decode, "
+                    help="parity.zig's long case: its 16,445 + 16 ids and forced routes (in place of --prompt, --decode, "
                          "--seed, --ids-from and --routes-from), the logits from the last prompt row on")
     ap.add_argument("--head-from", type=int, default=None, metavar="ROW",
                     help="write the logits of rows ROW on only (the trunk still runs every row)")
