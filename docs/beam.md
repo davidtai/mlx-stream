@@ -265,8 +265,8 @@ context 32,768 and the 255.55 GB target, on the quiet M5 Ultra after the evictio
 
 | Baseline | Value | Rows (prompt / decode) | Process bound |
 |---|---|---|---|
-| Box (MiMo's; Beam before 6fa9759) | 33.03 GB | 175 / 185 | 222.45 GB |
-| Non-file (Beam from 6fa9759) | 22.68 GB | 184 / 194 | 232.22 GB |
+| Box (MiMo's; Beam before 6fa9759) | 33.03 GB | 176 / 185 | 222.42 GB |
+| Non-file (Beam from 6fa9759) | 22.68 GB | 185 / 194 | 232.19 GB |
 
 Each pair of rows bills 1.085 GB. At the non-file fill the target still leaves about 7 GB of RAM free beside 11.5 GB
 of other users' file cache. On the 256 GB M5 Ultra (ceiling 240 GiB, margin 2 GiB, baseline 12.6 GB, context 32,768) the bill test prints
