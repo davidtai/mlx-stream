@@ -124,6 +124,8 @@ pub const Stats = struct {
     /// the abandoned records had read.
     spec_claimed_inflight: u64 = 0,
     spec_abandoned_bytes: u64 = 0,
+    /// Claimed chunks started while another speculative thread read the same record (the co-read's second call).
+    spec_co_reads: u64 = 0,
     direct_ranges: u64 = 0,
     adopt_ranges: u64 = 0,
     adopt_bytes: u64 = 0,
