@@ -356,17 +356,31 @@ pub fn checkRow(g: *G, a: std.mem.Allocator, n: u32) !T {
     return g.hostArray(std.mem.sliceAsBytes(bits), &.{ 1, @intCast(n) }, .bfloat16);
 }
 
-/// `want` and `got` evaluated and equal byte for byte (the same dtype, shape and bytes), else error.BeamGlueCheck, the
-/// first differing element named in `diag` (or printed without one).
+/// `want` and `got` evaluated and equal byte for byte (the same dtype, shape and values in row-major order), else
+/// error.BeamGlueCheck, the first differing element named in `diag` (or printed without one). Either may be a view (the
+/// stock router's ids at M > 1 are a slice of its sort's rows): each is compared through its row-major copy.
 pub fn sameBytes(g: *G, name: []const u8, want: T, got: T, diag: ?*sdk.Diag) !void {
     try g.evalAll(&.{ want, got });
     const n = mlx.mlx_array_size(want);
     if (mlx.mlx_array_dtype(want) != mlx.mlx_array_dtype(got) or n != mlx.mlx_array_size(got) or !std.mem.eql(c_int, mlx.getShape(want), mlx.getShape(got)))
         return mismatch(diag, "{s}: the dtype or the shape differs", .{name});
+    const w = try rowMajor(g, want);
+    const o = try rowMajor(g, got);
+    try g.evalAll(&.{ w, o });
     const size = n * mlx.mlx_array_itemsize(want);
-    const wb = (mlx.mlx_array_data_uint8(want) orelse return error.MlxNoData)[0..size];
-    const ob = (mlx.mlx_array_data_uint8(got) orelse return error.MlxNoData)[0..size];
+    const wb = (mlx.mlx_array_data_uint8(w) orelse return error.MlxNoData)[0..size];
+    const ob = (mlx.mlx_array_data_uint8(o) orelse return error.MlxNoData)[0..size];
     if (std.mem.indexOfDiff(u8, wb, ob)) |i| return mismatch(diag, "{s}: element {d} of {d} differs", .{ name, i / mlx.mlx_array_itemsize(want), n });
+}
+
+/// `x` as a row-major array (MLX's `contiguous`: a copy only when `x` is a view of another layout).
+fn rowMajor(g: *G, x: T) !T {
+    var o = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_contiguous(&o, x, false, g.s)) catch |e| {
+        _ = mlx.mlx_array_free(o);
+        return e;
+    };
+    return g.adopt(o);
 }
 
 fn mismatch(diag: ?*sdk.Diag, comptime fmt: []const u8, args: anytype) error{BeamGlueCheck} {
