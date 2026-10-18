@@ -289,6 +289,8 @@ a draft of 5.9 ms and a verify of 83 to 95 ms. The serial runs of ABBA 2 prefill
 Depth and delta, on the lane over the stack's fold 1 (5df1fc9), the BF16 pack, 168 / 178 rows, seed 1234: `exact`
 depth 3 is the fastest exact depth (18.97 tok/s against 15.58 serial; depths 1 to 8, 11 and 15 measured);
 `typical` 0.2 and 0.6 at depth 3 are the fastest deltas (22.41 and 22.40 tok/s; 0.2 to 0.8 at depths 2 and 3).
+Depth 7 (the drafter card's serving block of 8) gave 18.60 tok/s there, within the noise of depth 3 (one seed; each
+depth's text is different). Depth 7 is not measured on the stack.
 
 The quality of `typical`: on a 1,082-token coding prompt (the same task without its 15K context), greedy, depth 3,
 on that fold-1 bundle and the BF16 pack, each lane's 1,024 tokens forced through the serial control at 24 positions
@@ -318,7 +320,7 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 | `decode_moe` | `hitpass`, `fused`, `stock` | `hitpass` where registered, on a GPU stream |
 | `decode_glue` | `fused`, `ops` | `fused` where the texts register the model's router, on a GPU stream |
 | `mtp_lane` | `true`, `false` | `false` (the serial control) |
-| `draft_depth` | drafts a round, 1 .. 15 (the drafter's block of 16 less one) | 7 (the drafter card's serving block of 8) |
+| `draft_depth` | drafts a round, 1 .. 15 (the drafter's block of 16 less one) | 3 (the measured depth) |
 | `draft_gate` | theta in [0, 1): verify the leading drafts whose cumulative drafter probability stays at theta or more | 0 (off) |
 | `mtp_acceptance` | `exact`, `typical` (lossy) | `exact` |
 | `mtp_typical_delta` | (0, 1], named only with `typical` | 0.5 |
@@ -328,8 +330,8 @@ One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV qua
 refuses the load (`BeamDecodeMoeUnregistered`); named on a CPU stream it refuses at construction
 (`BeamDecodeMoeNeedsGpu`). `decode_glue: fused` named for a model whose router the texts do not register refuses the
 load (`BeamDecodeGlueUnregistered`); named on a CPU stream it refuses at construction (`BeamDecodeGlueNeedsGpu`).
-A draft key without `mtp_lane: true` refuses (`BeamDraftSettingWithoutLane`). The measured setting is
-`{"mtp_lane":true,"draft_depth":3}` ([The draft lane](#the-draft-lane)).
+A draft key without `mtp_lane: true` refuses (`BeamDraftSettingWithoutLane`). The default depth, 3, is the measured
+and kept depth ([The draft lane](#the-draft-lane)).
 
 `expert_rows_by_layer` moves decode rows between the routed layers. The prompt rows and the decode total stay the
 plan's, so the bill does not change. Each offset adds to the plan's decode rows of one routed layer (model layer 3
