@@ -23,6 +23,9 @@ Code: `src/arch/beam/`.
 | `parity.zig` | The parity test against `scripts/beam_reference_logits.py`. |
 | `decode_kernels_parity.zig` | The fused texts against the stock gathers on the slice's records, word for word. |
 | `decode_kernels_bench.zig` | The decode experts' bench: the stock gathers and the fused texts per routed layer. |
+| `drafter.zig` | The DFlash2 drafter: its sidecar, its context rings, the block's forward and the selector. |
+| `lane.zig` | The draft lane: a round's draft, its verify chunks, the commit and the counters. |
+| `lane_test.zig` | The lane's GPU tests on the fixture pack, and the drafter against z-lab's reference. |
 
 ## The model
 
@@ -90,8 +93,9 @@ has no model work. Then MiMo's keep-warm engine (`gpu_keep_warm: waits`) runs fr
 and the hit wave starts beside a running warm chunk, not on an idle GPU. The step commits its logits and does not wait
 for them. The host's read of the drawn token
 is the step's last synchronization, and the sampler runs on the GPU right behind the head. The `beam decode` line
-times each step from its start to the next step's start (the last step to the request's end). There is no draft
-lane: `draft_lane.arm` binds the plugin's sampler and answers `off`.
+times each step from its start to the next step's start (the last step to the request's end). Without `mtp_lane`
+there is no draft lane: `draft_lane.arm` binds the plugin's sampler and answers `off`. With it, a clean request
+decodes in rounds ([The draft lane](#the-draft-lane)).
 
 The module keeps no prefix. A prompt longer than the billed context refuses with `ContextOverBill`.
 
@@ -234,6 +238,68 @@ groups, 12 dispatches each. 10.5 routed layers a step have misses, at 1.04 miss 
 layer's hit wave in 3 dispatches, and the miss parts keep their gathers. Thus a step has about 280 expert dispatches
 instead of about 1,100.
 
+## The draft lane
+
+`mtp_lane: true` installs a draft lane on Reflection's DFlash2 drafter (`reflection/Beam-1.0-501B-A23B-DFlash2` at
+163b276b; the reference is z-lab/dflash `DFlash2DraftModel` at 07ebd93d). The drafter is a sidecar in the pack:
+`drafter.safetensors` (the release's file, byte for byte) and `drafter-manifest.json` (format
+`mlx-stream-dflash2-drafter-v1`, written by the converter's `drafter` step). Construction checks the manifest against
+the trunk, then every tensor's sha256 and the file's, before the bytes become arrays (`sdk_ext/sidecar.zig`). A pack
+without the sidecar refuses `mtp_lane: true` by name.
+
+The drafter has 5 layers and 1.93 B parameters (3.855 GB, BF16). It reads the trunk's residual stream at the end of
+layers 4, 16, 28, 40 and 46. It uses the trunk's embedding and lm_head. Its attention sees the newest 4,095 context
+positions.
+
+A round at trunk length p (t1, the next token, at p):
+
+1. Draft: the block [t1, mask x d] at positions p .. p + d goes through the drafter's layers in one eval. The selector
+   walks the greedy path through the top 16 candidates of each position. d is `draft_depth`.
+2. Verify: [t1, d1 .. dd] goes through the trunk in chunks of at most 4 rows (the decode lane's rows). The chunk that
+   holds the first rejection ends the verify.
+3. Commit: the rejected rows leave the KV lanes. The captures of t1 and the accepted drafts go into the drafter's
+   context. The host gets t1, the accepted drafts and the next token.
+
+The rule (`mtp_acceptance`) is a construction value. `exact` is the default and is lossless: on a greedy request a
+draft is kept when it is its verify row's argmax; on a sampled request each row's token is the target's seeded draw
+at its position, and a draft is kept when it is that draw. `typical` (Medusa's typical acceptance) also keeps a draft
+that the target gives enough probability. It is lossy: an opt-in.
+
+A request's end adds two lines: `[spec-stats] lane=... rounds= drafted= accepted= tokens_per_round= ...
+draft_ms_per_round= verify_ms_per_round= commit_ms_per_round=` and `beam draft lane: lane=... rounds=
+accepted_by_position=` (accepted / verified at each draft position).
+
+Measured on the coding workload (16,445 prompt tokens, 1,024 generated, all in the analysis channel; temperature 0.7,
+top_p 0.99; seeds 1234 and 4321): two ABBAs of the serial arm (`mtp_lane` off) against the lane, on the bundle of
+feat/beam-dflash2 ffe6b29 over the stack's fold 4 (1b95f2b), the q8 pack with the drafter's sidecar, both arms at
+186 / 196 rows. The values are the means of the two seeds; the rates by draft position are over both seeds' rounds.
+
+| ABBA | Arm | Decode | Tokens a round | Accepted at draft 1 / 2 / 3 | ms a round | SSD read a decode token | Prefill | TTFT | Peak footprint |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | serial | 21.84 tok/s | 1 | - | 45.81 | 178 MB | 693.9 tok/s | 24.19 s | 224.9 GB |
+| 1 | `exact`, depth 3 | 26.16 tok/s (+19.8 %) | 2.32, 2.57 | 66.4 / 45.6 / 31.9 % | 93.44 | 204 MB | 690.2 tok/s | 24.32 s | 229.1 GB |
+| 2 | serial | 21.80 tok/s | 1 | - | 45.88 | 178 MB | 720.5 tok/s | 23.31 s | 224.9 GB |
+| 2 | `typical` 0.2, depth 3 (lossy) | 32.73 tok/s (+50.1 %) | 3.20, 3.29 | 88.4 / 74.0 / 62.5 % | 99.25 | 184 MB | 689.6 tok/s | 24.32 s | 229.1 GB |
+
+Both seeds are faster in both ABBAs (`exact`: +17.2 % and +22.5 %; `typical` 0.2: +43.8 % and +56.6 %). The lane's
+texts differ from the serial texts: a verify of 4 rows rounds differently from a serial step at a near tie. A round is
+a draft of 5.9 ms and a verify of 83 to 95 ms. The serial runs of ABBA 2 prefill at 720 tok/s and those of ABBA 1 at
+694 tok/s (the same bundle and settings); the lane's runs prefill at 689 to 691 tok/s in both.
+
+Depth and delta, on the lane over the stack's fold 1 (5df1fc9), the BF16 pack, 168 / 178 rows, seed 1234: `exact`
+depth 3 is the fastest exact depth (18.97 tok/s against 15.58 serial; depths 1 to 8, 11 and 15 measured);
+`typical` 0.2 and 0.6 at depth 3 are the fastest deltas (22.41 and 22.40 tok/s; 0.2 to 0.8 at depths 2 and 3).
+
+The quality of `typical`: on a 1,082-token coding prompt (the same task without its 15K context), greedy, depth 3,
+on that fold-1 bundle and the BF16 pack, each lane's 1,024 tokens forced through the serial control at 24 positions
+(`quality_tf.py`):
+
+| Rule | Top-1 agreement with the control | Mean excess surprisal | p95 excess surprisal |
+|---|---|---|---|
+| `exact` | 100.0 % | 0 nats | 0 nats |
+| `typical` 0.2 | 91.7 % | 0.106 nats | 0.418 nats |
+| `typical` 0.8 | 95.8 % | 0.0099 nats | 0 nats |
+
 ## Settings
 
 The settings are in the `settings` object of `expert_streaming`. The module reads them one time, at construction. A
@@ -251,12 +317,19 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 | `gpu_keep_warm` | `waits`, `off` | `waits` on a GPU stream |
 | `decode_moe` | `hitpass`, `fused`, `stock` | `hitpass` where registered, on a GPU stream |
 | `decode_glue` | `fused`, `ops` | `fused` where the texts register the model's router, on a GPU stream |
+| `mtp_lane` | `true`, `false` | `false` (the serial control) |
+| `draft_depth` | drafts a round, 1 .. 15 (the drafter's block of 16 less one) | 7 (the drafter card's serving block of 8) |
+| `draft_gate` | theta in [0, 1): verify the leading drafts whose cumulative drafter probability stays at theta or more | 0 (off) |
+| `mtp_acceptance` | `exact`, `typical` (lossy) | `exact` |
+| `mtp_typical_delta` | (0, 1], named only with `typical` | 0.5 |
 
 One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV quantization must be off
 (`BeamKvQuantUnsupported`). `decode_moe: hitpass` or `fused` named for a model where the texts are not registered
 refuses the load (`BeamDecodeMoeUnregistered`); named on a CPU stream it refuses at construction
 (`BeamDecodeMoeNeedsGpu`). `decode_glue: fused` named for a model whose router the texts do not register refuses the
 load (`BeamDecodeGlueUnregistered`); named on a CPU stream it refuses at construction (`BeamDecodeGlueNeedsGpu`).
+A draft key without `mtp_lane: true` refuses (`BeamDraftSettingWithoutLane`). The measured setting is
+`{"mtp_lane":true,"draft_depth":3}` ([The draft lane](#the-draft-lane)).
 
 `expert_rows_by_layer` moves decode rows between the routed layers. The prompt rows and the decode total stay the
 plan's, so the bill does not change. Each offset adds to the plan's decode rows of one routed layer (model layer 3
@@ -297,6 +370,8 @@ at 173 / 183 rows, temperature 0.7, top_p 0.99, seeds 1234 and 4321. Each seed g
 | `decode_kernels` | The fused texts' set, its pipelines and prepared launches under `decode_moe: hitpass` and `fused`: 20 MiB declared. At the pack's load the fused route's construction footprint is 18.6 MB more than the stock route's (host side 416.1 MB against 397.5 MB; MLX active the same). |
 | `hitpass_luts` | Under `decode_moe: hitpass`: a LUT pair for each model layer, each LUT a page (52 x 2 x 16 KiB). |
 | `glue_kernels` | Under `decode_glue: fused`: the glue's texts, their pipelines and launch configurations (`glue.zig`): 8 MiB declared, from construction. |
+| `drafter_residents`, `drafter_context` | With `mtp_lane`: the drafter's 81 tensors and its split base kernels (121 arrays, 3,855,460,864 B, page-rounded), and its context rings (5 layers x K and V x 2 slots x 4,624 rows x 8 heads x 128 x 2 B = 189,399,040 B), from construction. |
+| `draft_round` | With `mtp_lane`: the prompt's captures (5 target layers x the call's last 4,095 rows, and a 512-row context tile) and, in decode, a round's draft and verify arrays at the block. The decode wave is billed at the verify chunk's 4 rows. At depth 7 the lane bills 4.14 GB more in decode and 4.34 GB more in the prompt phase: the fixture's fill goes from 194 / 204 to 190 / 200 rows. |
 
 The fill gives the most decode rows and prompt rows that fit the host's ceiling less its wired margin. The floor is 8
 rows. The fill bills the rows beside the host's non-file baseline (wired + anonymous - purgeable + compressor, the
@@ -512,3 +587,7 @@ token change from run to run. At seed 4321 the two fills read about the same byt
 - The fused texts run each routed layer's hit wave. A miss part (the gated route: its gathers wait on its read's
   event) still runs MLX's gathers per bank.
 - The combine is a step of its own after the down text. glm5_next's down text does not fold it either.
+- The draft lane on a sampled request drafts its greedy path. SGLang and TokenSpeed draw the selector's path at the
+  request's temperature and keep a draft with min(1, p / q) (rejection sampling).
+- The drafter drafts d + 1 rows a round. It is trained at 16 rows; its card serves 8.
+- The prompt pass evaluates each capture's copy at its target layer: 5 waits a prompt call.
