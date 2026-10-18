@@ -262,6 +262,13 @@ draft is kept when it is its verify row's argmax; on a sampled request each row'
 at its position, and a draft is kept when it is that draw. `typical` (Medusa's typical acceptance) also keeps a draft
 that the target gives enough probability. It is lossy: an opt-in.
 
+`draft_path` sets the drafter's path on a sampled request. `greedy` (the default) is the selector's greedy walk. With
+`sampled` the lane draws each draft from the selector's distribution over its 16 candidates (the softmax of their scores
+at the request's temperature). The draw uses the target's own uniform for that token (`acceptance.drawV` at its
+position) and the inverse CDF in token-id order: glm5_next's `boundedDraw` pattern (drafter.zig `sampledPathOf`). The
+verify does not change, so each emitted token is the target's draw at its position under both paths: a draft is
+accepted where the drafter's CDF and the target's agree at that uniform. A greedy request takes the greedy walk.
+
 A request's end adds two lines: `[spec-stats] lane=... rounds= drafted= accepted= tokens_per_round= ...
 draft_ms_per_round= verify_ms_per_round= commit_ms_per_round=` and `beam draft lane: lane=... rounds=
 accepted_by_position=` (accepted / verified at each draft position).
@@ -320,6 +327,7 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 | `draft_gate` | theta in [0, 1): verify the leading drafts whose cumulative drafter probability stays at theta or more | 0 (off) |
 | `mtp_acceptance` | `exact`, `typical` (lossy) | `exact` |
 | `mtp_typical_delta` | (0, 1], named only with `typical` | 0.5 |
+| `draft_path` | `greedy`, `sampled`: the drafter's path on a sampled request | `greedy` |
 
 One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV quantization must be off
 (`BeamKvQuantUnsupported`). `decode_moe: hitpass` or `fused` named for a model where the texts are not registered

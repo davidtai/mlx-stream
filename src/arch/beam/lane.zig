@@ -18,7 +18,9 @@
 //! The rule is a construction value (`settings.mtp_acceptance`, `mtp_typical_delta`; `acceptGeneral`'s): `exact`, the
 //! default (a greedy request's tokens are each verify row's argmax; a sampled one's are the target's position-keyed
 //! draws, a draft kept when it is the draw: distributed as the target), or `typical` (Medusa's typical acceptance on every
-//! request: lossy, an opt-in). The drafter always proposes its greedy path (a point-mass drafter: `acceptance` needs no q).
+//! request: lossy, an opt-in). The drafter proposes its greedy path (a point mass), or on a sampled request with
+//! `draft_path: sampled` a path drawn at the target's own uniforms (drafter.zig `sampledPathOf`); `acceptance` needs no
+//! q under either: each emitted token is the target's draw.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -132,6 +134,8 @@ pub const Lane = struct {
     /// Drafts a round at most (`settings.draft_depth`); the block is depth + 1 rows.
     depth: u32,
     gate: f32,
+    /// The drafter's path on a sampled request (`settings.draft_path`).
+    path: settings.DraftPath = .greedy,
     /// The decision graphs' and the draft's backend (its own scope, reset every round).
     g: G,
     stats: Stats = .{},
@@ -153,8 +157,8 @@ pub const Lane = struct {
         var g = try G.init(a, s);
         errdefer g.deinit();
         const self = try a.create(Lane);
-        self.* = .{ .a = a, .dr = dr, .rule = cfg.draftRule(), .depth = cfg.draft_depth, .gate = cfg.draft_gate, .g = g };
-        self.name_len = (nameOf(&self.name_buf, self.rule, self.depth, self.gate) catch unreachable).len;
+        self.* = .{ .a = a, .dr = dr, .rule = cfg.draftRule(), .depth = cfg.draft_depth, .gate = cfg.draft_gate, .path = cfg.draft_path, .g = g };
+        self.name_len = (nameOf(&self.name_buf, self.rule, self.depth, self.gate, self.path) catch unreachable).len;
         return self;
     }
 
@@ -164,15 +168,16 @@ pub const Lane = struct {
         self.a.destroy(self);
     }
 
-    /// The lane's label: `dflash2 exact depth 7`, `dflash2 typical 0.4 depth 3`, a gate named (`gate 0.5`).
-    pub fn nameOf(buf: []u8, rule: acc.Rule, depth: u32, gate: f32) ![]const u8 {
-        const tier = switch (rule) {
+    /// The lane's label: `dflash2 exact depth 7`, `dflash2 typical 0.4 depth 3`, a gate named (`gate 0.5`), the sampled
+    /// path named (`path sampled`).
+    pub fn nameOf(buf: []u8, rule: acc.Rule, depth: u32, gate: f32, path: settings.DraftPath) ![]const u8 {
+        var n = (switch (rule) {
             .exact => try std.fmt.bufPrint(buf, "dflash2 exact depth {d}", .{depth}),
             .typical => |t| try std.fmt.bufPrint(buf, "dflash2 typical {d} depth {d}", .{ t.delta, depth }),
-        };
-        if (gate == 0) return tier;
-        const tail = try std.fmt.bufPrint(buf[tier.len..], " gate {d}", .{gate});
-        return buf[0 .. tier.len + tail.len];
+        }).len;
+        if (gate != 0) n += (try std.fmt.bufPrint(buf[n..], " gate {d}", .{gate})).len;
+        if (path == .sampled) n += (try std.fmt.bufPrint(buf[n..], " path sampled", .{})).len;
+        return buf[0..n];
     }
 
     pub fn name(self: *const Lane) []const u8 {
@@ -226,6 +231,7 @@ pub fn roundWith(m: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, s
     const t0 = m.nowNs();
     m.openRound(t0);
     var k = mimo_draft.draftCount(dr.ready(p), self.depth, accepted_cap, m.reserve, p);
+    const params = acc.Params.of(sampling);
     var ids: [drafter.max_block]u32 = undefined;
     ids[0] = t1;
     if (k > 0) {
@@ -244,7 +250,12 @@ pub fn roundWith(m: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, s
             const cand = try g.hostU32(d.cand, cb[0 .. @as(usize, self.depth) * c.top_k]);
             var path: [drafter.max_block]u32 = undefined;
             var pick: [drafter.max_block]u32 = undefined;
-            drafter.pathOf(scores, cand, self.depth, c.top_k, path[0..self.depth], pick[0..self.depth]);
+            // A sampled request under `draft_path: sampled` draws the path at the target's uniforms; else the greedy walk.
+            const drawn: ?acc.Params = if (self.path == .sampled) acc.Params.active(params) else null;
+            if (drawn) |sm|
+                drafter.sampledPathOf(scores, cand, self.depth, c.top_k, sm.temperature, sm.seed, p, path[0..self.depth], pick[0..self.depth])
+            else
+                drafter.pathOf(scores, cand, self.depth, c.top_k, path[0..self.depth], pick[0..self.depth]);
             @memcpy(ids[1 .. k + 1], path[0..k]);
             if (d.probs) |pr| {
                 var pb: [(drafter.max_block - 1) * drafter.max_top_k]f32 = undefined;
@@ -268,7 +279,6 @@ pub fn roundWith(m: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, s
     var caps: [max_chunks]drafter.Captures = undefined;
     var n_chunks: u32 = 0;
     defer for (caps[0..n_chunks]) |*cp| cp.release();
-    const params = acc.Params.of(sampling);
     var walk: Walk = .{};
     var deviated: u32 = 0;
     var start: u32 = 0;
@@ -369,11 +379,13 @@ test "beam lane: the acceptance by draft position counts each round's verified a
     try testing.expectEqualStrings("", none.positions(&buf));
 }
 
-test "beam lane: the label names the rule, the delta, the depth and a gate" {
+test "beam lane: the label names the rule, the delta, the depth, a gate and the sampled path" {
     var buf: [64]u8 = undefined;
-    try testing.expectEqualStrings("dflash2 exact depth 7", try Lane.nameOf(&buf, .exact, 7, 0));
-    try testing.expectEqualStrings("dflash2 typical 0.4 depth 3", try Lane.nameOf(&buf, .{ .typical = .{ .delta = 0.4 } }, 3, 0));
-    try testing.expectEqualStrings("dflash2 exact depth 15 gate 0.5", try Lane.nameOf(&buf, .exact, 15, 0.5));
+    try testing.expectEqualStrings("dflash2 exact depth 7", try Lane.nameOf(&buf, .exact, 7, 0, .greedy));
+    try testing.expectEqualStrings("dflash2 typical 0.4 depth 3", try Lane.nameOf(&buf, .{ .typical = .{ .delta = 0.4 } }, 3, 0, .greedy));
+    try testing.expectEqualStrings("dflash2 exact depth 15 gate 0.5", try Lane.nameOf(&buf, .exact, 15, 0.5, .greedy));
+    try testing.expectEqualStrings("dflash2 exact depth 3 path sampled", try Lane.nameOf(&buf, .exact, 3, 0, .sampled));
+    try testing.expectEqualStrings("dflash2 exact depth 3 gate 0.5 path sampled", try Lane.nameOf(&buf, .exact, 3, 0.5, .sampled));
 }
 
 test "beam lane: the receipt adds the chunks, the gate, the deviations and the phases' time to MiMo's line" {

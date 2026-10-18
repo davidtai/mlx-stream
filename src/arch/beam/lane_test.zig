@@ -223,30 +223,35 @@ test "beam lane: a seeded sampled request draws the same ids through the lane as
         if (i + 1 < n) x = try root.step(m, &.{ser[i]});
     }
     m.requestEnd();
-    // The lane: the same seed, sample-then-verify (exact).
-    try testing.expectEqual(sdk.DraftArm.stochastic, root.draft_lane.arm(m, .{ .greedy = false, .clean = true, .sampling = sp }));
-    x = try root.prefill(m, &prompt, shapeOf(&prompt, n));
-    var t1 = argmaxMargin(try rowsOf(m, x, row)).id;
-    m.g.release(x);
-    var got: [n]u32 = undefined;
-    var emitted: usize = 0;
-    while (emitted < n) {
-        var r = try root.draft_lane.round(m, a, t1, @intCast(n - emitted - 1), sp);
-        defer r.deinit(a);
-        for (r.tokens) |tok| {
-            if (emitted == n) break;
-            got[emitted] = tok;
-            emitted += 1;
+    // The lane: the same seed, sample-then-verify (exact), with the greedy path and with the sampled path
+    // (`draft_path: sampled`: the drafts drawn at the target's uniforms; the verify unchanged).
+    for ([_]settings.DraftPath{ .greedy, .sampled }) |dp| {
+        m.lane.?.path = dp;
+        try testing.expectEqual(sdk.DraftArm.stochastic, root.draft_lane.arm(m, .{ .greedy = false, .clean = true, .sampling = sp }));
+        x = try root.prefill(m, &prompt, shapeOf(&prompt, n));
+        var t1 = argmaxMargin(try rowsOf(m, x, row)).id;
+        m.g.release(x);
+        var got: [n]u32 = undefined;
+        var emitted: usize = 0;
+        while (emitted < n) {
+            var r = try root.draft_lane.round(m, a, t1, @intCast(n - emitted - 1), sp);
+            defer r.deinit(a);
+            for (r.tokens) |tok| {
+                if (emitted == n) break;
+                got[emitted] = tok;
+                emitted += 1;
+            }
+            t1 = r.next_token;
         }
-        t1 = r.next_token;
+        const st = m.lane.?.stats.base;
+        m.requestEnd();
+        var same: usize = 0;
+        while (same < n and got[same] == ser[same]) same += 1;
+        std.debug.print("\nBEAM LANE sampled (T 0.7, top_p 0.99, seed 1234, path {s}): the lane's ids equal the serial ids for {d} of {d} positions; rounds {d} drafted {d} accepted {d}\n", .{ @tagName(dp), same, n, st.rounds, st.drafted, st.accepted });
+        // The first token is the prompt pass's draw on every path.
+        try testing.expectEqual(ser[0], got[0]);
     }
-    const st = m.lane.?.stats.base;
-    m.requestEnd();
-    var same: usize = 0;
-    while (same < n and got[same] == ser[same]) same += 1;
-    std.debug.print("\nBEAM LANE sampled (T 0.7, top_p 0.99, seed 1234): the lane's ids equal the serial ids for {d} of {d} positions; rounds {d} drafted {d} accepted {d}\n", .{ same, n, st.rounds, st.drafted, st.accepted });
-    // The first token is the prompt pass's draw on both paths.
-    try testing.expectEqual(ser[0], got[0]);
+    m.lane.?.path = .greedy;
 }
 
 test "beam drafter: the block's hidden rows against z-lab's reference by cosine and rms ratio, the greedy path's ids exactly (BEAM_DRAFTER_PARITY)" {
