@@ -963,6 +963,36 @@ fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, s
 /// The head's rows: the last row's logits (served), or every row's (the parity test's).
 pub const Head = enum { last, all };
 
+/// diag/beam-p5-layers (not for serving): a test's probe of each prompt call's per-layer arrays at chosen positions
+/// (absolute rows): the residual after the attention (`x1`), the MLP's or the MoE's output (`f`) and the layer's output
+/// (`x2`), f32 [layer][position][hidden]. Set by parity.zig's per-layer diag around a long run; null otherwise.
+pub const Probe = struct {
+    positions: []const u32,
+    hidden: usize,
+    x1: []f32,
+    f: []f32,
+    x2: []f32,
+
+    /// The positions of a call over [start, start + rows) copied from `t` ([rows, hidden]) into `which` at `layer`.
+    fn put(p: *Probe, g: *G, which: []f32, layer: usize, t: T, start: u32, rows: u32) !void {
+        var local: [256]u32 = undefined;
+        var at: [256]usize = undefined;
+        var n: usize = 0;
+        for (p.positions, 0..) |pos, i| if (pos >= start and pos < start + rows) {
+            local[n] = pos - start;
+            at[n] = i;
+            n += 1;
+        };
+        if (n == 0) return;
+        const idx = try g.hostArray(std.mem.sliceAsBytes(local[0..n]), &.{@intCast(n)}, .uint32);
+        const got = try g.astype(try g.take(t, idx, 0), .float32);
+        try g.evalAll(&.{got});
+        const data = mlx.mlx_array_data_float32(got) orelse return error.MlxNoData;
+        for (0..n) |j| @memcpy(which[(layer * p.positions.len + at[j]) * p.hidden ..][0..p.hidden], data[j * p.hidden ..][0..p.hidden]);
+    }
+};
+pub var probe: ?*Probe = null;
+
 /// One forward of `ids` at positions [start, start + ids.len) through every layer (each layer's state advanced in
 /// `cache`), the routed experts through `src`, the construction's `routes`: the last row's logits f32 [1, vocab]
 /// (soft-capped), a kept handle the caller frees; under `head == .all` every row's, f32 [rows, vocab]. `force` is `{}`
@@ -1041,6 +1071,11 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             break :blk b2.res;
         } else try depthAdd(g, c, try rmsNorm(g, f, lw.post_ff_norm, c.rms_norm_eps), x1, beam.Config.residualIndex(l, true));
         const next = g.keep(x2);
+        if (prompt) if (probe) |p| {
+            try p.put(g, p.x1, li, x1, start, rows);
+            try p.put(g, p.f, li, f, start, rows);
+            try p.put(g, p.x2, li, next, start, rows);
+        };
         g.release(x);
         x = next;
         // MiMo's tail: a prompt layer's output evaluated before the next layer starts (bounding its graph), then the

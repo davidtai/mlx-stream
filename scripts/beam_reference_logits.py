@@ -223,6 +223,10 @@ class Beam:
         self.own: dict = {}
         # The twin's routes (`--twin`): every routed layer's ids by row, taken in place of the choice.
         self.forced: dict | None = None
+        # diag/beam-p5-layers: rows whose per-layer arrays are kept (the residual after the attention, the MLP's or the
+        # MoE's output, the layer's output), [layer] -> (x1, f, x2) f32 [rows, hidden].
+        self.dump_rows: list | None = None
+        self.dumps: list = []
 
     def w(self, name):
         return self.st.get(name)
@@ -331,9 +335,13 @@ class Beam:
             p = f"model.layers.{l}."
             a = self.attention(l, rms_norm(x, self.w(p + "input_layernorm.weight"), self.eps), pos)
             x = self.depth_add(rms_norm(a, self.w(p + "post_attention_layernorm.weight"), self.eps), x, 2 * (l + 1))
+            x1 = x
             h = rms_norm(x, self.w(p + "pre_feedforward_layernorm.weight"), self.eps)
             f = self.dense(l, h) if self.mlp_types[l] == "dense" else self.moe(l, h)
             x = self.depth_add(rms_norm(f, self.w(p + "post_feedforward_layernorm.weight"), self.eps), x, 2 * (l + 1) + 1)
+            if self.dump_rows is not None:
+                r = np.asarray(self.dump_rows)
+                self.dumps.append((x1[r].copy(), f[r].copy(), x[r].copy()))
         logits = linear(rms_norm(x[head_from:], self.w("model.norm.weight"), self.eps), self.w("lm_head.weight"))
         return (np.tanh(logits / np.float32(self.cap)) * np.float32(self.cap)).astype(np.float32)
 
@@ -358,6 +366,10 @@ def main() -> None:
                          "--seed, --ids-from and --routes-from), the logits from the last prompt row on")
     ap.add_argument("--head-from", type=int, default=None, metavar="ROW",
                     help="write the logits of rows ROW on only (the trunk still runs every row)")
+    ap.add_argument("--dump-rows", metavar="ROWS",
+                    help="diag/beam-p5-layers: 'boundary' (the last row of each 512-row tile below the old 16,384-row "
+                         "call, then the 61 rows past it) or a comma list: PREFIX.layers.f32 holds each layer's residual "
+                         "after the attention, MLP or MoE output and layer output at those rows, f32 [3][layers][rows][hidden]")
     ap.add_argument("--twin", action="store_true",
                     help="also write PREFIX.twin.f32: the same forward on the same routes with no BF16 rounding (every "
                          "tensor f32), the model's own rounding sensitivity, which the parity test's bound reads")
@@ -402,7 +414,14 @@ def main() -> None:
     if not 0 <= head_from < len(ids):
         raise SystemExit(f"--head-from {head_from}: the rows are 0-{len(ids) - 1}")
     forced = m.forced is not None
+    if args.dump_rows is not None:
+        m.dumps = []
+        m.dump_rows = (list(range(511, 16_384, 512)) + list(range(16_384, LONG_PROMPT)) if args.dump_rows == "boundary"
+                       else [int(t) for t in args.dump_rows.split(",")])
     logits = m.forward(ids, head_from)
+    if m.dump_rows is not None:
+        stack = np.stack([np.stack([d[t] for d in m.dumps]) for t in range(3)]).astype("<f4")
+        args.out.with_suffix(".layers.f32").write_bytes(stack.tobytes())
     srt = np.sort(logits, axis=-1)
     margins = np.stack([m.margins[l] for l in routed]) if routed else np.full((1, len(ids)), np.inf)
     meta = {
@@ -410,6 +429,7 @@ def main() -> None:
         "routes_from": str(args.routes_from) if args.routes_from is not None else None,
         "prompt_tokens": args.prompt, "decode_tokens": args.decode, "seed": args.seed, "decode_ids": args.decode_ids,
         "ids": ids, "rows": len(ids), "vocab": vocab, "head_from": head_from,
+        "dump_rows": m.dump_rows,
         "argmax": np.argmax(logits, axis=-1).tolist(), "margin": (srt[:, -1] - srt[:, -2]).astype(float).tolist(),
         # Each row's routing margin: the least, over the routed layers, of its group and expert choice margins; and the
         # first routed layer (absolute index) where it is under 0.02, else -1.

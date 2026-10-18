@@ -567,6 +567,34 @@ fn longRun(a: std.mem.Allocator, dir: []const u8, rows: ?u32, ids: []const u32, 
     return .{ .logits = out, .chosen = chosen };
 }
 
+/// The long case's ids (a fixed sequence over the vocabulary) and forced routes (row p of routed layer l takes the k
+/// experts from (p x 2,654,435,761 + l x 40,503) mod E on). Caller frees both (`deinit`).
+const LongInputs = struct {
+    ids: []u32,
+    routes: []u32,
+
+    fn deinit(in: LongInputs, a: std.mem.Allocator) void {
+        a.free(in.ids);
+        a.free(in.routes);
+    }
+};
+
+fn longInputs(a: std.mem.Allocator, model: *const beam.Config) !LongInputs {
+    const positions = long_rows + long_steps;
+    const n_moe: usize = model.moeLayers();
+    const e: u64 = model.n_routed_experts;
+    const k: usize = model.n_experts_per_tok;
+    const ids = try a.alloc(u32, positions);
+    errdefer a.free(ids);
+    for (ids, 0..) |*id, i| id.* = @intCast((@as(u64, i) * 2_654_435_761 + 12_345) % @as(u64, model.vocab_size));
+    const routes = try a.alloc(u32, n_moe * positions * k);
+    for (0..n_moe) |l| for (0..positions) |p| {
+        const base = (@as(u64, p) * 2_654_435_761 + @as(u64, l) * 40_503) % e;
+        for (0..k) |j| routes[(l * positions + p) * k + j] = @intCast((base + @as(u64, j)) % e);
+    };
+    return .{ .ids = ids, .routes = routes };
+}
+
 /// The long case's reference (`ref`, PREFIX of scripts/beam_reference_logits.py --long-case): the f32-accumulated
 /// forward of the same ids on the same forced routes, its logits from the last prompt row on, and its router's own
 /// choices and margins at every position. Refused (`BeamParityRef`) unless its ids and routes are the case's.
@@ -725,18 +753,12 @@ fn longCase(dir: []const u8, rows: ?u32, ref_prefix: ?[]const u8) !void {
     try testing.expect(@import("experts.zig").call_rows >= long_rows);
     const positions = long_rows + long_steps;
     const n_moe: usize = model.moeLayers();
-    const e: u64 = model.n_routed_experts;
     const k: usize = model.n_experts_per_tok;
     const vocab: usize = model.vocab_size;
-    const ids = try a.alloc(u32, positions);
-    defer a.free(ids);
-    for (ids, 0..) |*id, i| id.* = @intCast((@as(u64, i) * 2_654_435_761 + 12_345) % @as(u64, vocab));
-    const routes = try a.alloc(u32, n_moe * positions * k);
-    defer a.free(routes);
-    for (0..n_moe) |l| for (0..positions) |p| {
-        const base = (@as(u64, p) * 2_654_435_761 + @as(u64, l) * 40_503) % e;
-        for (0..k) |j| routes[(l * positions + p) * k + j] = @intCast((base + @as(u64, j)) % e);
-    };
+    const in = try longInputs(a, &model);
+    defer in.deinit(a);
+    const ids = in.ids;
+    const routes = in.routes;
     const one = try longRun(a, dir, rows, ids, routes, long_rows);
     defer {
         a.free(one.logits);
@@ -792,4 +814,80 @@ test "beam parity: on the real-weight slice a prompt past the old 16,384-row cal
     const dir = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE") orelse return error.SkipZigTest);
     const ref: ?[]const u8 = if (std.c.getenv("BEAM_PARITY_SLICE_LONG_REF")) |p| std.mem.span(p) else null;
     try longCase(dir, slice_rows, ref);
+}
+
+// diag/beam-p5-layers (not for serving): the long call's per-layer distance to the reference. Both paths (one call;
+// 16,384 + 61) run with graph.zig's `Probe` at the reference's dump rows (`--long-case --dump-rows boundary`: the last
+// row of each 512-row tile below 16,384, then the 61 rows past it); each layer's residual after the attention (x1), MLP
+// or MoE output (f) and layer output (x2) against the reference's: RMS over the rows below the old call's end and over
+// the rows past it, per path.
+test "beam diag p5 layers: the long call's per-layer distance to the reference (BEAM_PARITY_SLICE, BEAM_PARITY_SLICE_LONG_LAYERS or long-layers beside BEAM_PARITY_SLICE_LONG_REF)" {
+    const dir = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    // The dump's prefix: BEAM_PARITY_SLICE_LONG_LAYERS, else `long-layers` beside the long-call reference.
+    const prefix: []const u8 = if (std.c.getenv("BEAM_PARITY_SLICE_LONG_LAYERS")) |p| try a.dupe(u8, std.mem.span(p)) else blk: {
+        const long_ref = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE_LONG_REF") orelse return error.SkipZigTest);
+        break :blk try std.fs.path.join(a, &.{ std.fs.path.dirname(long_ref) orelse return error.SkipZigTest, "long-layers" });
+    };
+    defer a.free(prefix);
+    var pack_dir = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+    const text = try pack_dir.readFileAlloc(io, "config.json", a, .limited(1 << 20));
+    pack_dir.close(io);
+    defer a.free(text);
+    var diag: beam.Diag = .{};
+    const model = try beam.Config.parse(a, text, &diag);
+    const hidden: usize = model.hidden_size;
+    const n_layers: usize = model.n_layers;
+    const in = try longInputs(a, &model);
+    defer in.deinit(a);
+    const json_path = try std.fmt.allocPrint(a, "{s}.json", .{prefix});
+    defer a.free(json_path);
+    const layers_path = try std.fmt.allocPrint(a, "{s}.layers.f32", .{prefix});
+    defer a.free(layers_path);
+    const meta_text = try std.Io.Dir.cwd().readFileAlloc(io, json_path, a, .limited(256 << 20));
+    defer a.free(meta_text);
+    const Meta = struct { ids: []const u32, routes: []const u32, dump_rows: []const u32 };
+    const meta = try std.json.parseFromSlice(Meta, a, meta_text, .{ .ignore_unknown_fields = true });
+    defer meta.deinit();
+    if (!std.mem.eql(u32, meta.value.ids, in.ids) or !std.mem.eql(u32, meta.value.routes, in.routes)) return error.BeamParityRef;
+    const rows = meta.value.dump_rows;
+    const n = rows.len;
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, layers_path, a, .limited(1 << 30));
+    defer a.free(raw);
+    const per_tap = n_layers * n * hidden;
+    if (raw.len != 3 * per_tap * 4) return error.BeamParityRef;
+    const ref = try a.alloc(f32, 3 * per_tap);
+    defer a.free(ref);
+    @memcpy(std.mem.sliceAsBytes(ref), raw);
+    var bufs: [2][3][]f32 = undefined;
+    for (&bufs) |*b| for (b) |*t| {
+        t.* = try a.alloc(f32, per_tap);
+        @memset(t.*, std.math.nan(f32));
+    };
+    defer for (bufs) |b| for (b) |t| a.free(t);
+    var probes: [2]graph.Probe = undefined;
+    for (&probes, bufs) |*p, b| p.* = .{ .positions = rows, .hidden = hidden, .x1 = b[0], .f = b[1], .x2 = b[2] };
+    for ([_]usize{ long_rows, old_call_rows }, 0..) |chunk, i| {
+        graph.probe = &probes[i];
+        defer graph.probe = null;
+        const run = try longRun(a, dir, slice_rows, in.ids, in.routes, chunk);
+        a.free(run.logits);
+        a.free(run.chosen);
+    }
+    const taps = [_][]const u8{ "x1 (after attention)", "f (MLP / MoE out)", "x2 (layer out)" };
+    for (0..n_layers) |l| for (0..3) |t| {
+        var sums: [2][2]f64 = .{ .{ 0, 0 }, .{ 0, 0 } };
+        var counts: [2]usize = .{ 0, 0 };
+        for (rows, 0..) |pos, r| {
+            const span: usize = @intFromBool(pos >= old_call_rows);
+            counts[span] += hidden;
+            const want = ref[t * per_tap + (l * n + r) * hidden ..][0..hidden];
+            for (0..2) |path| {
+                const got = bufs[path][t][(l * n + r) * hidden ..][0..hidden];
+                for (got, want) |x, y| sums[path][span] += @as(f64, x - y) * (x - y);
+            }
+        }
+        std.debug.print("BEAM DIAG P5 layer {d} {s}: RMS vs the reference, below row {d} / past it: one call {d:.6} / {d:.6}, 16,384 + 61 {d:.6} / {d:.6}\n", .{ l, taps[t], old_call_rows, @sqrt(sums[0][0] / @as(f64, @floatFromInt(counts[0]))), @sqrt(sums[0][1] / @as(f64, @floatFromInt(counts[1]))), @sqrt(sums[1][0] / @as(f64, @floatFromInt(counts[0]))), @sqrt(sums[1][1] / @as(f64, @floatFromInt(counts[1]))) });
+    };
 }
