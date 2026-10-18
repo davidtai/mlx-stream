@@ -262,6 +262,16 @@ draft is kept when it is its verify row's argmax; on a sampled request each row'
 at its position, and a draft is kept when it is that draw. `typical` (Medusa's typical acceptance) also keeps a draft
 that the target gives enough probability. It is lossy: an opt-in.
 
+`draft_path` sets the drafter's path on a sampled request. `greedy` (the default) is the selector's greedy walk, and
+the verify is sample-then-verify: each emitted token is the target's draw at its position. With `sampled` the lane draws
+each draft from the selector's distribution q over its 16 candidates (the softmax of their scores at the request's
+temperature, at the drafter's own uniform `acceptance.drawQ`: drafter.zig `sampledPathOf`). The verify is then
+speculative sampling (`acceptance.speculativeRows`): a draft x is kept when u x q(x) < p(x) (u = `acceptance.drawU`
+at its position), and a rejected row emits a draw from the residual (p - q)+. Each emitted token is distributed as the
+target, and a draft is kept with probability sum min(p, q). A seeded request is reproducible, but its tokens are not the
+serial path's draws. `sampled` takes the `exact` rule only (`BeamDraftPathTypical`). A greedy request takes the greedy
+walk.
+
 A request's end adds two lines: `[spec-stats] lane=... rounds= drafted= accepted= tokens_per_round= ...
 draft_ms_per_round= verify_ms_per_round= commit_ms_per_round=` and `beam draft lane: lane=... rounds=
 accepted_by_position=` (accepted / verified at each draft position).
@@ -320,6 +330,7 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 | `draft_gate` | theta in [0, 1): verify the leading drafts whose cumulative drafter probability stays at theta or more | 0 (off) |
 | `mtp_acceptance` | `exact`, `typical` (lossy) | `exact` |
 | `mtp_typical_delta` | (0, 1], named only with `typical` | 0.5 |
+| `draft_path` | `greedy`, `sampled` (drafts drawn from q, speculative sampling): the drafter's path on a sampled request | `greedy` |
 
 One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV quantization must be off
 (`BeamKvQuantUnsupported`). `decode_moe: hitpass` or `fused` named for a model where the texts are not registered
@@ -369,7 +380,7 @@ at 173 / 183 rows, temperature 0.7, top_p 0.99, seeds 1234 and 4321. Each seed g
 | `hitpass_luts` | Under `decode_moe: hitpass`: a LUT pair for each model layer, each LUT a page (52 x 2 x 16 KiB). |
 | `glue_kernels` | Under `decode_glue: fused`: the glue's texts, their pipelines and launch configurations (`glue.zig`): 8 MiB declared, from construction. |
 | `drafter_residents`, `drafter_context` | With `mtp_lane`: the drafter's 81 tensors and its split base kernels (121 arrays, 3,855,460,864 B, page-rounded), and its context rings (5 layers x K and V x 2 slots x 4,624 rows x 8 heads x 128 x 2 B = 189,399,040 B), from construction. |
-| `draft_round` | With `mtp_lane`: the prompt's captures (5 target layers x the call's last 4,095 rows, and a 512-row context tile) and, in decode, a round's draft and verify arrays at the block. The decode wave is billed at the verify chunk's 4 rows. At depth 7 the lane bills 4.14 GB more in decode and 4.34 GB more in the prompt phase: the fixture's fill goes from 194 / 204 to 190 / 200 rows. |
+| `draft_round` | With `mtp_lane`: the prompt's captures (5 target layers x the call's last 4,095 rows, and a 512-row context tile) and, in decode, a round's draft and verify arrays at the block (under `draft_path: sampled` four more f32 rows of the vocabulary a chunk row: the speculative verify's rows of q, the difference, the residual and its cumulative sum). The decode wave is billed at the verify chunk's 4 rows. At depth 7 the lane bills 4.14 GB more in decode and 4.34 GB more in the prompt phase: the fixture's fill goes from 194 / 204 to 190 / 200 rows. |
 
 The fill gives the most decode rows and prompt rows that fit the host's ceiling less its wired margin. The floor is 8
 rows. The fill bills the rows beside the host's non-file baseline (wired + anonymous - purgeable + compressor, the

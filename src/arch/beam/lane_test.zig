@@ -223,30 +223,107 @@ test "beam lane: a seeded sampled request draws the same ids through the lane as
         if (i + 1 < n) x = try root.step(m, &.{ser[i]});
     }
     m.requestEnd();
-    // The lane: the same seed, sample-then-verify (exact).
-    try testing.expectEqual(sdk.DraftArm.stochastic, root.draft_lane.arm(m, .{ .greedy = false, .clean = true, .sampling = sp }));
-    x = try root.prefill(m, &prompt, shapeOf(&prompt, n));
-    var t1 = argmaxMargin(try rowsOf(m, x, row)).id;
-    m.g.release(x);
-    var got: [n]u32 = undefined;
-    var emitted: usize = 0;
-    while (emitted < n) {
-        var r = try root.draft_lane.round(m, a, t1, @intCast(n - emitted - 1), sp);
-        defer r.deinit(a);
-        for (r.tokens) |tok| {
-            if (emitted == n) break;
-            got[emitted] = tok;
-            emitted += 1;
+    // The lane: the same seed, with the greedy path (sample-then-verify: the serial ids where the rows agree) and with
+    // the sampled path (`draft_path: sampled`: the drafts drawn from q, speculative sampling; distributed as the target,
+    // not the serial path's draws).
+    for ([_]settings.DraftPath{ .greedy, .sampled }) |dp| {
+        m.lane.?.path = dp;
+        try testing.expectEqual(sdk.DraftArm.stochastic, root.draft_lane.arm(m, .{ .greedy = false, .clean = true, .sampling = sp }));
+        x = try root.prefill(m, &prompt, shapeOf(&prompt, n));
+        var t1 = argmaxMargin(try rowsOf(m, x, row)).id;
+        m.g.release(x);
+        var got: [n]u32 = undefined;
+        var emitted: usize = 0;
+        while (emitted < n) {
+            var r = try root.draft_lane.round(m, a, t1, @intCast(n - emitted - 1), sp);
+            defer r.deinit(a);
+            for (r.tokens) |tok| {
+                if (emitted == n) break;
+                got[emitted] = tok;
+                emitted += 1;
+            }
+            t1 = r.next_token;
         }
-        t1 = r.next_token;
+        const st = m.lane.?.stats.base;
+        m.requestEnd();
+        var same: usize = 0;
+        while (same < n and got[same] == ser[same]) same += 1;
+        std.debug.print("\nBEAM LANE sampled (T 0.7, top_p 0.99, seed 1234, path {s}): the lane's ids equal the serial ids for {d} of {d} positions; rounds {d} drafted {d} accepted {d}\n", .{ @tagName(dp), same, n, st.rounds, st.drafted, st.accepted });
+        // The first token is the prompt pass's draw on every path.
+        try testing.expectEqual(ser[0], got[0]);
     }
-    const st = m.lane.?.stats.base;
-    m.requestEnd();
-    var same: usize = 0;
-    while (same < n and got[same] == ser[same]) same += 1;
-    std.debug.print("\nBEAM LANE sampled (T 0.7, top_p 0.99, seed 1234): the lane's ids equal the serial ids for {d} of {d} positions; rounds {d} drafted {d} accepted {d}\n", .{ same, n, st.rounds, st.drafted, st.accepted });
-    // The first token is the prompt pass's draw on both paths.
-    try testing.expectEqual(ser[0], got[0]);
+    m.lane.?.path = .greedy;
+}
+
+test "beam lane: the speculative verify's device rows give the host reference's decisions and tokens (drafts drawn from a 16-candidate q; BEAM_LANE)" {
+    _ = std.c.getenv("BEAM_LANE") orelse return error.SkipZigTest;
+    try window();
+    mlx.installErrorHandler();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try graph.G.init(testing.allocator, s);
+    defer g.deinit();
+    // A verify chunk: 3 drafts and the bonus row over a 300-token vocabulary; q over 16 distinct candidates a row.
+    const W = 4;
+    const V = 300;
+    const K = 16;
+    var lg: [W * V]f32 = undefined;
+    var rng: std.Random.DefaultPrng = .init(20261018);
+    for (&lg) |*v| v.* = rng.random().floatNorm(f32) * 2.0;
+    const row2 = try g.hostArray(std.mem.sliceAsBytes(&lg), &.{ W, V }, .float32);
+    var kept: usize = 0;
+    var rejected: usize = 0;
+    for ([_]acc.Params{ .{ .temperature = 0.7, .top_p = 0.99, .seed = 1234 }, .{ .temperature = 1.0, .seed = 77 }, .{ .temperature = 0.7, .top_k = 20, .top_p = 0.9, .seed = 78 } }) |sm| {
+        for (0..16) |set| {
+            const base: u64 = 4321 + set * 16;
+            var qd: [(W - 1) * V]f32 = @splat(0);
+            var q64: [W - 1][V]f64 = undefined;
+            var qx: [W - 1]f32 = undefined;
+            var drafts: [W - 1]u32 = undefined;
+            for (0..W - 1) |r| {
+                // 16 distinct ids (a shuffled range), their weights; the draft drawn from q at the drafter's uniform.
+                var perm: [V]u32 = undefined;
+                for (&perm, 0..) |*x, i| x.* = @intCast(i);
+                rng.random().shuffle(u32, &perm);
+                var wts: [K]f32 = undefined;
+                var z: f32 = 0;
+                for (&wts) |*x| {
+                    x.* = @exp(rng.random().floatNorm(f32) * 1.5);
+                    z += x.*;
+                }
+                for (perm[0..K], wts) |id, x| qd[r * V + id] = x / z;
+                for (&q64[r], qd[r * V ..][0..V]) |*o, x| o.* = x;
+                drafts[r] = acc.draw(&q64[r], acc.drawQ(sm.seed, base + r + 1));
+                qx[r] = qd[r * V + drafts[r]];
+            }
+            const m0 = g.mark();
+            defer g.resetTo(m0);
+            const qxa = try g.hostArray(std.mem.sliceAsBytes(&qx), &.{W - 1}, .float32);
+            const qda = try g.hostArray(std.mem.sliceAsBytes(&qd), &.{ W - 1, V }, .float32);
+            const sr = try acc.speculativeRows(&g, row2, sm, base, &drafts, qxa, qda);
+            var tok: [W]u32 = undefined;
+            _ = try g.hostU32(sr.tok, &tok);
+            var flags: [W - 1]bool = undefined;
+            _ = try g.hostBool(sr.accept.?, &flags);
+            for (0..W) |r| {
+                var d: [V]f64 = undefined;
+                acc.distribution(lg[r * V ..][0..V], sm, &d);
+                const x: ?u32 = if (r < W - 1) drafts[r] else null;
+                const q: ?[]const f64 = if (r < W - 1) &q64[r] else null;
+                const want = acc.specStep(&d, x, q, acc.drawU(sm.seed, base + r + 1), acc.drawV(sm.seed, base + r + 1));
+                if (r < W - 1) {
+                    try testing.expectEqual(want.accept, flags[r]);
+                    // A rejected row's token is the residual's draw (an accepted row's is unused: the draft is kept).
+                    if (want.accept) kept += 1 else {
+                        rejected += 1;
+                        try testing.expectEqual(want.tok, tok[r]);
+                    }
+                } else try testing.expectEqual(want.tok, tok[r]);
+            }
+        }
+    }
+    std.debug.print("\nBEAM LANE speculative rows: {d} drafts kept, {d} rejected (the residual's draw), the device's decisions and tokens the host reference's\n", .{ kept, rejected });
+    try testing.expect(kept > 0 and rejected > 0);
 }
 
 test "beam drafter: the block's hidden rows against z-lab's reference by cosine and rms ratio, the greedy path's ids exactly (BEAM_DRAFTER_PARITY)" {

@@ -30,6 +30,13 @@
 //! by (seed, absolute position of the drawn token, draw index), never by round: a seeded request is reproducible however
 //! its rounds fall.
 //!
+//! A lane whose drafter draws each draft x from its own distribution q (at `drawQ`, `drawAt` index 2) hands the rows its
+//! q (`specStep`'s `q`, `speculativeRows`): speculative sampling (Leviathan et al. 2023, Chen et al. 2023). x is kept
+//! iff u x q(x) < p(x) (u = `drawU`: kept with probability min(1, p(x) / q(x))); a rejected row emits the residual
+//! (p - q)+'s draw at `drawV`, the bonus row p's own draw. Each emitted token is distributed as p, and a draft is kept
+//! with probability sum min(p, q), the most any coupling of the two gives; a seeded request is reproducible, but its
+//! tokens are not the serial path's draws.
+//!
 //! The rule on every request (`acceptGeneral`, `typicalRows`; a lane opts in at construction by calling them: MiMo's
 //! MTP lane does, DeepSeek-V4.1's DSpark lane keeps `accept` / `sampledRows`): `exact` is as above (greedy: argmax
 //! equality; sampled: sample-then-verify). `typical` on a sampled request is Medusa's typical acceptance (Cai
@@ -44,13 +51,13 @@
 //! decoding"). Medusa's first token is the target's greedy token; here it is the previous round's draw (t1), so a
 //! sampled request samples every token the target emits.
 //!
-//! Two forms of the same rules: the device graphs (`typicalFlags`, `sampledRows`) a lane folds into its verify's eval
-//! (written once against any op backend with the ops they call: `shapeOf`, `astype`, `slice`, `logsumexp`, `sub`,
-//! `exp`, `neg`, `sum`, `mul`, `minimum`, `scalar`, `hostArray`, `takeAlongAxis`, `reshape`, `greater`, `sort`,
-//! `softmax`, `arange`, `less`, `where`, `div`, `cumsum`, `logicalAnd`, `max`, `greaterEqual`, `equal`), and the host
-//! reference (`accept`, `distribution`, `specStep`, `typicalAccepts`): the parity tests' oracle, rows of at most
-//! `ref_max_vocab` tokens. `prefix` is the walk both share: from the rows' tokens (argmax or drawn) and the per-draft
-//! decisions to the accepted count and the next token.
+//! Two forms of the same rules: the device graphs (`typicalFlags`, `sampledRows`, `speculativeRows`) a lane folds into
+//! its verify's eval (written once against any op backend with the ops they call: `shapeOf`, `astype`, `slice`,
+//! `logsumexp`, `sub`, `exp`, `neg`, `sum`, `mul`, `minimum`, `maximum`, `scalar`, `hostArray`, `takeAlongAxis`,
+//! `reshape`, `greater`, `sort`, `softmax`, `arange`, `less`, `where`, `div`, `cumsum`, `logicalAnd`, `max`,
+//! `greaterEqual`, `equal`, `concat`), and the host reference (`accept`, `distribution`, `specStep`, `typicalAccepts`):
+//! the parity tests' oracle, rows of at most `ref_max_vocab` tokens. `prefix` is the walk both share: from the rows'
+//! tokens (argmax or drawn) and the per-draft decisions to the accepted count and the next token.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -103,8 +110,9 @@ pub const Params = struct {
 /// mlx-stream's one random stream: the uniform in (0, 1) of draw `index` at absolute token position `pos` of a request
 /// seeded `seed`. splitmix64 over (seed ^ the index's key) + pos x the golden gamma, its top 24 bits, centred
 /// ((bits + 0.5) / 2^24, never 0 or 1). Index 0 (`token_draw`) is the token's draw (every path samples it: serial,
-/// verify, first token); index 1 (`test_draw`) the typical tier's spare. The same (seed, pos, index) is the same
-/// uniform on every arch and path, however the rounds fall.
+/// verify, first token); index 1 (`test_draw`) the speculative test's (and the typical tier's spare); index 2
+/// (`draft_draw`) a drafter's own draw from its q. The same (seed, pos, index) is the same uniform on every arch and
+/// path, however the rounds fall.
 pub fn drawAt(seed: u64, pos: u64, index: u32) f32 {
     var z = (seed ^ draw_keys[index]) +% pos *% 0x9E3779B97F4A7C15;
     z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
@@ -116,7 +124,8 @@ pub fn drawAt(seed: u64, pos: u64, index: u32) f32 {
 
 pub const token_draw: u32 = 0;
 pub const test_draw: u32 = 1;
-const draw_keys = [2]u64{ 0xD1B54A32D192ED03, 0 };
+pub const draft_draw: u32 = 2;
+const draw_keys = [3]u64{ 0xD1B54A32D192ED03, 0, 0x8CB92BA72F3D8DD7 };
 
 /// The token draw at `pos` (`drawAt` index 0).
 pub fn drawV(seed: u64, pos: u64) f32 {
@@ -126,6 +135,11 @@ pub fn drawV(seed: u64, pos: u64) f32 {
 /// The spare uniform at `pos` (`drawAt` index 1).
 pub fn drawU(seed: u64, pos: u64) f32 {
     return drawAt(seed, pos, test_draw);
+}
+
+/// A drafter's own draw for the token at `pos` (`drawAt` index 2): its draft drawn from its q.
+pub fn drawQ(seed: u64, pos: u64) f32 {
+    return drawAt(seed, pos, draft_draw);
 }
 
 /// The reference sampler: the token at absolute position `pos` of a request seeded `seed`, drawn from `dist` (the
@@ -319,13 +333,22 @@ pub fn draw(dist: []const f64, u: f32) u32 {
     return @intCast(dist.len - 1);
 }
 
-/// The reference step on one row of a sampled request (sample-then-verify): the row's token is p's draw at v; a draft
-/// is accepted iff it is that token. `q` and `u` are not read (any drafter: the emitted token is p's draw).
+/// The reference step on one row of a sampled request. Without `q` (sample-then-verify): the row's token is p's draw at
+/// v; a draft is accepted iff it is that token (u is not read). With `q` (the draft's distribution: the drafter drew the
+/// draft from it), speculative sampling: draft x is accepted iff u x q(x) < p(x); a rejected row's token is the residual
+/// (p - q)+'s draw at v. Without a draft (the bonus row) the token is p's draw at v. Each path emits tokens distributed
+/// as p.
 pub fn specStep(dist: []const f64, draft: ?u32, q: ?[]const f64, u: f32, v: f32) struct { accept: bool, tok: u32 } {
-    _ = .{ q, u };
-    const tok = draw(dist, v);
-    const x = draft orelse return .{ .accept = false, .tok = tok };
-    return .{ .accept = x == tok, .tok = tok };
+    const x = draft orelse return .{ .accept = false, .tok = draw(dist, v) };
+    const qq = q orelse {
+        const tok = draw(dist, v);
+        return .{ .accept = x == tok, .tok = tok };
+    };
+    if (@as(f64, u) * qq[x] < dist[x]) return .{ .accept = true, .tok = x };
+    var rb: [ref_max_vocab]f64 = undefined;
+    const res = rb[0..dist.len];
+    for (res, dist, qq[0..dist.len]) |*r, pv, qv| r.* = @max(pv - qv, 0);
+    return .{ .accept = false, .tok = draw(res, v) };
 }
 
 /// The reference typical step on one row of a sampled request (`acceptGeneral`): the row's token is p's draw at `v`;
@@ -449,6 +472,38 @@ pub fn sampledRows(g: anytype, row2: anytype, sm: Params, base: u64, drafts: []c
         accept_ = try g.equal(try g.slice(tok, &.{0}, &.{nd}, &.{1}), xs);
     }
     return .{ .tok = tok, .accept = accept_, .p = f.p };
+}
+
+/// A sampled request's rows under speculative sampling (`specStep` with q; a lane whose drafter draws each draft from
+/// its own q): p = `filteredRows`; draft x at row r is accepted iff u x q_r(x) < p_r(x) (u = `drawU(seed, base + r +
+/// 1)`); a rejected row's token is the residual (p_r - q_r)+'s draw, the bonus row's p's own draw, both at v =
+/// `drawV(seed, base + r + 1)` (`drawRows`). `qx` f32 [drafts.len]: each draft's q; `qd` f32 [drafts.len, V]: the
+/// drafts' rows of q (0 off the drafter's support). `tok` uint32 [W]: the residual draws on the draft rows, then the
+/// bonus row's draw when the rows hold it (the token `prefix` takes at the first rejection or after the run). One host
+/// array of the drafts and one of their test uniforms.
+pub fn speculativeRows(g: anytype, row2: anytype, sm: Params, base: u64, drafts: []const u32, qx: @TypeOf(row2), qd: @TypeOf(row2)) !SampledRows(@TypeOf(row2)) {
+    const sh = g.shapeOf(row2);
+    const w = sh.dim(0);
+    const vocab = sh.dim(1);
+    const nd: c_int = @intCast(drafts.len);
+    std.debug.assert(drafts.len >= 1 and (nd == w or nd + 1 == w));
+    const f = try filteredRows(g, row2, sm);
+    const vv = try drawUniforms(g, w, sm, base);
+    const pd = try g.slice(f.p, &.{ 0, 0 }, &.{ nd, vocab }, &.{ 1, 1 });
+    const res = try g.maximum(try g.sub(pd, qd), f.zero);
+    var tok = try drawRows(g, res, try g.slice(vv, &.{ 0, 0 }, &.{ nd, 1 }, &.{ 1, 1 }));
+    if (w > nd) {
+        const bonus = try drawRows(g, try g.slice(f.p, &.{ nd, 0 }, &.{ w, vocab }, &.{ 1, 1 }), try g.slice(vv, &.{ nd, 0 }, &.{ w, 1 }, &.{ 1, 1 }));
+        tok = try g.concat(&.{ tok, bonus }, 0);
+    }
+    var ib: [max_rows]i32 = undefined;
+    for (ib[0..drafts.len], drafts) |*x, d| x.* = @intCast(d);
+    const xs = try g.hostArray(std.mem.sliceAsBytes(ib[0..drafts.len]), &.{ nd, 1 }, .int32);
+    const px = try g.reshape(try g.takeAlongAxis(pd, xs, -1), &.{nd});
+    var ub: [max_rows]f32 = undefined;
+    for (ub[0..drafts.len], 0..) |*u, r| u.* = drawU(sm.seed, base + r + 1);
+    const uu = try g.hostArray(std.mem.sliceAsBytes(ub[0..drafts.len]), &.{nd}, .float32);
+    return .{ .tok = tok, .accept = try g.less(try g.mul(uu, qx), px), .p = f.p };
 }
 
 /// A sampled request's rows under the typical rule (`acceptGeneral`'s graph; Medusa's typical acceptance): p =
@@ -645,6 +700,31 @@ test "sdk_ext acceptance: speculative sampling emits tokens distributed as the t
             if (pi == 0) try testing.expectEqual(@as(u32, 0), ci);
         }
     };
+}
+
+test "sdk_ext acceptance: speculative sampling keeps a draft drawn from q with probability sum min(p, q), more than a point mass at q's mode keeps (20k rounds)" {
+    const lg = [_]f32{ 1.2, 0.9, 0.4, 0.1, -0.6, -1.5 };
+    const q = [_]f64{ 0.1, 0.4, 0.2, 0.1, 0.1, 0.1 };
+    const sm: Params = .{ .temperature = 1.0, .seed = 2718 };
+    var p: [6]f64 = undefined;
+    distribution(&lg, sm, &p);
+    var overlap: f64 = 0;
+    for (p, q) |a, b| overlap += @min(a, b);
+    const n = 20000;
+    var kept: u32 = 0;
+    var kept_mode: u32 = 0;
+    for (0..n) |round| {
+        const pos: u64 = 5000 + round;
+        // The drafter's own draw (index 2), the test's (index 1) and the residual's (index 0) are three uniforms.
+        const x = draw(&q, drawQ(sm.seed, pos));
+        kept += @intFromBool(specStep(&p, x, &q, drawU(sm.seed, pos), drawV(sm.seed, pos)).accept);
+        kept_mode += @intFromBool(specStep(&p, 1, null, drawU(sm.seed, pos), drawV(sm.seed, pos)).accept);
+    }
+    // sum min(p, q) = 0.716 here; the point mass at q's mode (token 1) is kept with p(1) = 0.269.
+    try testing.expectApproxEqAbs(overlap, @as(f64, @floatFromInt(kept)) / n, 0.015);
+    try testing.expectApproxEqAbs(p[1], @as(f64, @floatFromInt(kept_mode)) / n, 0.015);
+    try testing.expect(overlap > p[1] + 0.3);
+    try testing.expect(drawQ(42, 1000) != drawU(42, 1000) and drawQ(42, 1000) != drawV(42, 1000));
 }
 
 test "sdk_ext acceptance: a point-mass draft the target disfavours is accepted less (acceptance = p(draft))" {
