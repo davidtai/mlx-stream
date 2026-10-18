@@ -567,12 +567,116 @@ fn longRun(a: std.mem.Allocator, dir: []const u8, rows: ?u32, ids: []const u32, 
     return .{ .logits = out, .chosen = chosen };
 }
 
+/// The long case's reference (`ref`, PREFIX of scripts/beam_reference_logits.py --long-case): the f32-accumulated
+/// forward of the same ids on the same forced routes, its logits from the last prompt row on, and its router's own
+/// choices and margins at every position. Refused (`BeamParityRef`) unless its ids and routes are the case's.
+const LongRef = struct {
+    /// (1 + long_steps) x vocab: the last prompt row's logits, then each decode step's.
+    logits: []f32,
+    /// [routed layer][position][k], and [routed layer][position].
+    own: []u32,
+    margins: []f32,
+
+    fn deinit(r: *LongRef, a: std.mem.Allocator) void {
+        a.free(r.logits);
+        a.free(r.own);
+        a.free(r.margins);
+    }
+};
+
+fn readLongRef(a: std.mem.Allocator, prefix: []const u8, ids: []const u32, routes: []const u32, k: usize, vocab: usize) !LongRef {
+    const io = testing.io;
+    const json_path = try std.fmt.allocPrint(a, "{s}.json", .{prefix});
+    defer a.free(json_path);
+    const bin_path = try std.fmt.allocPrint(a, "{s}.f32", .{prefix});
+    defer a.free(bin_path);
+    const cwd = std.Io.Dir.cwd();
+    const text = try cwd.readFileAlloc(io, json_path, a, .limited(256 << 20));
+    defer a.free(text);
+    const Meta = struct { ids: []const u32, rows: usize, vocab: usize, head_from: usize, route_k: usize, routes: []const u32, own_routes: []const u32, route_margins: []const f32 };
+    const meta = try std.json.parseFromSlice(Meta, a, text, .{ .ignore_unknown_fields = true });
+    defer meta.deinit();
+    const v = meta.value;
+    if (!std.mem.eql(u32, v.ids, ids) or !std.mem.eql(u32, v.routes, routes) or v.route_k != k or v.vocab != vocab) return error.BeamParityRef;
+    if (v.rows != ids.len or v.head_from != long_rows - 1 or v.own_routes.len != routes.len or v.route_margins.len != routes.len / k) return error.BeamParityRef;
+    const raw = try cwd.readFileAlloc(io, bin_path, a, .limited(1 << 30));
+    defer a.free(raw);
+    if (raw.len != (1 + long_steps) * vocab * 4) return error.BeamParityRef;
+    const logits = try a.alloc(f32, (1 + long_steps) * vocab);
+    errdefer a.free(logits);
+    @memcpy(std.mem.sliceAsBytes(logits), raw);
+    const own = try a.dupe(u32, v.own_routes);
+    errdefer a.free(own);
+    return .{ .logits = logits, .own = own, .margins = try a.dupe(f32, v.route_margins) };
+}
+
+/// One path's distance to the long reference: the largest logit difference, the logits past `abs_tol`, the argmax on
+/// each row whose reference top-2 margin is past twice `abs_tol`, and the router's own choices (as sets) against the
+/// reference router's by span (before the old call's end, after it, in decode) and where the reference's margin is at
+/// least `route_tol` (decisive).
+const LongDistance = struct {
+    max_diff: f32 = 0,
+    logits: usize = 0,
+    over: usize = 0,
+    decisive_rows: usize = 0,
+    argmax_differ: usize = 0,
+    choice_differ: [3]usize = .{ 0, 0, 0 },
+    choices: [3]usize = .{ 0, 0, 0 },
+    decisive_choices: usize = 0,
+    decisive_differ: usize = 0,
+
+    fn of(run: LongRun, ref: *const LongRef, n_moe: usize, k: usize, vocab: usize) LongDistance {
+        var d: LongDistance = .{};
+        for (0..1 + long_steps) |r| {
+            const x = run.logits[r * vocab ..][0..vocab];
+            const y = ref.logits[r * vocab ..][0..vocab];
+            for (x, y) |p, q| {
+                d.max_diff = @max(d.max_diff, @abs(p - q));
+                d.over += @intFromBool(@abs(p - q) > abs_tol);
+            }
+            d.logits += vocab;
+            if (margin(y) > 2 * abs_tol) {
+                d.decisive_rows += 1;
+                d.argmax_differ += @intFromBool(argmax(x) != argmax(y));
+            }
+        }
+        const positions = long_rows + long_steps;
+        for (0..n_moe) |l| for (0..positions) |p| {
+            const span: usize = if (p < old_call_rows) 0 else if (p < long_rows) 1 else 2;
+            const at = (l * positions + p) * k;
+            const x = run.chosen[at..][0..k];
+            const y = ref.own[at..][0..k];
+            var same = true;
+            for (x) |ex| same = same and std.mem.indexOfScalar(u32, y, ex) != null;
+            d.choices[span] += 1;
+            d.choice_differ[span] += @intFromBool(!same);
+            if (ref.margins[l * positions + p] >= route_tol) {
+                d.decisive_choices += 1;
+                d.decisive_differ += @intFromBool(!same);
+            }
+        };
+        return d;
+    }
+
+    /// Whether `d` (P5's one call) is no farther from the reference than `chunked`: its largest difference within the
+    /// chunked path's plus `abs_tol`, and no more decisive argmax or decisive router choices off.
+    fn within(d: LongDistance, chunked: LongDistance) bool {
+        return d.max_diff <= chunked.max_diff + abs_tol and d.argmax_differ <= chunked.argmax_differ and d.decisive_differ <= chunked.decisive_differ;
+    }
+
+    fn print(d: LongDistance, label: []const u8) void {
+        std.debug.print("{s}: max_diff {d:.5}, {d} of {d} logits over abs_tol, argmax {d} of {d} decisive rows differ; router choices off the reference's {d} of {d} before row {d}, {d} of {d} after, {d} of {d} in decode, {d} of {d} decisive", .{ label, d.max_diff, d.over, d.logits, d.argmax_differ, d.decisive_rows, d.choice_differ[0], d.choices[0], old_call_rows, d.choice_differ[1], d.choices[1], d.choice_differ[2], d.choices[2], d.decisive_differ, d.decisive_choices });
+    }
+};
+
 /// The long case on one pack: its ids (a fixed sequence over the vocabulary) and its forced routes (row p of routed
 /// layer l takes the k experts from (p x 2,654,435,761 + l x 40,503) mod E on), served in one call and in the old calls;
 /// the logits compared bit for bit, their largest difference, the argmax on every row whose top-2 margin is past twice
-/// `abs_tol`, and the router's own choices (as sets) by position: before the old call's end, after it, in decode. A
-/// report: the slice's bound is its reference twin's (`twin_factor`), and this prompt has no reference.
-fn longCase(dir: []const u8, rows: ?u32) !void {
+/// `abs_tol`, and the router's own choices (as sets) by position: before the old call's end, after it, in decode. With
+/// `ref` (the f32-accumulated reference of the same rows), each path's distance to it, and the gate: P5's one call is
+/// no farther from the reference than the chunked calls it replaced (its largest difference within theirs plus
+/// `abs_tol`; no more decisive argmax or decisive router choices off). Without `ref`, a report.
+fn longCase(dir: []const u8, rows: ?u32, ref_prefix: ?[]const u8) !void {
     const a = testing.allocator;
     const io = testing.io;
     var pack_dir = try std.Io.Dir.openDirAbsolute(io, dir, .{});
@@ -634,9 +738,21 @@ fn longCase(dir: []const u8, rows: ?u32) !void {
         choice_differ[span] += @intFromBool(!same);
     };
     std.debug.print("BEAM PARITY {s} one call vs calls of {d} rows ({d} prompt rows, {d} decode steps, forced routes): {d} logits, {d} differ, max_diff {d:.5} (abs_tol {d:.4}), argmax {d} of {d} decisive rows differ; router choices differ: {d} of {d} before row {d}, {d} of {d} after, {d} of {d} in decode\n", .{ std.fs.path.basename(dir), old_call_rows, long_rows, long_steps, one.logits.len, differ, max_diff, abs_tol, argmax_differ, decisive, choice_differ[0], choices[0], old_call_rows, choice_differ[1], choices[1], choice_differ[2], choices[2] });
+    const prefix = ref_prefix orelse return;
+    var ref = try readLongRef(a, prefix, ids, routes, k, vocab);
+    defer ref.deinit(a);
+    const d1 = LongDistance.of(one, &ref, n_moe, k, vocab);
+    const d2 = LongDistance.of(two, &ref, n_moe, k, vocab);
+    const ok = d1.within(d2);
+    std.debug.print("BEAM PARITY {s} long call against the f32-accumulated reference ({s}): ", .{ std.fs.path.basename(dir), std.fs.path.basename(prefix) });
+    d1.print("one call (P5)");
+    d2.print("; calls of 16384 + 61 (stock)");
+    std.debug.print("; P5 within the chunked distance + abs_tol: {s}\n", .{if (ok) "yes" else "NO"});
+    if (!ok) return error.BeamParityLongCall;
 }
 
-test "beam parity: on the real-weight slice a prompt past the old 16,384-row call: P5's one call against the chunked calls (BEAM_PARITY_SLICE)" {
+test "beam parity: on the real-weight slice a prompt past the old 16,384-row call: P5's one call against the chunked calls, and both against the f32-accumulated reference (BEAM_PARITY_SLICE, BEAM_PARITY_SLICE_LONG_REF)" {
     const dir = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE") orelse return error.SkipZigTest);
-    try longCase(dir, slice_rows);
+    const ref: ?[]const u8 = if (std.c.getenv("BEAM_PARITY_SLICE_LONG_REF")) |p| std.mem.span(p) else null;
+    try longCase(dir, slice_rows, ref);
 }

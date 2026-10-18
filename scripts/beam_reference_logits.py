@@ -2,7 +2,8 @@
 """The reference logits of a Beam pack for the beam arch's parity test (src/arch/beam/parity.zig).
 
     python3 -B -I scripts/beam_reference_logits.py --pack PACK --out PREFIX [--prompt 40] [--decode 8] [--seed 7]
-        [--decode-ids greedy|seeded] [--ids-from REF.json] [--routes-from REF.json] [--cache-gb 4]
+        [--decode-ids greedy|seeded] [--ids-from REF.json] [--routes-from REF.json] [--cache-gb 4] [--long-case]
+        [--head-from ROW]
 
 Reads the pack as mlx-stream serves it (config.json, the residents in model.safetensors, the NVFP4 expert bank
 experts.bin with expert-manifest.json: docs/nvfp4-pack.md) and runs modeling_beam.py's forward in numpy on the CPU:
@@ -11,6 +12,11 @@ token) or seeded (drawn from SEED, one forward: the parity test forces the token
 of another reference (`--ids-from`: its prompt and decode rows, so two packs' references share their rows). Every row's
 logits are those of one causal forward over the whole sequence (a decode step's row is the sequence's row at its
 position).
+
+`--long-case` takes parity.zig's long case instead (`longCase`: 16,445 prompt ids and 4 decode ids
+(i x 2,654,435,761 + 12,345) mod vocab, and at routed layer l, row p, the 8 experts from (p x 2,654,435,761 + l x 40,503)
+mod E on, forced), the reference for P5's one long prompt call; its logits only from the last prompt row on
+(`--head-from`). The test checks that the reference's ids and routes are its own.
 
 A q8 pack's projections (`residents_format: affine8_g64`: U32 codes with BF16 scales and biases a group of 64) are
 dequantized in f32 as MLX's qmv reads them, s x q + b (an 8-bit code times a BF16 scale is exact in f32), and enter
@@ -21,11 +27,15 @@ reference on the BF16 reference's routes is the parity test's bound for the q8 p
 The arithmetic follows the reference's dtypes: every tensor the reference holds in BF16 is rounded to BF16 (round to
 nearest even) where the reference rounds it, every reduction runs in f32. The routed experts are the bank's records
 dequantized in f32 by the bank's formula (MLX's nvfp4 dequantize: inv = g / 2688, s = e4m3(scale) x inv,
-w = s x e2m1(code)). The attention's softmax runs in f32 and its output rounds to BF16.
+w = s x e2m1(code)). The attention's softmax runs in f32 and its output rounds to BF16. The attention runs one head
+and one block of 1,024 query rows at a time over the keys the row may see (a sliding layer's window, a full layer's
+prefix), as f32 matrix products: a long prompt never holds the heads x rows x rows scores.
 
 Writes PREFIX.json (the ids, the rows, the vocab, the per-row argmax and top-2 margin, the per-row routing margin: the
-least gap of a group or expert choice over the routed layers, every routed layer's chosen experts by row), PREFIX.f32 (the logits, little-endian f32
-[rows, vocab], row-major) and with `--twin` PREFIX.twin.f32 (the same rows with no BF16 rounding, on the same routes). The residents and the bank are mapped, never read whole (the full pack's experts.bin is
+least gap of a group or expert choice over the routed layers, every routed layer's chosen experts by row, and under
+forced routes the router's own choices as `own_routes`), PREFIX.f32 (the logits, little-endian f32 [rows, vocab],
+row-major; from row `head_from` on with `--head-from`) and with `--twin` PREFIX.twin.f32 (the same rows with no BF16
+rounding, on the same routes). The residents and the bank are mapped, never read whole (the full pack's experts.bin is
 277 GB): a tensor's bytes are read when the forward asks for them (the embedding's rows only), and the dequantized
 experts (157 MB each at Beam's geometry) sit in an LRU of `--cache-gb`. Stdlib and numpy only.
 """
@@ -67,6 +77,10 @@ def e4m3_table() -> np.ndarray:
 
 
 E4M3 = e4m3_table()
+# The attention's query block: one head's scores over the keys a block of rows may see, at most 1,024 x rows f32.
+ATTN_ROWS = 1024
+# parity.zig's long case (`longCase`): its rows, and its ids' and forced routes' formulas.
+LONG_PROMPT, LONG_DECODE, LONG_MUL, LONG_ADD, LONG_LAYER = 16_445, 4, 2_654_435_761, 12_345, 40_503
 E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], np.float32)
 
 
@@ -205,6 +219,8 @@ class Beam:
         self.mlp_types = c["mlp_layer_types"]
         self.margins: dict = {}
         self.routes: dict = {}
+        # The router's own choices by routed layer (the routes' when nothing is forced).
+        self.own: dict = {}
         # The twin's routes (`--twin`): every routed layer's ids by row, taken in place of the choice.
         self.forced: dict | None = None
 
@@ -234,18 +250,23 @@ class Beam:
             q = bf16(q * cos + rot(q) * sin)
             k = bf16(k * cos + rot(k) * sin)
         rep = self.nh // self.kvh
-        kk = np.repeat(k, rep, axis=1)
-        vv = np.repeat(v, rep, axis=1)
-        s = np.einsum("qhd,khd->hqk", q, kk) * np.float32(self.d ** -0.5)
-        qi, ki = pos[:, None], pos[None, :]
-        allowed = ki <= qi
-        if not full:
-            allowed &= (qi - ki) < self.window
-        s = np.where(allowed[None], s, -np.inf)
-        s = s - s.max(axis=-1, keepdims=True)
-        pr = np.exp(s)
-        pr = pr / pr.sum(axis=-1, keepdims=True)
-        o = bf16(np.einsum("hqk,khd->qhd", pr, vv))
+        scale = np.float32(self.d ** -0.5)
+        o = np.empty((n, self.nh, self.d), np.float32)
+        for i0 in range(0, n, ATTN_ROWS):
+            i1 = min(n, i0 + ATTN_ROWS)
+            k0 = 0 if full else max(0, i0 - self.window + 1)
+            qi, ki = pos[i0:i1, None], pos[None, k0:i1]
+            allowed = ki <= qi
+            if not full:
+                allowed &= (qi - ki) < self.window
+            for h in range(self.nh):
+                s = (q[i0:i1, h, :] @ k[k0:i1, h // rep, :].T) * scale
+                s = np.where(allowed, s, -np.inf)
+                s = s - s.max(axis=-1, keepdims=True)
+                pr = np.exp(s)
+                pr = pr / pr.sum(axis=-1, keepdims=True)
+                o[i0:i1, h, :] = pr @ v[k0:i1, h // rep, :]
+        o = bf16(o)
         gate = bf16(linear(x, self.w(p + "gate_proj.weight")).reshape(n, self.nh, self.d) + self.w(p + "gate_bias")[None, :, None])
         o = bf16(o * bf16(sigmoid(gate)))
         return linear(o.reshape(n, self.nh * self.d), self.w(p + "o_proj.weight"))
@@ -277,6 +298,7 @@ class Beam:
         msort = np.sort(masked, axis=-1)
         gap_e = msort[:, -self.k] - msort[:, -self.k - 1]
         self.margins[l] = np.minimum(gap_g, np.where(np.isfinite(gap_e), gap_e, np.inf))
+        self.own[l] = ids
         if self.forced is not None:
             ids = self.forced[l][:n]
         self.routes[l] = ids
@@ -301,7 +323,8 @@ class Beam:
     def depth_add(h, r, i):
         return bf16(bf16(h * np.float32(1.0 / math.sqrt(i))) + bf16(r * np.float32(math.sqrt((i - 1) / i))))
 
-    def forward(self, ids):
+    def forward(self, ids, head_from=0):
+        """The logits of rows `head_from` on (every row's trunk runs: the attention sees the whole prefix)."""
         pos = np.arange(len(ids))
         x = self.st.rows("model.embed_tokens.weight", ids)
         for l in range(self.L):
@@ -311,7 +334,7 @@ class Beam:
             h = rms_norm(x, self.w(p + "pre_feedforward_layernorm.weight"), self.eps)
             f = self.dense(l, h) if self.mlp_types[l] == "dense" else self.moe(l, h)
             x = self.depth_add(rms_norm(f, self.w(p + "post_feedforward_layernorm.weight"), self.eps), x, 2 * (l + 1) + 1)
-        logits = linear(rms_norm(x, self.w("model.norm.weight"), self.eps), self.w("lm_head.weight"))
+        logits = linear(rms_norm(x[head_from:], self.w("model.norm.weight"), self.eps), self.w("lm_head.weight"))
         return (np.tanh(logits / np.float32(self.cap)) * np.float32(self.cap)).astype(np.float32)
 
 
@@ -330,13 +353,30 @@ def main() -> None:
     ap.add_argument("--routes-from", type=Path, help="REF.json of a reference of the same rows: its experts forced at "
                                                      "every routed layer (the weights this pack's router's scores)")
     ap.add_argument("--cache-gb", type=float, default=4.0, help="the dequantized experts' LRU (default 4 GB)")
+    ap.add_argument("--long-case", action="store_true",
+                    help="parity.zig's long case: its 16,445 + 4 ids and forced routes (in place of --prompt, --decode, "
+                         "--seed, --ids-from and --routes-from), the logits from the last prompt row on")
+    ap.add_argument("--head-from", type=int, default=None, metavar="ROW",
+                    help="write the logits of rows ROW on only (the trunk still runs every row)")
     ap.add_argument("--twin", action="store_true",
                     help="also write PREFIX.twin.f32: the same forward on the same routes with no BF16 rounding (every "
                          "tensor f32), the model's own rounding sensitivity, which the parity test's bound reads")
     args = ap.parse_args()
     m = Beam(args.pack, int(args.cache_gb * 1e9))
     vocab = m.cfg["vocab_size"]
-    if args.ids_from is not None:
+    routed = [l for l in range(m.L) if m.mlp_types[l] != "dense"]
+    if args.long_case:
+        if args.ids_from is not None or args.routes_from is not None:
+            raise SystemExit("--long-case brings its own ids and routes")
+        args.prompt, args.decode, args.seed, args.decode_ids = LONG_PROMPT, LONG_DECODE, 0, "long case"
+        rows = LONG_PROMPT + LONG_DECODE
+        ids = [(i * LONG_MUL + LONG_ADD) % vocab for i in range(rows)]
+        base = (np.arange(rows, dtype=np.int64)[None, :] * LONG_MUL + np.arange(len(routed), dtype=np.int64)[:, None] * LONG_LAYER) % m.E
+        r = (base[:, :, None] + np.arange(m.k, dtype=np.int64)[None, None, :]) % m.E
+        m.forced = {l: r[i] for i, l in enumerate(routed)}
+        if args.head_from is None:
+            args.head_from = LONG_PROMPT - 1
+    elif args.ids_from is not None:
         src = json.loads(args.ids_from.read_text())
         ids = [int(t) for t in src["ids"]]
         args.prompt, args.decode, args.seed = src["prompt_tokens"], src["decode_tokens"], src["seed"]
@@ -351,23 +391,25 @@ def main() -> None:
         else:
             for _ in range(args.decode):
                 ids.append(int(np.argmax(m.forward(ids)[-1])))
-    m.margins, m.routes = {}, {}
+    m.margins, m.routes, m.own = {}, {}, {}
     if args.routes_from is not None:
         src = json.loads(args.routes_from.read_text())
         if src["ids"] != ids:
             raise SystemExit(f"{args.routes_from}: its ids are not these rows'")
-        routed = [l for l in range(m.L) if m.mlp_types[l] != "dense"]
         r = np.array(src["routes"], np.int64).reshape(len(routed), len(ids), src["route_k"])
         m.forced = {l: r[i] for i, l in enumerate(routed)}
-    logits = m.forward(ids)
+    head_from = args.head_from or 0
+    if not 0 <= head_from < len(ids):
+        raise SystemExit(f"--head-from {head_from}: the rows are 0-{len(ids) - 1}")
+    forced = m.forced is not None
+    logits = m.forward(ids, head_from)
     srt = np.sort(logits, axis=-1)
-    routed = sorted(m.margins)
     margins = np.stack([m.margins[l] for l in routed]) if routed else np.full((1, len(ids)), np.inf)
     meta = {
         "pack": str(args.pack), "residents_format": m.cfg.get("residents_format", "bf16"),
         "routes_from": str(args.routes_from) if args.routes_from is not None else None,
         "prompt_tokens": args.prompt, "decode_tokens": args.decode, "seed": args.seed, "decode_ids": args.decode_ids,
-        "ids": ids, "rows": len(ids), "vocab": vocab,
+        "ids": ids, "rows": len(ids), "vocab": vocab, "head_from": head_from,
         "argmax": np.argmax(logits, axis=-1).tolist(), "margin": (srt[:, -1] - srt[:, -2]).astype(float).tolist(),
         # Each row's routing margin: the least, over the routed layers, of its group and expert choice margins; and the
         # first routed layer (absolute index) where it is under 0.02, else -1.
@@ -379,13 +421,15 @@ def main() -> None:
         "route_k": m.k,
         "routes": np.stack([m.routes[l] for l in routed]).astype(int).ravel().tolist() if routed else [],
     }
+    if forced and routed:
+        meta["own_routes"] = np.stack([m.own[l] for l in routed]).astype(int).ravel().tolist()
     args.out.with_suffix(".f32").write_bytes(logits.astype("<f4").tobytes())
     if args.twin:
         global bf16
         rounded = bf16
         bf16 = lambda x: np.asarray(x, dtype=np.float32)  # noqa: E731
         m.forced = {l: m.routes[l] for l in routed}
-        twin = m.forward(ids)
+        twin = m.forward(ids, head_from)
         bf16 = rounded
         args.out.with_suffix(".twin.f32").write_bytes(twin.astype("<f4").tobytes())
         d = np.abs(twin - logits).max(axis=-1)
