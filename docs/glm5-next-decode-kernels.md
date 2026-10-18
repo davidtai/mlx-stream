@@ -1,7 +1,7 @@
 # GLM-5.3-Flash decode experts: the fused NVFP4 kernels
 
 GLM-5.3-Flash (`glm5_next`) has the same routed-expert shape as MiMo-V2.6-Flash: hidden 4096, intermediate 2048, top-8,
-SwiGLU. Its bank is NVFP4 instead of MXFP4 (see the pack format, [nvfp4-pack.md](nvfp4-pack.md)). This page
+SwiGLU. Its bank is NVFP4 instead of MXFP4 (see the pack format, `docs/glm5-next-pack.md` on `glm5next/pack`). This page
 covers the decode kernels that run those experts. They port MiMo's served decode family (the `k1` texts of
 `src/arch/mimo_v2/moe.zig`) to the NVFP4 bank, keeping MiMo's tiling and dispatch geometry. The page gives the dispatch
 contract a module installs them by.
