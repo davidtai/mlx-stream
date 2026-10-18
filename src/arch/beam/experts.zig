@@ -2,10 +2,12 @@
 //! the SDK stream over the shared NVFP4 bank (`mimo_v2/stream_source.For` over src/expert/nvfp4_bank.zig: the read pool,
 //! the event gates, the lookahead, P7's read schedule), the shared DeepSeek scheduler (`deepseek_v41_experts.ExpertsWith`:
 //! the decode lane and the wide prompt lane, the wide feed and P1's read-ahead), MiMo's expert math over the shared NVFP4
-//! format (`mimo_v2/math.MathOf(nvfp4_format.FormatOf(.{}))`: sorted NAX gathers per bank, the window bank view,
+//! format (`mimo_v2/math.MathOf(Format)`: sorted NAX gathers per bank, the window bank view,
 //! pipelined drains) and MiMo's prompt combine (`mimo_v2/prefill_combine`: the in-place text over the wide call's
-//! sources). Beam's first route has no fused decode texts: the decode lane runs MLX's gathers (`gather_qmm` nvfp4 with
-//! each slot's global scale) per bank. The activation is the f32 SwiGLU (`sdk_ext.quant.Activation.swiglu_f32`).
+//! sources). The decode lane takes the construction's route (`settings.DecodeMoe`): the fused qmv texts over the three
+//! banks at once (decode_kernels.zig, the shared scheduler's banked waves: one launch of gate/up and one of down per
+//! wave), or MLX's gathers (`gather_qmm` nvfp4 with each slot's global scale) per bank; the fused rows are the stock
+//! route's bit for bit. The activation is the f32 SwiGLU (`sdk_ext.quant.Activation.swiglu_f32`).
 //! A routed call's output is the weighted sum of its experts [nt, H] bf16 (the weights the router's normalized scores);
 //! the trunk multiplies it by `routed_scaling_factor`.
 
@@ -25,6 +27,7 @@ const prefill_combine = @import("../mimo_v2/prefill_combine.zig");
 const route = @import("../mimo_v2/route.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const nvfp4_format = @import("../../expert/nvfp4_format.zig");
+const decode_kernels = @import("decode_kernels.zig");
 const settings = @import("settings.zig");
 const log = sdk.log;
 
@@ -39,8 +42,9 @@ pub const top_k: u32 = 8;
 pub const max_experts: u32 = 256;
 /// The prompt pass's calls: at most this many rows each (MiMo's: the expert math's row scratch holds one call).
 pub const call_rows: u32 = 16_384;
-/// The NVFP4 format without fused decode texts (Beam's first route: the stock gathers).
-pub const Format = nvfp4_format.FormatOf(.{ .max_call_tokens = call_rows });
+/// The NVFP4 format with the fused qmv decode texts (installed under `decode_moe: fused`), prompt calls of at most
+/// `call_rows` rows.
+pub const Format = nvfp4_format.FormatOf(.{ .Fused = decode_kernels.FusedDecode, .max_call_tokens = call_rows });
 /// The bridge over the NVFP4 bank: its {w, scales, global_scale} slot bindings, its read pool's staging.
 pub const B = bridge.For(bank, .{ .Arrays = bank.Arrays, .staging_bytes = settings.reader_staging_bytes });
 pub const Stream = B.Stream;
@@ -54,11 +58,10 @@ pub const decode_lane_rows: u32 = Math.decode_forward_rows;
 comptime {
     if (Math.prefill_min_tokens != decode_lane_rows + 1) @compileError("beam: the scheduler's wide threshold is not the decode lane's bound");
     if (mimo_stream.decode_lane_route_ids != decode_lane_rows * top_k) @compileError("beam: decode's window 0 is not the decode lane's route");
-    if (Format.has_fused) @compileError("beam: the first route has no fused decode texts");
 }
 
 /// The experts' activation: (silu(f32(gate)) * f32(up)) rounded once to bf16 (BeamExperts `_apply_gate`).
-fn expertActivation(g: *ops.MlxOps, gate: T, up: T) anyerror!T {
+pub fn expertActivation(g: *ops.MlxOps, gate: T, up: T) anyerror!T {
     return sdk_ext.quant.activation(ops.MlxOps, g, .swiglu_f32, gate, up);
 }
 
@@ -100,7 +103,7 @@ pub const Source = struct {
     /// Construction (the GPU stream, under the caller's lock): the bank opened and checked against the model's routed
     /// experts (`want`), the stream at `rows`, the scheduler bound. `gates` holds every model layer's router (the dense
     /// layers' empty): the lookahead's predictor reads the next routed layer's stored F32 weight.
-    pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, want: bank.Topology, k: u32, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, keep_warm: gpu_warm.Route, tally: expert_tally.Settings, prompt_residents: settings.PromptResidents) !*Self {
+    pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, want: bank.Topology, k: u32, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, keep_warm: gpu_warm.Route, tally: expert_tally.Settings, prompt_residents: settings.PromptResidents, decode_moe: settings.DecodeMoe) !*Self {
         var owner = try bank.Bank.open(a, io, model_dir);
         errdefer owner.deinit();
         const geo = owner.geometry;
@@ -157,6 +160,15 @@ pub const Source = struct {
         math.bank_view = try Math.bankViewsOf(route.bank_view);
         // The lookahead's scores on the routers' stored F32 weights ([experts, hidden]: no copy).
         math.predictor = .{ .scores = route.scoresStored };
+        // The decode lane's route: the fused qmv texts installed here (the model's geometry against the set's, the set's
+        // compile self-check, the launches prepared per wave width), refused by name; the stock gathers otherwise.
+        if (decode_moe == .fused) {
+            var diag: sdk.Diag = .{};
+            math.fused = decode_kernels.FusedDecode.install(a, stream, geo.hidden_size, geo.intermediate_size, k, .swiglu_f32, &diag) catch |e| {
+                log.err("beam: the fused decode route refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
+                return e;
+            };
+        }
         self.combine_route = combineRouteOf(geo.hidden_size, k);
         switch (self.combine_route) {
             .inplace => self.combine_kernel = try prefill_combine.Kernel.initInplace(geo),
@@ -171,10 +183,13 @@ pub const Source = struct {
             .n_routed_experts = geo.num_experts,
             .n_experts_per_tok = k,
         };
-        self.ex = try Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true } });
+        self.ex = try Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true }, .banked = decode_moe == .fused });
         errdefer self.ex.deinit();
         if (self.combine_route == .inplace) self.ex.setJoinlessBound(prefill_combine.inplace_sources);
-        log.info("beam experts: NVFP4 g16 bank {d} x {d} records of {d} B (scale lines isolated, {d}-byte lines); decode_moe=stock (MLX's gather_qmm nvfp4 per bank); prompt_combine={s}; {s}\n", .{ geo.num_moe_layers, geo.num_experts, geo.record_bytes, bank.scale_line_bytes, @tagName(self.combine_route), expert_usage.promptResidentsLine("beam", prompt_residents) });
+        log.info("beam experts: NVFP4 g16 bank {d} x {d} records of {d} B (scale lines isolated, {d}-byte lines); decode_moe={s} ({s}); prompt_combine={s}; {s}\n", .{ geo.num_moe_layers, geo.num_experts, geo.record_bytes, bank.scale_line_bytes, @tagName(decode_moe), switch (decode_moe) {
+            .fused => "the qmv texts over the three banks, one launch of gate/up and one of down per wave",
+            .stock => "MLX's gather_qmm nvfp4 per bank",
+        }, @tagName(self.combine_route), expert_usage.promptResidentsLine("beam", prompt_residents) });
         try self.beginPrefill();
         return self;
     }

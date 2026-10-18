@@ -19,7 +19,10 @@ Code: `src/arch/beam/`.
 | `module.zig` | Construction and requests. |
 | `graph.zig` | The forward and the KV lanes. |
 | `experts.zig` | The expert source on MiMo's route. |
+| `decode_kernels.zig` | Beam's case of the fused NVFP4 decode texts (docs/nvfp4-decode-kernels.md). |
 | `parity.zig` | The parity test against `scripts/beam_reference_logits.py`. |
+| `decode_kernels_parity.zig` | The fused texts against the stock gathers on the slice's records, word for word. |
+| `decode_kernels_bench.zig` | The decode experts' bench: the stock gathers and the fused texts per routed layer. |
 
 ## The model
 
@@ -123,7 +126,13 @@ the bank view, the decode window, the prompt cache (2 GiB) and the decode cache 
 and its NVFP4 projection format are shared with glm5_next (`src/expert/nvfp4_bank.zig`,
 `src/expert/nvfp4_format.zig`).
 
-- Decode experts use MLX's `gather_qmm` in nvfp4 mode (`decode_moe: stock`). Beam has no fused NVFP4 decode texts.
+- Decode experts take the route `decode_moe` names, installed once at construction. `fused` (the default) installs
+  the qmv texts (`decode_kernels.zig`; docs/nvfp4-decode-kernels.md) and binds the shared scheduler's banked waves: one
+  launch of gate, up and the f32 SwiGLU, and one launch of down, per wave over the three slot banks. `stock` runs
+  MLX's `gather_qmm` in nvfp4 mode per bank, then the f32 SwiGLU as MLX ops. The texts compute each row in the order
+  of MLX's gather_qmv_fast, so the two routes give the same bits. The default resolves to `stock` where the texts are
+  not registered (a routed geometry other than 5,120 / 2,560 / top-8: the fixture) and on a CPU stream, with one log
+  line.
 - The prompt combine uses MiMo's in-place text when the hidden size is a multiple of 1,024 and the model routes 8
   experts a token. Otherwise it uses MiMo's stock reduction (a test pack).
 
@@ -141,9 +150,11 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 | `resident_seed`, `expert_usage_record`, `expert_usage_label` | the usage seed and record (sdk_ext/expert/usage.zig) | off |
 | `prompt_residents` | `keep`, `forget` | `keep` |
 | `gpu_keep_warm` | `waits`, `off` | `waits` on a GPU stream |
+| `decode_moe` | `fused`, `stock` | `fused` where registered, on a GPU stream |
 
 One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV quantization must be off
-(`BeamKvQuantUnsupported`).
+(`BeamKvQuantUnsupported`). `decode_moe: fused` named for a model where the texts are not registered refuses the load
+(`BeamDecodeMoeUnregistered`); named on a CPU stream it refuses at construction (`BeamDecodeMoeNeedsGpu`).
 
 ## The bill
 
@@ -160,6 +171,7 @@ One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV qua
 | `request`, `request_wiring` | The prompt wave at the widest call, the decode wave, and their wiring. |
 | `prompt_view` | The q8 tier only, prompt phase: the BF16 weights of the widest layer's projections (a dense layer: 838,860,800 B) and their wiring. |
 | `sampler`, `gpu_warm` | The plugin's sampler. MiMo's keep-warm engine when it is on. |
+| `decode_kernels` | The fused texts' set and prepared launches under `decode_moe: fused`: 16 MiB declared (glm5_next's value for the same set). |
 
 The fill gives the most decode rows and prompt rows that fit the host's ceiling less its wired margin. The floor is 8
 rows. On the 256 GB M5 Ultra (ceiling 240 GiB, margin 2 GiB, baseline 12.6 GB, context 32,768) the bill test prints
@@ -345,8 +357,6 @@ token change from run to run. At seed 4321 the two fills read about the same byt
 
 ## Not done
 
-- Fused NVFP4 decode texts at Beam's geometry. glm5_next's texts are checked against its own geometry. A Beam set
-  needs its own kernel manifest.
 - A Beam reading of the host runtime and the compiled kernels. The bill uses MiMo's declared values.
 - The lookahead selector's top-k is the bank's fixed 8 (`routed_top_k`). It only selects reads.
 - A profile build and the benchmark record.

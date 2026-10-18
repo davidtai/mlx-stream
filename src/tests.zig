@@ -70,6 +70,9 @@ comptime {
     _ = @import("arch/beam/module.zig");
     _ = @import("arch/beam/root.zig");
     _ = @import("arch/beam/parity.zig");
+    _ = @import("arch/beam/decode_kernels.zig");
+    _ = @import("arch/beam/decode_kernels_parity.zig");
+    _ = @import("arch/beam/decode_kernels_bench.zig");
     _ = @import("arch/deepseek_v41/deepseek_v41.zig");
     _ = @import("arch/deepseek_v41/ops.zig");
     _ = @import("arch/deepseek_v41/graph.zig");
