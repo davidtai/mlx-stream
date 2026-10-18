@@ -61,10 +61,12 @@ pub const texts = struct {
     pub const add_norm = @embedFile(dir ++ "glue_add_norm.metal");
     pub const header_combine = @embedFile(dir ++ "header_decode_glue_combine.metal");
     pub const combine = @embedFile(dir ++ "glue_moe_combine.metal");
+    pub const header_q8 = @embedFile(dir ++ "header_decode_glue_q8.metal");
+    pub const q8 = @embedFile(dir ++ "glue_q8_gemv.metal");
 };
 /// sha256 of manifest_beam.json (scripts/decode_glue_manifest.py prints it), which records every text's sha256 (checked
 /// against the pins by a CPU test).
-pub const manifest_sha256 = "d755fb32d63f8bab85fa1c7cd1d3027596fdda3ea0ffc01d97964d02a5d13636";
+pub const manifest_sha256 = "439d0923180468f6822b9cac3ad16a14562a59c71d572faeadbf685b9b9992e2";
 pub const text_pins = [_]kset.TextPin{
     .{ .file = "header_decode_glue.metal", .text = texts.header, .sha256 = "6bec0858b4e0754c74a4eee95560bd78f0942ecc092cc50d50bcc7840977e484" },
     .{ .file = "glue_router_gemv.metal", .text = texts.gemv, .sha256 = "1c82d26867b1c277adb2ca003200f6c05c3ecc396126b74ac571854b202bdcb7" },
@@ -73,6 +75,8 @@ pub const text_pins = [_]kset.TextPin{
     .{ .file = "glue_add_norm.metal", .text = texts.add_norm, .sha256 = "7802402dbccaa535d22b60265c0476f20cd55788572c45c7b5429d7bd836042d" },
     .{ .file = "header_decode_glue_combine.metal", .text = texts.header_combine, .sha256 = "c4761ee970f8a39a190f1d348e247e66c8ba2b112de9bfe4a267c6dcde992a67" },
     .{ .file = "glue_moe_combine.metal", .text = texts.combine, .sha256 = "836812cc11442c1494947afb502862303caf5a244c1dcb7fbd67a61e0914fb5d" },
+    .{ .file = "header_decode_glue_q8.metal", .text = texts.header_q8, .sha256 = "e4273595fa3f04409b6fd06d3ae0628f322181000fce9f75ef244dbaebb4d7d8" },
+    .{ .file = "glue_q8_gemv.metal", .text = texts.q8, .sha256 = "b1f432fda5cec73ab5a8d0e60606e51a5ae9f1aa9bb92cd28ea630ec1855bbd6" },
 };
 
 pub fn checkPins() !void {
@@ -526,7 +530,7 @@ const testing = std.testing;
 
 test "beam glue: the embedded manifest and texts are the pinned ones" {
     try checkPins();
-    try kset.expectManifestPins(texts.manifest, &text_pins, 5);
+    try kset.expectManifestPins(texts.manifest, &text_pins, 6);
 }
 
 test "beam glue: Beam 1.0's and the fixture's routers are the texts'; another is refused by name" {
@@ -613,7 +617,7 @@ test "beam glue: the manifest registers the instantiations the install builds (e
                 if (int(o, "D") == geo.hidden and int(o, "TPG") == normThreads(geo.hidden)) add_found = true;
             } else if (std.mem.eql(u8, kk.name, "glue_moe_combine")) {
                 if (int(o, "D") == geo.hidden and int(o, "K") == geo.top_k) combine_found[@intCast(int(o, "M") - 1)] = true;
-            } else return error.BeamGlueManifestKernel;
+            } else if (!std.mem.eql(u8, kk.name, "glue_q8_gemv")) return error.BeamGlueManifestKernel;
         };
         for (gemv_found) |f| try testing.expect(f);
         for (select_found) |f| try testing.expect(f);
@@ -947,6 +951,149 @@ test "beam glue GPU bench: a step's 49 routed combines, the stock join, combine 
         std.mem.sort(u64, &times, {}, std.sort.asc(u64));
         const med: f64 = @floatFromInt(times[times.len / 2]);
         std.debug.print("BEAM GLUE BENCH combine {s}: {d} layers in {d:.1} us (median of 12, graph build and encode included), {d:.2} us a layer\n", .{ if (text) "text" else "stock", layers, med / 1e3, med / 1e3 / layers });
+    }
+}
+
+/// The q8 GEMV text's launch (`glue_q8_gemv`) at `n` output rows of `k` columns: `rows` rows a simdgroup, `spt`
+/// simdgroups a threadgroup (MLX's affine_qmv_fast: 4 and 2), `pf` the next block's codes loaded first.
+pub const Q8Plan = struct { rows: u32, spt: u32, pf: bool };
+
+pub fn q8Kernel() !Kernel {
+    return newKernel("beam_glue_q8_gemv", &.{ "x", "w", "scales", "biases" }, &.{"y"}, texts.q8, texts.header ++ texts.header_q8);
+}
+
+pub fn q8Config(n: u32, k: u32, plan: Q8Plan) !Config {
+    const shape = [_]c_int{ 1, @intCast(n) };
+    const t = templateOf(&.{ "K", "ROWS", "SPT", "PF" }, .{ @intCast(k), @intCast(plan.rows), @intCast(plan.spt), @intFromBool(plan.pf) });
+    return kset.buildConfig(.{ .grid = .{ 32, n / plan.rows, 1 }, .threadgroup = .{ 32, plan.spt, 1 }, .out_shapes = &.{&shape}, .out_dtypes = &.{.bfloat16}, .template = &t });
+}
+
+/// The trunk's q8 shapes at Beam 1.0's geometry (N, K): the fused q / k / v / gate, o, the dense gate and up, the dense
+/// down, the head.
+const q8_shapes = [_][2]u32{ .{ 14336, 5120 }, .{ 5120, 6144 }, .{ 20480, 5120 }, .{ 5120, 20480 }, .{ 151936, 5120 } };
+const q8_plans = [_]Q8Plan{ .{ .rows = 4, .spt = 2, .pf = false }, .{ .rows = 4, .spt = 2, .pf = true }, .{ .rows = 8, .spt = 2, .pf = true }, .{ .rows = 8, .spt = 1, .pf = true }, .{ .rows = 4, .spt = 4, .pf = true }, .{ .rows = 2, .spt = 4, .pf = true }, .{ .rows = 8, .spt = 4, .pf = true }, .{ .rows = 2, .spt = 2, .pf = true } };
+
+fn q8Weights(a: std.mem.Allocator, g: *G, n: u32, k: u32, seed: u64) ![3]T {
+    const wt = try testBf16(a, g, &.{ @intCast(n), @intCast(k) }, 0.02, seed);
+    return ops.quantizeAffine(g, wt, 64, 8);
+}
+
+fn q8Apply(g: *G, kern: Kernel, cfg: Config, x: T, q: [3]T) !T {
+    var out: [1]T = undefined;
+    try apply(g, kern, cfg, &.{ x, q[0], q[1], q[2] }, &out);
+    return out[0];
+}
+
+test "beam glue GPU: the q8 GEMV text is MLX's affine qmv bit for bit (the trunk's five shapes, every plan)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    const kern = try q8Kernel();
+    defer mtl.mlx_fast_metal_kernel_free(kern);
+    var checked: usize = 0;
+    for (q8_shapes, 0..) |shape, si| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        // The head at 16,384 of its rows (its 151,936 are whole threadgroups of every plan too).
+        const n: u32 = if (shape[0] > 100_000) 16384 else shape[0];
+        const q = try q8Weights(a, &g, n, shape[1], 7000 + si);
+        try g.evalAll(&q);
+        for (0..3) |trial| {
+            const mt = g.mark();
+            defer g.resetTo(mt);
+            const x = if (trial == 2) try g.zeros(&.{ 1, @intCast(shape[1]) }, .bfloat16) else try testBf16(a, &g, &.{ 1, @intCast(shape[1]) }, if (trial == 1) 64.0 else 1.0, 7100 + si * 8 + trial);
+            const want = try g.quantizedMatmul(x, q[0], q[1], q[2], true, 8, 64, .affine);
+            for (q8_plans) |plan| {
+                const cfg = try q8Config(n, shape[1], plan);
+                defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+                try sameBytes(&g, "q8 gemv", want, try q8Apply(&g, kern, cfg, x, q), null);
+                checked += 1;
+            }
+        }
+    }
+    std.debug.print("BEAM GLUE q8 gemv: {d} launches over the trunk's 5 shapes x {d} plans bit-equal to MLX's affine_qmv_fast\n", .{ checked, q8_plans.len });
+}
+
+test "beam glue GPU bench: the trunk's q8 GEMVs, MLX's qmv against the text's plans (12 layers of distinct weights, dependent)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    const kern = try q8Kernel();
+    defer mtl.mlx_fast_metal_kernel_free(kern);
+    const layers = 12;
+    // Per shape pair: a layer's q / k / v / gate (14,336 x 5,120) then its o (5,120 x 6,144), or a dense layer's up
+    // (20,480 x 5,120) then its down (5,120 x 20,480); each layer's weights its own (past the caches), the chain
+    // dependent: the first product's leading K columns feed the second, the second's output the next layer's first.
+    const pairs = [_][2]usize{ .{ 0, 1 }, .{ 2, 3 } };
+    for (pairs) |pr| {
+        const n0 = q8_shapes[pr[0]][0];
+        const k0 = q8_shapes[pr[0]][1];
+        const n1 = q8_shapes[pr[1]][0];
+        const k1 = q8_shapes[pr[1]][1];
+        var w0: [layers][3]T = undefined;
+        var w1: [layers][3]T = undefined;
+        for (0..layers) |l| {
+            const q0 = try q8Weights(a, &g, n0, k0, 8000 + l);
+            const q1 = try q8Weights(a, &g, n1, k1, 8100 + l);
+            for (0..3) |i| {
+                w0[l][i] = g.keep(q0[i]);
+                w1[l][i] = g.keep(q1[i]);
+            }
+            try g.evalAll(&(w0[l] ++ w1[l]));
+            g.clearCache();
+        }
+        defer for (0..layers) |l| for (0..3) |i| {
+            g.release(w0[l][i]);
+            g.release(w1[l][i]);
+        };
+        const bytes: f64 = @floatFromInt(@as(u64, layers) * (n0 * k0 + n1 * k1) * 17 / 16);
+        // Plan index -1: MLX's quantized_matmul.
+        var p: i32 = -1;
+        while (p < q8_plans.len) : (p += 1) {
+            var cfgs: [2]Config = .{ .{ .ctx = null }, .{ .ctx = null } };
+            if (p >= 0) {
+                cfgs[0] = try q8Config(n0, k0, q8_plans[@intCast(p)]);
+                cfgs[1] = try q8Config(n1, k1, q8_plans[@intCast(p)]);
+            }
+            defer for (cfgs) |cfg| if (cfg.ctx != null) {
+                _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            };
+            var times: [9]u64 = undefined;
+            for (&times) |*tm| {
+                const m = g.mark();
+                defer g.resetTo(m);
+                var x = try testBf16(a, &g, &.{ 1, @intCast(k0) }, 1.0, 8200);
+                try g.evalAll(&.{x});
+                const t0 = std.Io.Timestamp.now(testing.io, .awake);
+                for (0..layers) |l| {
+                    const y0 = if (p < 0) try g.quantizedMatmul(x, w0[l][0], w0[l][1], w0[l][2], true, 8, 64, .affine) else try q8Apply(&g, kern, cfgs[0], x, w0[l]);
+                    // The second product's input: the first's leading k1 columns (every pair has n0 >= k1): a view for
+                    // MLX's op, the row itself for the text (it reads its first K values, as the served o reads the
+                    // attention's own output).
+                    std.debug.assert(n0 >= k1);
+                    const y1 = if (p < 0) try g.quantizedMatmul(try g.slice(y0, &.{ 0, 0 }, &.{ 1, @intCast(k1) }, &.{ 1, 1 }), w1[l][0], w1[l][1], w1[l][2], true, 8, 64, .affine) else try q8Apply(&g, kern, cfgs[1], y0, w1[l]);
+                    x = y1;
+                }
+                try g.evalAll(&.{x});
+                tm.* = @intCast(t0.untilNow(testing.io, .awake).nanoseconds);
+            }
+            std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+            const med: f64 = @floatFromInt(times[times.len / 2]);
+            if (p < 0) {
+                std.debug.print("BEAM GLUE BENCH q8 {d}x{d} + {d}x{d} MLX qmv: {d} layers in {d:.1} us (median of 9), {d:.0} GB/s\n", .{ n0, k0, n1, k1, layers, med / 1e3, bytes / med });
+            } else {
+                const pl = q8_plans[@intCast(p)];
+                std.debug.print("BEAM GLUE BENCH q8 {d}x{d} + {d}x{d} text rows={d} spt={d} pf={}: {d} layers in {d:.1} us (median of 9), {d:.0} GB/s\n", .{ n0, k0, n1, k1, pl.rows, pl.spt, pl.pf, layers, med / 1e3, bytes / med });
+            }
+        }
     }
 }
 
