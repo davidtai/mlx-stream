@@ -1998,9 +1998,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// persistent row (cold: its read-ahead admits records, and the drive bounds the prompt). A layer whose rows
             /// are all held (the usage seed's residents, a later call of a prompt) stages at its read-ahead (P6).
             pub fn stagesAhead(self: *const Stream, layer: u32) bool {
-                if (self.phase != .prefill or self.stage.rows.rows == 0 or layer >= self.layers.len) return false;
-                const pol = &self.layers[layer].policy;
-                return pol.occupancy < pol.capacity;
+                // diag/beam-prompt-nop1: P1 off, to time its cold cost (no layer stages ahead; P6 stays).
+                _ = self;
+                _ = layer;
+                return false;
             }
 
             /// P1: `stageAhead` of layer `layer` once the next prompt call (`planCall`) has posted its last read
