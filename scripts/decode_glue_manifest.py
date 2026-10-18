@@ -13,7 +13,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 KDIR = os.path.join(HERE, "..", "src", "kernels", "decode_glue")
 
-HEADERS = [("decode_glue", "header_decode_glue.metal")]
+HEADERS = [("decode_glue", "header_decode_glue.metal"), ("decode_glue_combine", "header_decode_glue_combine.metal")]
 # The decode lane's rows (beam experts.zig `decode_lane_rows`): the select text's launches at M = 1 .. 4.
 LANE_ROWS = 4
 
@@ -38,8 +38,8 @@ def select(instances):
 
 def qk_norm(instances):
     return {"name": "glue_qk_norm", "headers": ["decode_glue"], "template": ["HQ", "HK", "HD", "HPG", "MODE"],
-            "inputs": [arg("q", "bfloat16", [1, "HQ*HD"]), arg("k", "bfloat16", [1, "HK*HD"]), arg("qw", "bfloat16", ["HD"]),
-                       arg("kw", "bfloat16", ["HD"]), arg("consts", "float32", [8])],
+            "inputs": [arg("qk", "bfloat16", [1, "N>=(HQ+HK)*HD"]), arg("qw", "bfloat16", ["HD"]), arg("kw", "bfloat16", ["HD"]),
+                       arg("consts", "float32", [8])],
             "outputs": [arg("qo", "bfloat16", [1, "HQ", 1, "HD"]), arg("ko", "bfloat16", [1, "HK", 1, "HD"])],
             "grid": ["32*HPG*ceil((HQ+HK)/HPG)", 1, 1], "threadgroup": ["32*HPG", 1, 1], "instances": instances}
 
@@ -52,8 +52,18 @@ def add_norm(instances):
             "threadgroup": ["TPG", 1, 1], "instances": instances}
 
 
+def combine(instances):
+    return {"name": "glue_moe_combine", "headers": ["decode_glue_combine"], "template": ["D", "K", "M"],
+            "inputs": [arg("rows", "bfloat16", ["R", "D"]), arg("order", "uint32", ["M*K"]), arg("w", "float32", ["M", "K"]),
+                       arg("consts", "float32", [8])],
+            "outputs": [arg("y", "bfloat16", ["M", "D"])], "grid": ["D", "M", 1], "threadgroup": ["min(D,COMBINE_THREADS)", 1, 1],
+            "instances": instances}
+
+
 # The q / k norm text's heads a threadgroup (beam glue.zig `heads_per_group`).
 HEADS_PER_GROUP = 8
+# The combine text's columns a threadgroup (beam glue.zig `combine_threads`).
+COMBINE_THREADS = 256
 
 
 def norm_threads(d):
@@ -64,12 +74,13 @@ def norm_threads(d):
 def routed(d, e, g, tg, k, rows_per_group, hq, hk, hd):
     """One model's instantiations: the router's product and the predictor's at M = 1 (each `rows_per_group` rows of the
     weight a threadgroup), the select text at every decode-lane width, the q / k norm text on a sliding layer (MODE 0)
-    and a full one (MODE 1), the boundary text at MLX's rms threadgroup."""
+    and a full one (MODE 1), the boundary text at MLX's rms threadgroup, the combine at every decode-lane width."""
     gv = [{"D": d, "E": e, "M": 1, "R": r, "EPI": epi} for r in rows_per_group for epi in (0, 1)]
     sv = [{"E": e, "G": g, "TG": tg, "K": k, "M": m} for m in range(1, LANE_ROWS + 1)]
     qv = [{"HQ": hq, "HK": hk, "HD": hd, "HPG": HEADS_PER_GROUP, "MODE": mode} for mode in (0, 1)]
     av = [{"D": d, "TPG": norm_threads(d)}]
-    return gv, sv, qv, av
+    cv = [{"D": d, "K": k, "M": m} for m in range(1, LANE_ROWS + 1)]
+    return gv, sv, qv, av, cv
 
 
 # Beam 1.0 (hidden 5,120; 256 experts in 8 groups, 4 kept, top-8; 48 / 8 heads of 128) and the converter's fixture
@@ -84,13 +95,14 @@ def text(file):
 
 
 def build(case):
-    gv = [i for g, _, _, _ in CASES[case] for i in g]
-    sv = [i for _, s, _, _ in CASES[case] for i in s]
-    qv = [i for _, _, q, _ in CASES[case] for i in q]
-    av = [i for _, _, _, x in CASES[case] for i in x]
+    gv = [i for g, _, _, _, _ in CASES[case] for i in g]
+    sv = [i for _, s, _, _, _ in CASES[case] for i in s]
+    qv = [i for _, _, q, _, _ in CASES[case] for i in q]
+    av = [i for _, _, _, x, _ in CASES[case] for i in x]
+    cv = [i for _, _, _, _, x in CASES[case] for i in x]
     m = {"format": "mlx-stream-decode-glue-kernels-v1", "case": case, "headers": [dict(id=i, **text(f)) for i, f in HEADERS],
          "kernels": []}
-    for k in (gemv(gv), select(sv), qk_norm(qv), add_norm(av)):
+    for k in (gemv(gv), select(sv), qk_norm(qv), add_norm(av), combine(cv)):
         m["kernels"].append(dict(k, source=text(k["name"] + ".metal")))
     return (json.dumps(m, separators=(",", ":"), sort_keys=True) + "\n").encode()
 

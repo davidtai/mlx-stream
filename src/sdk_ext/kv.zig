@@ -1,6 +1,8 @@
 //! The KV seam (R/mlx-stream/kv-seam-20261002.md): the lane storage a module-owned arch builds its decode state
 //! from, generic over the arch's op backend `G` (`T`, `shapeOf`, `dtypeOf`, `keep`, `release`, `zeros`,
-//! `hostArray`, `sliceUpdateDyn`, `slice`, `concat`). The lanes hold rows; they never compute attention. The route
+//! `hostArray`, `sliceUpdateDyn`, `slice`, `concat`; a backend with `sliceUpdateRow` whose `staticRows()` is true writes
+//! each row with it instead: MLX's static slice update, one copy kernel where the dynamic update adds an offset kernel).
+//! The lanes hold rows; they never compute attention. The route
 //! is picked once at state construction and never changes during a request; a bounded lane is allocated once at
 //! its cap and an append past it is refused by name before anything is written. No per-forward mark: `trim` is the
 //! only in-request rewind.
@@ -137,8 +139,10 @@ pub fn Lanes(comptime G: type) type {
             return g.slice(x, start[0..s.n], stop[0..s.n], strides[0..s.n]);
         }
 
-        /// `mx.slice_update(buf, new, mx.array([0, row, 0..], int32), axes=all)`.
+        /// `mx.slice_update(buf, new, mx.array([0, row, 0..], int32), axes=all)`; the same bytes at the same place through
+        /// the backend's static slice update when it has one and `staticRows()` says so.
         fn write(g: *G, buf: T, new: T, row: u32) !T {
+            if (comptime @hasDecl(G, "sliceUpdateRow")) if (g.staticRows()) return g.sliceUpdateRow(buf, new, row);
             const n = g.shapeOf(new).n;
             var starts: [max_dims]i32 = @splat(0);
             starts[1] = @intCast(row);

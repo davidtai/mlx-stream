@@ -346,6 +346,10 @@ pub const RingOps = struct {
     s: Stream,
     temps: [max_temps]Array = undefined,
     n: usize = 0,
+    /// The lanes' row writes: MLX's dynamic slice update (false: the SDK's `write` as MiMo runs it), or its static one
+    /// (`sliceUpdateRow`: one copy kernel an append, the dynamic update's offset kernel gone; the same bytes at the same
+    /// place). The ring's own setting (`SlidingRing.static_rows`).
+    static_rows: bool = false,
 
     pub const Shape = struct {
         n: u8 = 0,
@@ -435,6 +439,22 @@ pub const RingOps = struct {
         return g.track(out);
     }
 
+    pub fn staticRows(g: *const RingOps) bool {
+        return g.static_rows;
+    }
+
+    /// `update` (native [1, H, n, D]) written at presented row `row` (MiMo's time axis 2) by MLX's static slice update
+    /// (the donated slot and one copy kernel).
+    pub fn sliceUpdateRow(g: *RingOps, src: Array, update: Array, row: u32) !Array {
+        const sh = mlx.getShape(update);
+        std.debug.assert(sh.len == 4);
+        const r: c_int = @intCast(row);
+        var out: Array = .{};
+        errdefer drop(out);
+        try mlx.check(mlx.mlx_slice_update(&out, src, update, &.{ 0, 0, r, 0 }, 4, &.{ sh[0], sh[1], r + sh[2], sh[3] }, 4, &.{ 1, 1, 1, 1 }, 4, g.s));
+        return g.track(out);
+    }
+
     pub fn concat(g: *RingOps, xs: []const Array, axis: c_int) !Array {
         const native: c_int = switch (axis) {
             1 => 2,
@@ -459,6 +479,8 @@ pub const SlidingRing = struct {
     k: Lane = empty,
     v: Lane = empty,
     s: Stream = .{},
+    /// The appends' row writes (`RingOps.static_rows`): false for MiMo and the drafter, true for Beam's decode lanes.
+    static_rows: bool = false,
 
     /// Construction: both slots of both lanes at the ring base (lazy zeros,
     /// materialized by the first write that reaches each slot).
@@ -514,7 +536,7 @@ pub const SlidingRing = struct {
         const s = r.s;
         const pos = r.k.logicalLen();
         {
-            var g: RingOps = .{ .s = s };
+            var g: RingOps = .{ .s = s, .static_rows = r.static_rows };
             defer g.reset();
             try r.k.append(&g, k);
             try r.v.append(&g, v);

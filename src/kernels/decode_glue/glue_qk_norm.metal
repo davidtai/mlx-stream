@@ -4,10 +4,11 @@
 // simd_sum as it is), then on a sliding layer (MODE 0) RoPE on both (MLX's rope_single, rotate-half, scale 1:
 // d = i / (HD / 2), inv_freq = exp2(-d * log2(base)), theta = position * inv_freq, fast cos and sin, x1 cos - x2 sin and
 // x1 sin + x2 cos in f32 by the pair's thread, bf16 once), or on a full layer (MODE 1) the query's scale
-// (bf16(f32(q) * s): graph.zig ScaleBy's product) and the key as normed. q [1, HQ * HD], k [1, HK * HD] bf16 (the fused
-// projections' row views), qw, kw [HD] bf16, consts [8] f32 (0: log2 of RoPE's base, 1: the full layer's query scale,
-// 2: eps, 3: the position) -> qo [1, HQ, 1, HD], ko [1, HK, 1, HD] bf16. One simdgroup a head (lane l holds the head's
-// elements 4 l .. 4 l + 3, as MLX's thread l), HPG heads a threadgroup.
+// (bf16(f32(q) * s): graph.zig ScaleBy's product) and the key as normed. qk [1, N] bf16 (the fused projections' row,
+// N >= (HQ + HK) * HD: the query heads, then the key heads, read in place: a row view of it would be copied before the
+// launch), qw, kw [HD] bf16, consts [8] f32 (0: log2 of RoPE's base, 1: the full layer's query scale, 2: eps, 3: the
+// position) -> qo [1, HQ, 1, HD], ko [1, HK, 1, HD] bf16. One simdgroup a head (lane l holds the head's elements
+// 4 l .. 4 l + 3, as MLX's thread l), HPG heads a threadgroup.
 constexpr int LANES = HD / 4;
 constexpr int HALF = LANES / 2;
 const uint sg = simdgroup_index_in_threadgroup;
@@ -16,7 +17,7 @@ const int h = int(threadgroup_position_in_grid.x) * HPG + int(sg);
 if (h < HQ + HK) {
   const bool is_q = h < HQ;
   const bool live = int(lane) < LANES;
-  const device bfloat16_t* xin = is_q ? q + size_t(h) * HD : k + size_t(h - HQ) * HD;
+  const device bfloat16_t* xin = qk + size_t(h) * HD;
   const device bfloat16_t* w = is_q ? qw : kw;
   float thread_x[4];
   float acc = 0;

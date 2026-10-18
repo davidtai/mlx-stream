@@ -9,12 +9,15 @@
 //!   - `glue_qk_norm`: a decode row's query and key heads normed (q_norm, k_norm), then RoPE on a sliding layer, or the
 //!     query's scale on a full layer (graph.zig `qkStock`: two norms and two ropes, or two norms and a scale);
 //!   - `glue_add_norm`: a decode row's sublayer boundary (graph.zig `boundaryStock`: the sublayer's norm, the
-//!     depth-scaled add, the next sublayer's norm).
+//!     depth-scaled add, the next sublayer's norm);
+//!   - `glue_moe_combine`: a decode-lane call's routed combine with the scheduler's join folded in and the routed scale
+//!     (the join's take, route.zig `combineStock`'s cast, product, sum and cast, graph.zig ScaleBy: six launches), the
+//!     routed rows read in place through the join's order.
 //! Stock: the router is the input cast, the GEMV and 17 ops (sigmoid, add, the groups' topk and sum, negation,
 //! argpartition, the group ids, equal, sum, greater, where, negation, argpartition, take_along_axis, sum, add, divide);
-//! the predictor is the cast, the GEMV, sigmoid and add. Exact: the ids, the weights, the predictor's scores and the
-//! normed heads are the stock route's bit for bit (`install`'s self-check over the model's own tables; the device tests
-//! `beam glue GPU`). At M > 1 the router's product stays MLX's matmul (MLX routes [M > 1, D] x [D, E] f32 to its GEMM: reproduced
+//! the predictor is the cast, the GEMV, sigmoid and add. Exact: the ids, the weights, the predictor's scores, the
+//! normed heads and the combined rows are the stock route's bit for bit (`install`'s self-check over the model's own
+//! tables; the device tests `beam glue GPU`). At M > 1 the router's product stays MLX's matmul (MLX routes [M > 1, D] x [D, E] f32 to its GEMM: reproduced
 //! only by running it) and the select text takes its logits; the predictor keeps the stock route there. Installed once
 //! at construction (the geometry refused by name, the kernel objects, the launch configurations per decode-lane width,
 //! the self-check); the forward then dispatches with no per-call config work.
@@ -42,6 +45,8 @@ pub const rows_per_group: u32 = 2;
 pub const gemv_threads: u32 = 256;
 /// The q / k norm text's heads a threadgroup (one simdgroup a head).
 pub const heads_per_group: u32 = 8;
+/// The combine text's columns a threadgroup (one thread a column of a row; a narrower model takes one threadgroup).
+pub const combine_threads: u32 = 256;
 
 // ── the texts and their pins (src/kernels/decode_glue/manifest_beam.json) ──
 
@@ -54,16 +59,20 @@ pub const texts = struct {
     pub const select = @embedFile(dir ++ "glue_router_select.metal");
     pub const qk = @embedFile(dir ++ "glue_qk_norm.metal");
     pub const add_norm = @embedFile(dir ++ "glue_add_norm.metal");
+    pub const header_combine = @embedFile(dir ++ "header_decode_glue_combine.metal");
+    pub const combine = @embedFile(dir ++ "glue_moe_combine.metal");
 };
 /// sha256 of manifest_beam.json (scripts/decode_glue_manifest.py prints it), which records every text's sha256 (checked
 /// against the pins by a CPU test).
-pub const manifest_sha256 = "668af11732c2705238a6057f79f69e38454d481127e3b15f61fc00249faa28e3";
+pub const manifest_sha256 = "d755fb32d63f8bab85fa1c7cd1d3027596fdda3ea0ffc01d97964d02a5d13636";
 pub const text_pins = [_]kset.TextPin{
     .{ .file = "header_decode_glue.metal", .text = texts.header, .sha256 = "6bec0858b4e0754c74a4eee95560bd78f0942ecc092cc50d50bcc7840977e484" },
     .{ .file = "glue_router_gemv.metal", .text = texts.gemv, .sha256 = "1c82d26867b1c277adb2ca003200f6c05c3ecc396126b74ac571854b202bdcb7" },
     .{ .file = "glue_router_select.metal", .text = texts.select, .sha256 = "5a7369ad5c53e6eb5b08013219ad7731cfa797863599d9be8f2c2e4715bf47f6" },
-    .{ .file = "glue_qk_norm.metal", .text = texts.qk, .sha256 = "4118ee77c24b91bf6386e0bb28e84df8aeec27a87064387d29609339891c1067" },
+    .{ .file = "glue_qk_norm.metal", .text = texts.qk, .sha256 = "998421219baf1c0f93371655ae43517bb608061cd35eaacda59f1255932afd3a" },
     .{ .file = "glue_add_norm.metal", .text = texts.add_norm, .sha256 = "7802402dbccaa535d22b60265c0476f20cd55788572c45c7b5429d7bd836042d" },
+    .{ .file = "header_decode_glue_combine.metal", .text = texts.header_combine, .sha256 = "c4761ee970f8a39a190f1d348e247e66c8ba2b112de9bfe4a267c6dcde992a67" },
+    .{ .file = "glue_moe_combine.metal", .text = texts.combine, .sha256 = "836812cc11442c1494947afb502862303caf5a244c1dcb7fbd67a61e0914fb5d" },
 };
 
 pub fn checkPins() !void {
@@ -106,6 +115,11 @@ pub const Kernels = struct {
     qk_cfg: [2]Config = @splat(.{ .ctx = null }),
     add_norm: Kernel = .{ .ctx = null },
     add_norm_cfg: Config = .{ .ctx = null },
+    combine: Kernel = .{ .ctx = null },
+    /// Index M - 1: the combine text at a decode-lane call of M rows.
+    combine_cfg: [max_rows]Config = @splat(.{ .ctx = null }),
+    /// f32 [8]: the routed scale (graph.zig ScaleBy's factor, `routed_scaling_factor`), then zeros.
+    combine_consts: T = .{ .ctx = null },
     /// The GEMV at M = 1: the router's logits (EPI 0) and the predictor's scores (EPI 1).
     route_cfg: Config = .{ .ctx = null },
     pred_cfg: Config = .{ .ctx = null },
@@ -122,13 +136,15 @@ pub const Kernels = struct {
     eps: f32 = 0,
 
     pub fn deinit(k: *Kernels) void {
-        for ([_]Kernel{ k.gemv, k.select, k.qk, k.add_norm }) |x| if (x.ctx != null) {
+        for ([_]Kernel{ k.gemv, k.select, k.qk, k.add_norm, k.combine }) |x| if (x.ctx != null) {
             mtl.mlx_fast_metal_kernel_free(x);
         };
-        for ([_]Config{ k.route_cfg, k.pred_cfg, k.add_norm_cfg } ++ k.select_cfg ++ k.qk_cfg) |cfg| if (cfg.ctx != null) {
+        for ([_]Config{ k.route_cfg, k.pred_cfg, k.add_norm_cfg } ++ k.select_cfg ++ k.qk_cfg ++ k.combine_cfg) |cfg| if (cfg.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         };
-        if (k.consts.ctx != null) _ = mlx.mlx_array_free(k.consts);
+        for ([_]T{ k.consts, k.combine_consts }) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
         k.* = .{};
     }
 
@@ -167,6 +183,11 @@ pub const Launch = struct {
         const t = normThreads(hidden);
         return .{ .grid = .{ t, 1, 1 }, .group = .{ t, 1, 1 } };
     }
+
+    /// The combine text: a thread per column of each of the call's `rows` rows, `combine_threads` columns a threadgroup.
+    pub fn combine(hidden: u32, rows: u32) Launch {
+        return .{ .grid = .{ hidden, rows, 1 }, .group = .{ @min(hidden, combine_threads), 1, 1 } };
+    }
 };
 
 /// MLX's rms threadgroup at width `d` (normalization.cpp RMSNorm::eval_gpu): rms_looped's 1,024 threads past
@@ -175,9 +196,9 @@ pub fn normThreads(d: u32) u32 {
     return if (d > 4096) 1024 else 32 * ((d + 127) / 128);
 }
 
-fn newKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8) !Kernel {
+fn newKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8, header: [:0]const u8) !Kernel {
     // The inputs are the forward's fresh row-major rows and the residents (a view would be copied: ensure_row_contiguous).
-    return kset.newKernel(name, ins, outs, source.ptr, texts.header.ptr, true) orelse error.BeamGlueKernel;
+    return kset.newKernel(name, ins, outs, source.ptr, header.ptr, true) orelse error.BeamGlueKernel;
 }
 
 fn templateOf(comptime names: []const [:0]const u8, values: [names.len]i32) [names.len]kset.TemplateArg {
@@ -206,6 +227,13 @@ fn addNormConfig(geo: Geometry) !Config {
     const shape = [_]c_int{ 1, @intCast(geo.hidden) };
     const t = templateOf(&.{ "D", "TPG" }, .{ @intCast(geo.hidden), @intCast(normThreads(geo.hidden)) });
     return kset.buildConfig(.{ .grid = l.grid, .threadgroup = l.group, .out_shapes = &.{ &shape, &shape }, .out_dtypes = &.{ .bfloat16, .bfloat16 }, .template = &t });
+}
+
+fn combineConfig(geo: Geometry, rows: u32) !Config {
+    const l = Launch.combine(geo.hidden, rows);
+    const shape = [_]c_int{ @intCast(rows), @intCast(geo.hidden) };
+    const t = templateOf(&.{ "D", "K", "M" }, .{ @intCast(geo.hidden), @intCast(geo.top_k), @intCast(rows) });
+    return kset.buildConfig(.{ .grid = l.grid, .threadgroup = l.group, .out_shapes = &.{&shape}, .out_dtypes = &.{.bfloat16}, .template = &t });
 }
 
 fn selectConfig(geo: Geometry, rows: u32) !Config {
@@ -238,19 +266,24 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const beam.Config, t
     const geo = geometryOf(c);
     var k: Kernels = .{ .hidden = geo.hidden, .experts = geo.experts, .top_k = geo.top_k, .rope_log2 = log2f(c.rope_theta), .eps = c.rms_norm_eps };
     errdefer k.deinit();
-    k.gemv = try newKernel("beam_glue_router_gemv", &.{ "x", "w", "bias" }, &.{"out"}, texts.gemv);
-    k.select = try newKernel("beam_glue_router_select", &.{ "logits", "bias", "consts" }, &.{ "ids", "weights" }, texts.select);
-    k.qk = try newKernel("beam_glue_qk_norm", &.{ "q", "k", "qw", "kw", "consts" }, &.{ "qo", "ko" }, texts.qk);
-    k.add_norm = try newKernel("beam_glue_add_norm", &.{ "y", "r", "w1", "w2", "consts" }, &.{ "res", "out" }, texts.add_norm);
+    k.gemv = try newKernel("beam_glue_router_gemv", &.{ "x", "w", "bias" }, &.{"out"}, texts.gemv, texts.header);
+    k.select = try newKernel("beam_glue_router_select", &.{ "logits", "bias", "consts" }, &.{ "ids", "weights" }, texts.select, texts.header);
+    k.qk = try newKernel("beam_glue_qk_norm", &.{ "qk", "qw", "kw", "consts" }, &.{ "qo", "ko" }, texts.qk, texts.header);
+    k.add_norm = try newKernel("beam_glue_add_norm", &.{ "y", "r", "w1", "w2", "consts" }, &.{ "res", "out" }, texts.add_norm, texts.header);
+    k.combine = try newKernel("beam_glue_moe_combine", &.{ "rows", "order", "w", "consts" }, &.{"y"}, texts.combine, texts.header_combine);
     k.add_norm_cfg = try addNormConfig(geo);
     k.route_cfg = try gemvConfig(geo, 0);
     k.pred_cfg = try gemvConfig(geo, 1);
     for (&k.select_cfg, 1..) |*cfg, m| cfg.* = try selectConfig(geo, @intCast(m));
+    for (&k.combine_cfg, 1..) |*cfg, m| cfg.* = try combineConfig(geo, @intCast(m));
     for (&k.qk_cfg, 0..) |*cfg, mode| cfg.* = try qkConfig(geo, @intCast(mode));
     var cv: [8]f32 = @splat(0);
     cv[0] = 1;
     k.consts = mlx.mlx_array_new_data(&cv, &[_]c_int{8}, 1, .float32);
     if (k.consts.ctx == null) return error.MlxError;
+    cv[0] = c.routed_scaling;
+    k.combine_consts = mlx.mlx_array_new_data(&cv, &[_]c_int{8}, 1, .float32);
+    if (k.combine_consts.ctx == null) return error.MlxError;
     selfCheck(a, s, c, &k, tables, diag) catch |err| {
         // A differing array names itself; any other failure is MLX's (a Metal compile error names the line).
         if (err != error.BeamGlueCheck) {
@@ -301,11 +334,13 @@ extern "c" fn log2f(x: f32) f32;
 
 pub const Heads = struct { q: T, k: T };
 
-/// A decode row's normed query and key heads: q [1, heads * head_dim], k [1, kv_heads * head_dim] bf16 (the fused
-/// projections' row views), the layer's q_norm and k_norm [head_dim] bf16, at position `pos` -> q [1, heads, 1,
-/// head_dim], k [1, kv_heads, 1, head_dim] bf16: roped on a sliding layer, the query times `scale` (the full layer's
-/// query scale, graph.zig `ssmaxAt`) on a full layer. One dispatch (graph.zig `qkStock`'s four or three).
-pub fn qkNorm(g: *G, k: *const Kernels, q: T, kk: T, q_norm: T, k_norm: T, pos: u32, full: bool, scale: f32) !Heads {
+/// A decode row's normed query and key heads: `qk` bf16 [1, n] the fused projections' row as the GEMV wrote it (its
+/// first heads * head_dim columns the query, the next kv_heads * head_dim the key: graph.zig `fuseProjections`; the text
+/// reads them in place, as a row view of the GEMV's buffer would be copied first), the layer's q_norm and k_norm
+/// [head_dim] bf16, at position `pos` -> q [1, heads, 1, head_dim], k [1, kv_heads, 1, head_dim] bf16: roped on a
+/// sliding layer, the query times `scale` (the full layer's query scale, graph.zig `ssmaxAt`) on a full layer. One
+/// dispatch (graph.zig `qkStock`'s four or three, and the two copies of the row views it would read).
+pub fn qkNorm(g: *G, k: *const Kernels, qk: T, q_norm: T, k_norm: T, pos: u32, full: bool, scale: f32) !Heads {
     var cv: [8]f32 = @splat(0);
     cv[0] = k.rope_log2;
     cv[1] = scale;
@@ -313,7 +348,7 @@ pub fn qkNorm(g: *G, k: *const Kernels, q: T, kk: T, q_norm: T, k_norm: T, pos: 
     cv[3] = @floatFromInt(pos);
     const consts = try g.hostArray(std.mem.sliceAsBytes(&cv), &.{8}, .float32);
     var out: [2]T = undefined;
-    try apply(g, k.qk, k.qk_cfg[@intFromBool(full)], &.{ q, kk, q_norm, k_norm, consts }, &out);
+    try apply(g, k.qk, k.qk_cfg[@intFromBool(full)], &.{ qk, q_norm, k_norm, consts }, &out);
     return .{ .q = out[0], .k = out[1] };
 }
 
@@ -339,6 +374,26 @@ pub fn addNorm(g: *G, k: *const Kernels, y: T, r: T, w1: T, w2: T, i: u32) !Boun
     var out: [2]T = undefined;
     try apply(g, k.add_norm, k.add_norm_cfg, &.{ y, r, w1, w2, consts }, &out);
     return .{ .res = out[0], .out = out[1] };
+}
+
+/// A decode-lane call's routed output: `rows` bf16 [R, hidden] (the call's concatenated outputs: the scheduler's
+/// `routedHoistIndexed`), `order` u32 [rows * top_k] (each routed position's row in them, the join's order), `weights` f32
+/// [rows, top_k] (the router's) -> bf16 [rows, hidden]: the score-weighted sum of the routed rows in router order, times
+/// the routed scale (graph.zig ScaleBy), one dispatch (the join's take, route.zig `combineStock`'s four and the scale's).
+pub fn combineRows(g: *G, k: *const Kernels, rows: T, order: T, weights: T, n: u32) !T {
+    std.debug.assert(n >= 1 and n <= max_rows);
+    var out: [1]T = undefined;
+    try apply(g, k.combine, k.combine_cfg[n - 1], &.{ rows, order, weights, k.combine_consts }, &out);
+    return out[0];
+}
+
+/// `combineRows`' stock route (the device tests' control and the self-check's): the join's take of `rows` by `order`,
+/// route.zig `combineStock` (f32 cast, the product with the weights, the axis-1 sum, bf16), then graph.zig ScaleBy's
+/// chain (bf16(f32(.) * scale)).
+pub fn combineStockRows(g: *G, c: *const beam.Config, rows: T, order: T, weights: T, n: u32) !T {
+    const graph = @import("graph.zig");
+    const joined = try g.reshape(try g.take(rows, order, 0), &.{ @intCast(n), @intCast(c.n_experts_per_tok), @intCast(c.hidden_size) });
+    return graph.scaleBy(g, try route.combineStock(g, joined, weights, c.n_experts_per_tok), try g.scalar(c.routed_scaling, .float32));
 }
 
 // ── the self-check (construction, once) ──
@@ -428,12 +483,13 @@ pub fn selfCheck(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const beam.Config,
     // position inside the first window and one far past it.
     const qn: c_int = @intCast(c.n_heads * c.head_dim);
     const kn: c_int = @intCast(c.n_kv_heads * c.head_dim);
-    const row = try checkRow(&g, a, @intCast(qn + kn));
+    // The fused projections' row: q and k at its head, then v and the gate (the text reads only the first two).
+    const row = try checkRow(&g, a, @intCast(2 * qn + 2 * kn));
     const q = try g.slice(row, &.{ 0, 0 }, &.{ 1, qn }, &.{ 1, 1 });
     const kk = try g.slice(row, &.{ 0, qn }, &.{ 1, qn + kn }, &.{ 1, 1 });
     for ([_]u32{ 300, 16_957 }) |pos| for ([_]bool{ false, true }) |full| {
         const want = try graph.qkStock(&g, c, t.q_norm, t.k_norm, q, kk, 1, pos, full);
-        const got = try qkNorm(&g, k, q, kk, t.q_norm, t.k_norm, pos, full, graph.ssmaxAt(pos));
+        const got = try qkNorm(&g, k, row, t.q_norm, t.k_norm, pos, full, graph.ssmaxAt(pos));
         try sameBytes(&g, if (full) "the full layer's query heads" else "the sliding layer's query heads", want.q, got.q, diag);
         try sameBytes(&g, if (full) "the full layer's key heads" else "the sliding layer's key heads", want.k, got.k, diag);
     };
@@ -446,13 +502,31 @@ pub fn selfCheck(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const beam.Config,
         try sameBytes(&g, "the boundary's residual", want.res, got.res, diag);
         try sameBytes(&g, "the boundary's normed row", want.out, got.out, diag);
     }
+    // The combine at every decode-lane width over six fixed rows (a device wave's four and two miss rows that replace
+    // two of its positions, as the scheduler's join orders them).
+    const kk_n = c.n_experts_per_tok;
+    const wave = try g.reshape(try checkRow(&g, a, 6 * c.hidden_size), &.{ 6, @intCast(c.hidden_size) });
+    for (1..max_rows + 1) |m| {
+        const ms = g.mark();
+        defer g.resetTo(ms);
+        const n: u32 = @intCast(m);
+        var ord: [max_rows * @import("experts.zig").top_k]u32 = undefined;
+        var wv: [max_rows * @import("experts.zig").top_k]f32 = undefined;
+        for (0..n * kk_n) |pi| {
+            ord[pi] = if (pi == 1) 4 else if (pi == 2) 5 else @intCast(pi % 4);
+            wv[pi] = 1.0 / @as(f32, @floatFromInt(kk_n)) + @as(f32, @floatFromInt(pi % 3)) * 0.0625 - 0.0625;
+        }
+        const order = try g.hostArray(std.mem.sliceAsBytes(ord[0 .. n * kk_n]), &.{@intCast(n * kk_n)}, .uint32);
+        const weights = try g.hostArray(std.mem.sliceAsBytes(wv[0 .. n * kk_n]), &.{ @intCast(n), @intCast(kk_n) }, .float32);
+        try sameBytes(&g, "the combined routed rows", try combineStockRows(&g, c, wave, order, weights, n), try combineRows(&g, k, wave, order, weights, n), diag);
+    }
 }
 
 const testing = std.testing;
 
 test "beam glue: the embedded manifest and texts are the pinned ones" {
     try checkPins();
-    try kset.expectManifestPins(texts.manifest, &text_pins, 4);
+    try kset.expectManifestPins(texts.manifest, &text_pins, 5);
 }
 
 test "beam glue: Beam 1.0's and the fixture's routers are the texts'; another is refused by name" {
@@ -498,6 +572,13 @@ test "beam glue: the launch geometry (the GEMV's experts / R threadgroups of 256
     // The depth scales of sublayer 2: 1 / sqrt(2) and sqrt(1 / 2), the same f32.
     const sc = depthScales(2);
     try testing.expectEqual(sc[0], sc[1]);
+    // The combine: a thread a column of each row, 20 threadgroups of 256 at 5,120; the fixture's 256 in one.
+    for (1..max_rows + 1) |m| {
+        const cb = Launch.combine(5120, @intCast(m));
+        try testing.expectEqual([3]u32{ 5120, @intCast(m), 1 }, cb.grid);
+        try testing.expectEqual([3]u32{ 256, 1, 1 }, cb.group);
+    }
+    try testing.expectEqual([3]u32{ 256, 1, 1 }, Launch.combine(256, 1).group);
 }
 
 test "beam glue: the manifest registers the instantiations the install builds (each geometry at M = 1 and the lane's widths)" {
@@ -511,6 +592,7 @@ test "beam glue: the manifest registers the instantiations the install builds (e
         var select_found: [max_rows]bool = @splat(false);
         var qk_found: [2]bool = @splat(false);
         var add_found = false;
+        var combine_found: [max_rows]bool = @splat(false);
         for (m.value.kernels) |kk| for (kk.instances) |inst| {
             const o = inst.object;
             const int = struct {
@@ -529,12 +611,15 @@ test "beam glue: the manifest registers the instantiations the install builds (e
                     qk_found[@intCast(int(o, "MODE"))] = true;
             } else if (std.mem.eql(u8, kk.name, "glue_add_norm")) {
                 if (int(o, "D") == geo.hidden and int(o, "TPG") == normThreads(geo.hidden)) add_found = true;
+            } else if (std.mem.eql(u8, kk.name, "glue_moe_combine")) {
+                if (int(o, "D") == geo.hidden and int(o, "K") == geo.top_k) combine_found[@intCast(int(o, "M") - 1)] = true;
             } else return error.BeamGlueManifestKernel;
         };
         for (gemv_found) |f| try testing.expect(f);
         for (select_found) |f| try testing.expect(f);
         for (qk_found) |f| try testing.expect(f);
         try testing.expect(add_found);
+        for (combine_found) |f| try testing.expect(f);
     }
 }
 
@@ -544,6 +629,12 @@ test "beam glue: the texts name the shapes they are launched at" {
     try testing.expect(std.mem.indexOf(u8, texts.select, "threadgroup float vs[E];") != null);
     try testing.expect(std.mem.indexOf(u8, texts.select, "weights[row * K + e] = q * consts[0];") != null);
     try testing.expect(std.mem.indexOf(u8, texts.header, "fp contract") == null);
+    // The q / k norm text reads the projection row in place; the combine reads the routed rows through the join's order,
+    // without contraction into FMA (its own header), and scales once.
+    try testing.expect(std.mem.indexOf(u8, texts.qk, "const device bfloat16_t* xin = qk + size_t(h) * HD;") != null);
+    try testing.expect(std.mem.indexOf(u8, texts.combine, "rows[size_t(o[k]) * D + h]") != null);
+    try testing.expect(std.mem.indexOf(u8, texts.combine, "static_cast<bfloat16_t>(static_cast<float>(routed) * consts[0])") != null);
+    try testing.expect(std.mem.indexOf(u8, texts.header_combine, "#pragma METAL fp contract(off)") != null);
 }
 
 // ── The texts on the device (BEAM_PARITY's environment: the box's suites under gpu-lock) ──
@@ -682,12 +773,13 @@ test "beam glue GPU: the q / k norm text is the stock norms and RoPE, or the nor
         for ([_]u32{ 0, 1, 7, 300, 511, 512, 16_957, 32_767, 1_048_575 }, 0..) |pos, i| for ([_]bool{ false, true }) |full| {
             const m = g.mark();
             defer g.resetTo(m);
-            // The fused projections' row (q, k at its head), its values of a few magnitudes, with zeros.
+            // The fused projections' row (q, k at its head), its values of a few magnitudes, with zeros: the stock ops on
+            // its row views, the text on the row itself.
             const row = try testBf16(a, &g, &.{ 1, qd + kd + kd + qd }, 1.0, 1300 + i);
             const q = try g.slice(row, &.{ 0, 0 }, &.{ 1, qd }, &.{ 1, 1 });
             const kk = try g.slice(row, &.{ 0, qd }, &.{ 1, qd + kd }, &.{ 1, 1 });
             const want = try graph.qkStock(&g, &c, qn, kn, q, kk, 1, pos, full);
-            const got = try qkNorm(&g, &k, q, kk, qn, kn, pos, full, graph.ssmaxAt(pos));
+            const got = try qkNorm(&g, &k, row, qn, kn, pos, full, graph.ssmaxAt(pos));
             try sameBytes(&g, "query heads", want.q, got.q, null);
             try sameBytes(&g, "key heads", want.k, got.k, null);
             calls += 1;
@@ -739,6 +831,122 @@ test "beam glue GPU: the boundary text is the stock norm, depth-scaled add and n
             calls += 1;
         }
         std.debug.print("BEAM GLUE add_norm hidden {d} ({d} threads): {d} sublayer boundaries bit-equal\n", .{ geo.hidden, normThreads(geo.hidden), calls });
+    }
+}
+
+/// A join's order for `n` rows of `k` routed positions over `r` concatenated rows: each position's row, a device wave's
+/// position row or a miss row past the wave's (the scheduler's joinOrder) or, every seventh call, a repeat.
+fn testOrder(g: *G, n: u32, k: u32, r: u32, seed: u64) !T {
+    var ord: [max_rows * @import("experts.zig").top_k]u32 = undefined;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    for (ord[0 .. n * k], 0..) |*o, p| o.* = if (seed % 7 == 0) rnd.uintLessThan(u32, r) else if (rnd.uintLessThan(u32, 4) == 0) n * k + rnd.uintLessThan(u32, r - n * k) else @as(u32, @intCast(p));
+    return g.hostArray(std.mem.sliceAsBytes(ord[0 .. n * k]), &.{@intCast(n * k)}, .uint32);
+}
+
+test "beam glue GPU: the combine text is the stock join, combine and routed scale bit for bit (both geometries, M = 1 .. 4, miss rows, repeats, zeros, saturated rows)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const graph = @import("graph.zig");
+    for (registered_geometries) |geo| {
+        const c = configOf(geo);
+        var g = try G.init(a, s);
+        defer g.deinit();
+        try graph.prepareFused(&g, &c);
+        const d: c_int = @intCast(geo.hidden);
+        const e: c_int = @intCast(geo.experts);
+        const hd: c_int = @intCast(geo.head_dim);
+        const w = try testF32(a, &g, &.{ e, d }, 1.0 / @sqrt(@as(f32, @floatFromInt(geo.hidden))), 11);
+        const bias = try testF32(a, &g, &.{e}, 0.01, 12);
+        const qn = try testBf16(a, &g, &.{hd}, 0.5, 15);
+        const kn = try testBf16(a, &g, &.{hd}, 0.5, 16);
+        const pn = try testBf16(a, &g, &.{d}, 0.5, 17);
+        const fnw = try testBf16(a, &g, &.{d}, 0.5, 18);
+        try g.evalAll(&.{ w, bias, qn, kn, pn, fnw });
+        var diag: sdk.Diag = .{};
+        var k = install(a, s, &c, .{ .w = w, .bias = bias, .next_w = w, .next_bias = bias, .q_norm = qn, .k_norm = kn, .post_attn_norm = pn, .pre_ff_norm = fnw }, &diag) catch |err| {
+            std.debug.print("beam glue install refused: {s}\n", .{diag.message()});
+            return err;
+        };
+        defer k.deinit();
+        var calls: usize = 0;
+        for (0..64) |trial| {
+            const m = g.mark();
+            defer g.resetTo(m);
+            const rows: u32 = @intCast(1 + trial % max_rows);
+            // A device wave's rows and up to three miss rows; every eighth trial rows of zeros, or rows 2^12 times
+            // larger (the products' and the sum's rounding at the bf16 extremes).
+            const extra: u32 = @intCast(1 + trial % 3);
+            const r: u32 = rows * geo.top_k + extra;
+            const scale: f32 = if (trial % 8 == 5) 4096 else 1;
+            const rr = if (trial % 8 == 3) try g.zeros(&.{ @intCast(r), d }, .bfloat16) else try testBf16(a, &g, &.{ @intCast(r), d }, scale, 2000 + trial);
+            const order = try testOrder(&g, rows, geo.top_k, r, 2100 + trial);
+            // The router's normalized weights, or (every fourth trial) unnormalized ones with a zero.
+            const wt = if (trial % 4 == 1) try g.astype(try testBf16(a, &g, &.{ @intCast(rows), @intCast(geo.top_k) }, 1.0, 2200 + trial), .float32) else (try routeRows(&g, &k, w, bias, try testBf16(a, &g, &.{ @intCast(rows), d }, 1.0, 2300 + trial), rows)).weights;
+            try sameBytes(&g, "combined rows", try combineStockRows(&g, &c, rr, order, wt, rows), try combineRows(&g, &k, rr, order, wt, rows), null);
+            calls += 1;
+        }
+        std.debug.print("BEAM GLUE combine hidden {d}, top-{d}: {d} calls at M = 1 .. {d} (miss rows, repeats, zeros, 2^12 rows) bit-equal\n", .{ geo.hidden, geo.top_k, calls, max_rows });
+    }
+}
+
+test "beam glue GPU bench: a step's 49 routed combines, the stock join, combine and scale against the text (M = 1, dependent)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const graph = @import("graph.zig");
+    const geo = registered_geometries[0];
+    const c = configOf(geo);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    try graph.prepareFused(&g, &c);
+    const d: c_int = @intCast(geo.hidden);
+    const e: c_int = @intCast(geo.experts);
+    const layers = 49;
+    // Each layer's wave rows [8, D] (kept), its order and weights; each layer's rows plus the previous layer's output (one
+    // broadcast add, both arms): the chain is dependent, as in a step.
+    var waves: [layers]T = undefined;
+    for (&waves, 0..) |*x, i| x.* = g.keep(try testBf16(a, &g, &.{ 8, d }, 1.0, 2400 + i));
+    defer for (waves) |x| g.release(x);
+    try g.evalAll(&waves);
+    const w = try testF32(a, &g, &.{ e, d }, 0.014, 11);
+    const bias = try testF32(a, &g, &.{e}, 0.01, 12);
+    const hd: c_int = @intCast(geo.head_dim);
+    const qn = try testBf16(a, &g, &.{hd}, 0.5, 15);
+    const kn = try testBf16(a, &g, &.{hd}, 0.5, 16);
+    const pn = try testBf16(a, &g, &.{d}, 0.5, 17);
+    var diag: sdk.Diag = .{};
+    var k = try install(a, s, &c, .{ .w = w, .bias = bias, .next_w = w, .next_bias = bias, .q_norm = qn, .k_norm = kn, .post_attn_norm = pn, .pre_ff_norm = pn }, &diag);
+    defer k.deinit();
+    const ord = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    const order = g.keep(try g.hostArray(std.mem.sliceAsBytes(&ord), &.{8}, .uint32));
+    defer g.release(order);
+    const wts = g.keep(try g.astype(try testBf16(a, &g, &.{ 1, 8 }, 0.125, 2500), .float32));
+    defer g.release(wts);
+    try g.evalAll(&.{ order, wts });
+    for ([_]bool{ false, true, false, true }) |text| {
+        var times: [12]u64 = undefined;
+        for (&times) |*tm| {
+            const m = g.mark();
+            defer g.resetTo(m);
+            var y = try g.zeros(&.{ 1, d }, .bfloat16);
+            try g.evalAll(&.{y});
+            const t0 = std.Io.Timestamp.now(testing.io, .awake);
+            for (waves) |wave| {
+                const rows = try g.add(wave, y);
+                y = if (text) try combineRows(&g, &k, rows, order, wts, 1) else try combineStockRows(&g, &c, rows, order, wts, 1);
+            }
+            try g.evalAll(&.{y});
+            tm.* = @intCast(t0.untilNow(testing.io, .awake).nanoseconds);
+        }
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        const med: f64 = @floatFromInt(times[times.len / 2]);
+        std.debug.print("BEAM GLUE BENCH combine {s}: {d} layers in {d:.1} us (median of 12, graph build and encode included), {d:.2} us a layer\n", .{ if (text) "text" else "stock", layers, med / 1e3, med / 1e3 / layers });
     }
 }
 

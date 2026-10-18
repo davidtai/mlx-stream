@@ -450,7 +450,8 @@ fn headBias(s: mlx.mlx_stream, b: T, dt: mlx.mlx_dtype) !T {
 // ── The decode state ──
 
 /// A full layer's K and V slabs [1, kv heads, cap, head_dim] bf16, allocated once at the billed positions, written by
-/// position (MLX's slice_update: in place when the slab is the only reference, as it is between steps).
+/// position (MLX's static slice_update: in place when the slab is the only reference, as it is between steps; one copy
+/// kernel a write).
 pub const Slab = struct {
     k: ?T = null,
     v: ?T = null,
@@ -464,10 +465,9 @@ pub const Slab = struct {
     /// Writes `n` rows at `pos` and returns the views [0, pos + n) (scoped to the caller's mark).
     fn append(self: *Slab, g: *G, k: T, v: T, pos: u32, n: u32) !struct { k: T, v: T } {
         const sk = g.shapeOf(self.k.?);
-        const start = [_]i32{ 0, 0, @intCast(pos), 0 };
-        const st = try g.hostArray(std.mem.sliceAsBytes(&start), &.{4}, .int32);
-        const nk = try g.sliceUpdateDyn(self.k.?, k, st);
-        const nv = try g.sliceUpdateDyn(self.v.?, v, st);
+        const start = [4]c_int{ 0, 0, @intCast(pos), 0 };
+        const nk = try sliceUpdateAt(g, self.k.?, k, start);
+        const nv = try sliceUpdateAt(g, self.v.?, v, start);
         const end: c_int = @intCast(pos + n);
         const view_k = try g.slice(nk, &.{ 0, 0, 0, 0 }, &.{ sk.d[0], sk.d[1], end, sk.d[3] }, &.{ 1, 1, 1, 1 });
         const view_v = try g.slice(nv, &.{ 0, 0, 0, 0 }, &.{ sk.d[0], sk.d[1], end, sk.d[3] }, &.{ 1, 1, 1, 1 });
@@ -479,8 +479,22 @@ pub const Slab = struct {
     }
 };
 
+/// `update` written into `src` at `start` (MLX's static slice update: the donated buffer and one copy kernel; the dynamic
+/// update's start array adds an offset kernel before it).
+fn sliceUpdateAt(g: *G, src: T, update: T, start: [4]c_int) !T {
+    const sh = g.shapeOf(update);
+    const stop = [4]c_int{ start[0] + sh.d[0], start[1] + sh.d[1], start[2] + sh.d[2], start[3] + sh.d[3] };
+    var o = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_slice_update(&o, src, update, &start, 4, &stop, 4, &.{ 1, 1, 1, 1 }, 4, g.s)) catch |e| {
+        _ = mlx.mlx_array_free(o);
+        return e;
+    };
+    return g.adopt(o);
+}
+
 /// The decode state of one request: each sliding layer's ring (MiMo's BF16 window ring over the SDK lanes,
-/// `mimo_v2/kv.zig` `SlidingRing`), each full layer's slab, bounded at `cap` positions.
+/// `mimo_v2/kv.zig` `SlidingRing`, its rows written by MLX's static slice update), each full layer's slab, bounded at
+/// `cap` positions.
 pub const Cache = struct {
     a: std.mem.Allocator,
     rings: []kv.SlidingRing,
@@ -495,6 +509,7 @@ pub const Cache = struct {
         errdefer for (rings[0..n_rings]) |*r| r.deinit();
         for (rings) |*r| {
             r.* = try kv.SlidingRing.allocate(c.n_kv_heads, c.head_dim, c.head_dim, c.sliding_window, g.s);
+            r.static_rows = true;
             n_rings += 1;
         }
         const slabs = try a.alloc(Slab, c.nFull());
@@ -731,7 +746,9 @@ fn windowMask(g: *G, a: std.mem.Allocator, pos: u32, n: u32, first: u32, keys: u
     return g.hostArray(std.mem.sliceAsBytes(buf), &.{ @intCast(n), @intCast(keys) }, .bool_);
 }
 
-const Projections = struct { q: T, k: T, v: T, gate: T };
+/// The four projections of a tile; `row` is the fused GEMV's output (null: the four were projected apart), which the
+/// decode glue's q / k text reads in place.
+const Projections = struct { q: T, k: T, v: T, gate: T, row: ?T = null };
 
 /// The attention's four projections of `xn` [n, hidden]: one GEMV (q8: one qmv) over the fused projection and its four
 /// row slices on a one-row call where `fuseProjections` fused them (the decode lane's step), else the four (`project`).
@@ -744,7 +761,7 @@ fn attnProjections(g: *G, c: *const beam.Config, at: *const Attention, xn: T) !P
     const b = [_]c_int{ 0, qd, qd + kd, qd + 2 * kd, 2 * qd + 2 * kd };
     var out: [4]T = undefined;
     for (&out, 0..) |*o, i| o.* = try g.slice(y, &.{ 0, b[i] }, &.{ 1, b[i + 1] }, &.{ 1, 1 });
-    return .{ .q = out[0], .k = out[1], .v = out[2], .gate = out[3] };
+    return .{ .q = out[0], .k = out[1], .v = out[2], .gate = out[3], .row = y };
 }
 
 /// `fuseProjections`' check: layer `at`'s fused GEMV against its four views' GEMVs on one fixed row, byte for byte
@@ -784,7 +801,8 @@ pub fn qkStock(g: *G, c: *const beam.Config, q_norm: T, k_norm: T, q: T, k: T, n
 }
 
 /// One attention tile of layer `lw`: `xn` [n, hidden] (the input norm's rows) at positions [pos, pos + n) -> [n, hidden].
-/// A one-row tile's heads come from the decode glue's text where it is installed (`gl`), else from the stock ops.
+/// A one-row tile's heads come from the decode glue's text where it is installed (`gl`), reading the fused projection's
+/// row in place; else from the stock ops.
 pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const Layer, xn: T, pos: u32, cache: *Cache, gl: ?*const glue.Kernels) !T {
     const n: c_int = @intCast(g.shapeOf(xn).dim(0));
     const nu: u32 = @intCast(n);
@@ -793,7 +811,7 @@ pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const 
     const hd: c_int = @intCast(c.head_dim);
     const at = &lw.attn;
     const p = try attnProjections(g, c, at, xn);
-    const qk = if (n == 1 and gl != null) try glue.qkNorm(g, gl.?, p.q, p.k, at.q_norm, at.k_norm, pos, lw.full, ssmaxAt(pos)) else try qkStock(g, c, at.q_norm, at.k_norm, p.q, p.k, n, pos, lw.full);
+    const qk = if (n == 1 and gl != null and p.row != null) try glue.qkNorm(g, gl.?, p.row.?, at.q_norm, at.k_norm, pos, lw.full, ssmaxAt(pos)) else try qkStock(g, c, at.q_norm, at.k_norm, p.q, p.k, n, pos, lw.full);
     const q = qk.q;
     const k = qk.k;
     const v = try heads4(g, p.v, n, kvh, hd);
@@ -1030,6 +1048,9 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, h, rows) else try mlp(g, d, h)) else blk: {
             const r = if (comptime @TypeOf(force) == void) try routeOf(g, c, routes, lw.router.?, h, !prompt) else try forcedRoute(g, c, routes, lw.router.?, h, force, l, start, !prompt);
             if (prompt) try g.asyncEval(&.{ r.indices, r.weights });
+            // A decode-lane call under the decode glue: the join, the combine and the routed scale in one text (glue.zig
+            // `combineRows`, the same bits as the stock route below).
+            if (!prompt) if (routes.glue) |k| break :blk try g.adopt(try src.forwardCombined(l, h, r.indices, r.weights, k));
             const routed = try g.adopt(try src.forward(l, h, r.indices, r.weights));
             break :blk try scaled(g, c, routed, try g.scalar(c.routed_scaling, .float32));
         };
@@ -1432,4 +1453,84 @@ test "beam graph GPU: the output gate is one kernel, the op chain bit for bit (a
         const bias = try g.reshape(try testBf16(a, &g, &.{heads}, 2.0, 1700 + i), &.{ 1, 1, heads, 1 });
         try expectBits("gate_out", &g, try gateOutChain(&g, o, gate, bias), try gateOut(&g, &c, o, gate, bias));
     }
+}
+
+test "beam graph GPU: the decode lanes' static row writes are the dynamic ones bit for bit (rings through compactions and a rollback, a slab's tiles and rows)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try G.init(a, stream);
+    defer g.deinit();
+    const c: beam.Config = .{};
+    const kvh: c_int = @intCast(c.n_kv_heads);
+    const hd: c_int = @intCast(c.head_dim);
+    // Two rings of one sliding layer: the dynamic writes (MiMo's) and the static ones (Beam's).
+    var rings: [2]kv.SlidingRing = undefined;
+    for (&rings, 0..) |*r, i| {
+        r.* = try kv.SlidingRing.allocate(c.n_kv_heads, c.head_dim, c.head_dim, c.sliding_window, g.s);
+        r.static_rows = i == 1;
+    }
+    defer for (&rings) |*r| r.deinit();
+    // A prompt's tiles (the slot holds 1,040 rows: the third tile compacts), then 1,100 decode rows (two more
+    // compactions), the draft lane's rollback of 3 rows at row 1,500.
+    var appends: usize = 0;
+    var checked: usize = 0;
+    var compactions: usize = 0;
+    var trimmed = false;
+    var step: u32 = 0;
+    while (step < 3 + 1100) : (step += 1) {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const n: u32 = if (step == 0 or step == 1) 512 else if (step == 2) 61 else 1;
+        const nn: c_int = @intCast(n);
+        // The key heads as the q / k text gives them; the values as the attention reads them: a view of the projection.
+        const k = try testBf16(a, &g, &.{ 1, kvh, nn, hd }, 1.0, 3000 + step);
+        const v = try g.transposeAxes(try g.reshape(try testBf16(a, &g, &.{ nn, kvh * hd }, 1.0, 4000 + step), &.{ 1, nn, kvh, hd }), &.{ 0, 2, 1, 3 });
+        const cur = rings[0].k.cur;
+        var views: [2]kv.DenseView = undefined;
+        for (&rings, &views) |*r, *vw| vw.* = try r.append(k, v, n);
+        defer for (&views) |*vw| vw.deinit();
+        appends += 1;
+        const compacted = rings[0].k.cur != cur;
+        if (compacted) compactions += 1;
+        try testing.expectEqual(rings[0].position(), rings[1].position());
+        if (step < 40 or step % 50 == 0 or compacted) {
+            _ = try sameBits("ring keys", &g, try g.adopt(views[0].k), try g.adopt(views[1].k));
+            _ = try sameBits("ring values", &g, try g.adopt(views[0].v), try g.adopt(views[1].v));
+            views = .{ .{}, .{} };
+            checked += 1;
+        }
+        if (!trimmed and rings[0].position() == 1500) {
+            for (&rings) |*r| try r.trimBy(3);
+            trimmed = true;
+        }
+    }
+    try testing.expect(compactions >= 2 and trimmed);
+    // A full layer's slab (2,048 positions): a tile, a short tile and single rows, each written by both routes into its
+    // own slab, the whole slabs compared.
+    var slabs: [2]T = undefined;
+    for (&slabs) |*sl| sl.* = g.keep(try g.zeros(&.{ 1, kvh, 2048, hd }, .bfloat16));
+    defer for (slabs) |sl| g.release(sl);
+    try g.evalAll(&slabs);
+    var pos: u32 = 0;
+    var writes: usize = 0;
+    for ([_]u32{ 512, 61, 1, 1, 1, 7, 1 }, 0..) |n, i| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const nn: c_int = @intCast(n);
+        const k = try g.transposeAxes(try g.reshape(try testBf16(a, &g, &.{ nn, kvh * hd }, 1.0, 5000 + i), &.{ 1, nn, kvh, hd }), &.{ 0, 2, 1, 3 });
+        const start = [_]i32{ 0, 0, @intCast(pos), 0 };
+        const st = try g.hostArray(std.mem.sliceAsBytes(&start), &.{4}, .int32);
+        const dyn = try g.sliceUpdateDyn(slabs[0], k, st);
+        const sta = try sliceUpdateAt(&g, slabs[1], k, .{ 0, 0, @intCast(pos), 0 });
+        _ = try sameBits("slab", &g, dyn, sta);
+        g.release(slabs[0]);
+        g.release(slabs[1]);
+        slabs = .{ g.keep(dyn), g.keep(sta) };
+        pos += n;
+        writes += 1;
+    }
+    std.debug.print("BEAM FUSED static row writes: ring {d} appends ({d} compactions, a rollback), {d} views checked; slab {d} writes to row {d}; bit-equal to the dynamic writes\n", .{ appends, compactions, checked, writes, pos });
 }

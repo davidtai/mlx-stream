@@ -30,6 +30,7 @@ const route = @import("../mimo_v2/route.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const nvfp4_format = @import("../../expert/nvfp4_format.zig");
 const decode_kernels = @import("decode_kernels.zig");
+const glue = @import("glue.zig");
 const settings = @import("settings.zig");
 const log = sdk.log;
 
@@ -347,6 +348,20 @@ pub const Source = struct {
         };
         try g.evalAll(&.{output});
         return g.keep(output);
+    }
+
+    /// A decode-lane call under the decode glue (graph.zig `forward`; `decode_glue: fused`): `forward`'s decode lane ended
+    /// before the scheduler's join (`routedHoistIndexed`: the concatenated outputs and each routed position's row in them),
+    /// then the glue's combine text (glue.zig `combineRows`): the join's take, the combine and the routed scale in one
+    /// launch, the same bits as `forward` and graph.zig's scale. The scaled routed output [nt, H] bf16, a KEPT handle the
+    /// caller adopts (lazy, as `forward`'s decode lane).
+    pub fn forwardCombined(self: *Self, layer: u32, x: T, expert_ids: T, route_weights: T, k: *const glue.Kernels) !T {
+        const g = &self.g;
+        defer g.reset();
+        const nt: u32 = @intCast(g.shapeOf(x).d[0]);
+        std.debug.assert(self.decodeLaneAt(nt));
+        const j = try self.ex.at(layer).routedHoistIndexed(g, x, expert_ids, &.{});
+        return g.keep(try glue.combineRows(g, k, j.rows, j.order, route_weights, nt));
     }
 
     /// The decode lookahead's predictor (the stock route's `route.scoresStored` until bound): the decode glue's texts
