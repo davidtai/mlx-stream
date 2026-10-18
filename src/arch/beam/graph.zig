@@ -22,7 +22,8 @@
 //! `tile_rows` rows with at most `tiles_in_flight` committed (each sliding ring's append is at most one tile: the ring's
 //! headroom), the dense MLP in tiles, the MoE over every row at once (the wide lane), the layer's output evaluated at
 //! its end. A decode step is one row: its routed calls take the decode lane, whose routing barrier evaluates the layer up
-//! to its router; nothing else is evaluated before the logits.
+//! to its router; nothing else is evaluated before the logits. A decode-lane call's router runs the decode glue's texts
+//! where the construction installed them (glue.zig, `Routes.glue`); a prompt call's runs the stock ops.
 //!
 //! The residents route (`Linear`, `project`), fixed by the pack's `residents_format`: a BF16 projection is MLX's matmul
 //! on the transposed weight (the control). A q8 projection is MLX's `quantized_matmul` (affine, 8 bits, group 64) in a
@@ -42,6 +43,7 @@ const mimo = @import("../mimo_v2/config.zig");
 const kv = @import("../mimo_v2/kv.zig");
 const beam = @import("config.zig");
 const experts = @import("experts.zig");
+const glue = @import("glue.zig");
 
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
@@ -65,7 +67,19 @@ pub const Linear = union(enum) {
 };
 pub const Q8 = struct { w: T, scales: T, biases: T };
 
-pub const Attention = struct { q: Linear, k: Linear, v: Linear, o: Linear, gate: Linear, gate_bias: T, q_norm: T, k_norm: T };
+pub const Attention = struct {
+    q: Linear,
+    k: Linear,
+    v: Linear,
+    o: Linear,
+    gate: Linear,
+    gate_bias: T,
+    q_norm: T,
+    k_norm: T,
+    /// `decode_glue: fused`: the q, k, v and gate projections as one projection [2 qd + 2 kd, hidden] in the pack's
+    /// format (`fuseProjections`); q / k / v / gate are then its row views.
+    qkvg: ?Linear = null,
+};
 pub const Mlp = struct { gate: Linear, up: Linear, down: Linear };
 /// The router: the F32 weight [experts, hidden] (the reference keeps it f32) and the F32 correction bias [experts].
 pub const Router = struct { w: T, bias: T };
@@ -274,6 +288,87 @@ pub const Weights = struct {
         return w.own(a, try f32Copy(s, x));
     }
 
+    /// `decode_glue: fused`: each layer's q, k, v and gate projections as one projection [2 qd + 2 kd, hidden], rows in
+    /// that order (`Attention.qkvg`), in the pack's format: the BF16 weights concatenated, or each q8 array (codes,
+    /// scales, biases) concatenated along its rows. The decode lane's one GEMV (MLX's gemv, or its qmv on q8, sums each
+    /// output row alone, in the same lanes whatever the matrix's height, so its rows are the four's bit for bit); q / k /
+    /// v / gate become its row views, which the prompt reads as it reads the four (the same values, strides and kernels;
+    /// q8: `promptView` dequantizes the views). The four originals are dropped from the weight map and MLX's cache is
+    /// cleared after each layer: the load holds one layer's projections twice at most. Then the first layer's fused GEMV
+    /// is checked against the four views' on one row, byte for byte. Once, after the residents are read (`map`: the
+    /// host's weight map the bind read from).
+    pub fn fuseProjections(w: *Weights, a: std.mem.Allocator, g: *G, map: *sdk.Weights, c: *const beam.Config) !void {
+        const qd: c_int = @intCast(c.n_heads * c.head_dim);
+        const kd: c_int = @intCast(c.n_kv_heads * c.head_dim);
+        const bounds = [_]c_int{ 0, qd, qd + kd, qd + 2 * kd, 2 * qd + 2 * kd };
+        for (w.layers, 0..) |*lw, li| {
+            const at = &lw.attn;
+            {
+                const m = g.mark();
+                defer g.resetTo(m);
+                const fused = try w.fuseRows(a, g, .{ at.q, at.k, at.v, at.gate });
+                var views: [4]Linear = undefined;
+                for (&views, 0..) |*v, i| v.* = try w.rowView(a, g, fused, bounds[i], bounds[i + 1]);
+                at.* = .{ .q = views[0], .k = views[1], .v = views[2], .o = at.o, .gate = views[3], .gate_bias = at.gate_bias, .q_norm = at.q_norm, .k_norm = at.k_norm, .qkvg = fused };
+            }
+            for ([_][]const u8{ "q_proj", "k_proj", "v_proj", "gate_proj" }) |proj| for ([_][]const u8{ "weight", "scales", "biases" }) |tail| {
+                var nb: [96]u8 = undefined;
+                map.drop(std.fmt.bufPrint(&nb, "model.layers.{d}.self_attn.{s}.{s}", .{ li, proj, tail }) catch unreachable);
+            };
+            g.clearCache();
+        }
+        try checkProjections(g, a, c, &w.layers[0].attn);
+    }
+
+    /// The projections `parts` (one format) concatenated along their rows, each array in a buffer of its own (owned),
+    /// evaluated.
+    fn fuseRows(w: *Weights, a: std.mem.Allocator, g: *G, parts: [4]Linear) !Linear {
+        switch (parts[0]) {
+            .bf16 => {
+                var xs: [4]T = undefined;
+                for (parts, &xs) |p, *x| x.* = switch (p) {
+                    .bf16 => |v| v,
+                    .q8 => return error.BeamFusedProjections,
+                };
+                return .{ .bf16 = try w.ownConcat(a, g, &xs) };
+            },
+            .q8 => {
+                var ws: [4]T = undefined;
+                var ss: [4]T = undefined;
+                var bs: [4]T = undefined;
+                for (parts, &ws, &ss, &bs) |p, *x, *sc, *b| switch (p) {
+                    .q8 => |q| {
+                        x.* = q.w;
+                        sc.* = q.scales;
+                        b.* = q.biases;
+                    },
+                    .bf16 => return error.BeamFusedProjections,
+                };
+                return .{ .q8 = .{ .w = try w.ownConcat(a, g, &ws), .scales = try w.ownConcat(a, g, &ss), .biases = try w.ownConcat(a, g, &bs) } };
+            },
+        }
+    }
+
+    fn ownConcat(w: *Weights, a: std.mem.Allocator, g: *G, xs: []const T) !T {
+        const cat = try g.concat(xs, 0);
+        try g.evalAll(&.{cat});
+        return w.own(a, g.keep(cat));
+    }
+
+    /// Rows [lo, hi) of the fused projection `f`: each array's row view (owned), evaluated.
+    fn rowView(w: *Weights, a: std.mem.Allocator, g: *G, f: Linear, lo: c_int, hi: c_int) !Linear {
+        return switch (f) {
+            .bf16 => |x| .{ .bf16 = try w.ownRows(a, g, x, lo, hi) },
+            .q8 => |q| .{ .q8 = .{ .w = try w.ownRows(a, g, q.w, lo, hi), .scales = try w.ownRows(a, g, q.scales, lo, hi), .biases = try w.ownRows(a, g, q.biases, lo, hi) } },
+        };
+    }
+
+    fn ownRows(w: *Weights, a: std.mem.Allocator, g: *G, x: T, lo: c_int, hi: c_int) !T {
+        const v = try g.slice(x, &.{ lo, 0 }, &.{ hi, g.shapeOf(x).dim(1) }, &.{ 1, 1 });
+        try g.evalAll(&.{v});
+        return w.own(a, g.keep(v));
+    }
+
     /// The gates the expert scheduler's lookahead reads, one per model layer (a dense layer's empty): the router's
     /// stored F32 weight [experts, hidden] (route.zig `scoresStored`) and its correction bias.
     pub fn gates(w: *const Weights, a: std.mem.Allocator) ![]experts.Gate {
@@ -456,6 +551,8 @@ pub fn project(g: *G, l: Linear, x: T) !T {
 pub fn promptView(g: *G, lw: *const Layer) !Layer {
     var v = lw.*;
     inline for (.{ "q", "k", "v", "o", "gate" }) |f| @field(v.attn, f) = try bf16View(g, @field(lw.attn, f));
+    // The decode glue's fused projection is the decode lane's: a prompt call (one row too) reads the four views.
+    v.attn.qkvg = null;
     if (lw.dense) |d| v.dense = .{ .gate = try bf16View(g, d.gate), .up = try bf16View(g, d.up), .down = try bf16View(g, d.down) };
     return v;
 }
@@ -524,6 +621,14 @@ pub fn depthAdd(g: *G, c: *const beam.Config, h: T, r: T, i: u32) !T {
     return o[0];
 }
 
+/// A sublayer boundary on the stock ops: the sublayer's output `y` normed by `w1`, the depth-scaled add of sublayer
+/// index `i` with the residual `r` (`res`, the next residual), then `res` normed by `w2` (`out`, the next sublayer's
+/// input). glue.zig `addNorm` gives the same bits on a decode row in one dispatch.
+pub fn boundaryStock(g: *G, c: *const beam.Config, y: T, r: T, w1: T, w2: T, i: u32) !glue.Boundary {
+    const res = try depthAdd(g, c, try rmsNorm(g, y, w1, c.rms_norm_eps), r, i);
+    return .{ .res = res, .out = try rmsNorm(g, res, w2, c.rms_norm_eps) };
+}
+
 /// `depthAdd`'s op chain (the compiled region's body, and the device test's control): bf16(f32(h) * a) + bf16(f32(r) *
 /// b), `a` and `b` f32 scalars.
 pub fn depthAddChain(g: *G, h: T, r: T, a: T, b: T) !T {
@@ -542,29 +647,60 @@ const DepthAdd = struct {
     }
 };
 
+/// The attention's output gate: `o` times sigmoid(`gate` + `bias`), each in bf16 (the reference's bf16 add, sigmoid and
+/// product: `gateOutChain`), one compiled kernel (`GateOut`, shapeless: the add's and the sigmoid's rows are not
+/// written). o and gate [1, n, heads, d], bias [1, 1, heads, 1].
+pub fn gateOut(g: *G, c: *const beam.Config, o: T, gate: T, bias: T) !T {
+    var r: [1]T = undefined;
+    try g.tape(GateOut, c, &.{ o, gate, bias }, &r);
+    return r[0];
+}
+
+/// `gateOut`'s op chain (the region's body, the device test's control).
+pub fn gateOutChain(g: *G, o: T, gate: T, bias: T) !T {
+    return g.mul(o, try g.sigmoid(try g.add(gate, bias)));
+}
+
+const GateOut = struct {
+    pub const region: ops_be.Region = .beam_gate;
+    pub const Ctx = beam.Config;
+    pub const n_out = 1;
+    pub const shapeless = true;
+    pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
+        out[0] = try gateOutChain(g, in[0], in[1], in[2]);
+    }
+};
+
 /// The trunk's compiled regions on `g` (once, at construction; `c` outlives `g`), each run once on one row so that MLX
 /// builds its kernels at the load and not in the first request.
 pub fn prepareFused(g: *G, c: *const beam.Config) !void {
     try g.prepareTape(DepthAdd, c);
     try g.prepareTape(ScaleBy, c);
     try g.prepareTape(Softcap, c);
+    try g.prepareTape(GateOut, c);
     const m = g.mark();
     defer g.resetTo(m);
     const row = try g.zeros(&.{ 1, @intCast(c.hidden_size) }, .bfloat16);
     // The full layers' query: [1, heads, rows, head_dim] against [1, 1, rows, 1] (its own signature).
     const q = try g.zeros(&.{ 1, @intCast(c.n_heads), 1, @intCast(c.head_dim) }, .bfloat16);
     const logits = try g.zeros(&.{ 1, @intCast(c.vocab_size) }, .bfloat16);
-    try g.evalAll(&.{ try depthAdd(g, c, row, row, 2), try scaled(g, c, row, try g.scalar(c.routed_scaling, .float32)), try scaled(g, c, q, try ssmaxScale(g, 0, 1)), try softcap(g, c, logits) });
+    // The output gate: the attention's [1, 1, heads, head_dim] rows and the [1, 1, heads, 1] bias.
+    const o = try g.zeros(&.{ 1, 1, @intCast(c.n_heads), @intCast(c.head_dim) }, .bfloat16);
+    const bias = try g.zeros(&.{ 1, 1, @intCast(c.n_heads), 1 }, .bfloat16);
+    try g.evalAll(&.{ try depthAdd(g, c, row, row, 2), try scaled(g, c, row, try g.scalar(c.routed_scaling, .float32)), try scaled(g, c, q, try ssmaxScale(g, 0, 1)), try softcap(g, c, logits), try gateOut(g, c, o, o, bias) });
 }
 
-/// The full layers' query scale at rows [pos, pos + n): (1 + (p + 1) / 2048) ^ 0.1, f32 [1, 1, n, 1].
+/// The full layers' query scale at position `pos`: (1 + (pos + 1) / 2048) ^ 0.1 in f32.
+pub fn ssmaxAt(pos: u32) f32 {
+    const p: f32 = @floatFromInt(pos);
+    return @exp(beam.ssmax_power * std.math.log1p((p + 1) / beam.ssmax_base));
+}
+
+/// The full layers' query scale at rows [pos, pos + n): `ssmaxAt` of each, f32 [1, 1, n, 1].
 fn ssmaxScale(g: *G, pos: u32, n: u32) !T {
     var buf: [tile_rows]f32 = undefined;
     std.debug.assert(n <= tile_rows);
-    for (buf[0..n], 0..) |*x, i| {
-        const p: f32 = @floatFromInt(pos + @as(u32, @intCast(i)));
-        x.* = @exp(beam.ssmax_power * std.math.log1p((p + 1) / beam.ssmax_base));
-    }
+    for (buf[0..n], 0..) |*x, i| x.* = ssmaxAt(pos + @as(u32, @intCast(i)));
     return g.hostArray(std.mem.sliceAsBytes(buf[0..n]), &.{ 1, 1, @intCast(n), 1 }, .float32);
 }
 
@@ -579,32 +715,78 @@ fn windowMask(g: *G, a: std.mem.Allocator, pos: u32, n: u32, first: u32, keys: u
     return g.hostArray(std.mem.sliceAsBytes(buf), &.{ @intCast(n), @intCast(keys) }, .bool_);
 }
 
+const Projections = struct { q: T, k: T, v: T, gate: T };
+
+/// The attention's four projections of `xn` [n, hidden]: one GEMV (q8: one qmv) over the fused projection and its four
+/// row slices on a one-row call where `fuseProjections` fused them (the decode lane's step), else the four (`project`).
+fn attnProjections(g: *G, c: *const beam.Config, at: *const Attention, xn: T) !Projections {
+    const fused = at.qkvg;
+    if (fused == null or g.shapeOf(xn).dim(0) != 1) return .{ .q = try project(g, at.q, xn), .k = try project(g, at.k, xn), .v = try project(g, at.v, xn), .gate = try project(g, at.gate, xn) };
+    const y = try project(g, fused.?, xn);
+    const qd: c_int = @intCast(c.n_heads * c.head_dim);
+    const kd: c_int = @intCast(c.n_kv_heads * c.head_dim);
+    const b = [_]c_int{ 0, qd, qd + kd, qd + 2 * kd, 2 * qd + 2 * kd };
+    var out: [4]T = undefined;
+    for (&out, 0..) |*o, i| o.* = try g.slice(y, &.{ 0, b[i] }, &.{ 1, b[i + 1] }, &.{ 1, 1 });
+    return .{ .q = out[0], .k = out[1], .v = out[2], .gate = out[3] };
+}
+
+/// `fuseProjections`' check: layer `at`'s fused GEMV against its four views' GEMVs on one fixed row, byte for byte
+/// (error.BeamFusedProjections otherwise).
+fn checkProjections(g: *G, a: std.mem.Allocator, c: *const beam.Config, at: *const Attention) !void {
+    const m = g.mark();
+    defer g.resetTo(m);
+    const x = try glue.checkRow(g, a, c.hidden_size);
+    const fused = try attnProjections(g, c, at, x);
+    const plain: Attention = .{ .q = at.q, .k = at.k, .v = at.v, .o = at.o, .gate = at.gate, .gate_bias = at.gate_bias, .q_norm = at.q_norm, .k_norm = at.k_norm };
+    const stock = try attnProjections(g, c, &plain, x);
+    inline for (.{ "q", "k", "v", "gate" }) |f| glue.sameBytes(g, "the fused projections' " ++ f, @field(stock, f), @field(fused, f), null) catch return error.BeamFusedProjections;
+}
+
+/// `x` [rows, hh x d] as [1, hh, rows, d] (a view).
+fn heads4(g: *G, x: T, rows: c_int, hh: c_int, d: c_int) !T {
+    return g.transposeAxes(try g.reshape(x, &.{ 1, rows, hh, d }), &.{ 0, 2, 1, 3 });
+}
+
+/// A tile's query and key heads at positions [pos, pos + n) from its projections `q` [n, heads x d] and `k` [n, kv
+/// heads x d]: q [1, heads, n, d], k [1, kv heads, n, d], each head normed over its d (q_norm / k_norm), then RoPE on a
+/// sliding layer, or the query times the full layer's scale. The stock ops (two norms and two ropes, or two norms and the
+/// scale's compiled kernel); glue.zig `qkNorm` gives the same bits on a decode row in one dispatch.
+pub fn qkStock(g: *G, c: *const beam.Config, q_norm: T, k_norm: T, q: T, k: T, n: c_int, pos: u32, full: bool) !glue.Heads {
+    const heads: c_int = @intCast(c.n_heads);
+    const kvh: c_int = @intCast(c.n_kv_heads);
+    const hd: c_int = @intCast(c.head_dim);
+    var qh = try heads4(g, try rmsNorm(g, try g.reshape(q, &.{ n, heads, hd }), q_norm, c.rms_norm_eps), n, heads, hd);
+    var kh = try heads4(g, try rmsNorm(g, try g.reshape(k, &.{ n, kvh, hd }), k_norm, c.rms_norm_eps), n, kvh, hd);
+    if (full) {
+        qh = try scaled(g, c, qh, try ssmaxScale(g, pos, @intCast(n)));
+    } else {
+        qh = try rope(g, qh, c.head_dim, c.rope_theta, pos);
+        kh = try rope(g, kh, c.head_dim, c.rope_theta, pos);
+    }
+    return .{ .q = qh, .k = kh };
+}
+
 /// One attention tile of layer `lw`: `xn` [n, hidden] (the input norm's rows) at positions [pos, pos + n) -> [n, hidden].
-pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const Layer, xn: T, pos: u32, cache: *Cache) !T {
+/// A one-row tile's heads come from the decode glue's text where it is installed (`gl`), else from the stock ops.
+pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const Layer, xn: T, pos: u32, cache: *Cache, gl: ?*const glue.Kernels) !T {
     const n: c_int = @intCast(g.shapeOf(xn).dim(0));
     const nu: u32 = @intCast(n);
     const heads: c_int = @intCast(c.n_heads);
     const kvh: c_int = @intCast(c.n_kv_heads);
     const hd: c_int = @intCast(c.head_dim);
     const at = &lw.attn;
-    const heads4 = struct {
-        fn f(gg: *G, x: T, rows: c_int, hh: c_int, d: c_int) !T {
-            return gg.transposeAxes(try gg.reshape(x, &.{ 1, rows, hh, d }), &.{ 0, 2, 1, 3 });
-        }
-    }.f;
-    // [1, heads, n, d]: each head normed over its d (q_norm / k_norm), then RoPE on a sliding layer.
-    var q = try heads4(g, try rmsNorm(g, try g.reshape(try project(g, at.q, xn), &.{ n, heads, hd }), at.q_norm, c.rms_norm_eps), n, heads, hd);
-    var k = try heads4(g, try rmsNorm(g, try g.reshape(try project(g, at.k, xn), &.{ n, kvh, hd }), at.k_norm, c.rms_norm_eps), n, kvh, hd);
-    const v = try heads4(g, try project(g, at.v, xn), n, kvh, hd);
+    const p = try attnProjections(g, c, at, xn);
+    const qk = if (n == 1 and gl != null) try glue.qkNorm(g, gl.?, p.q, p.k, at.q_norm, at.k_norm, pos, lw.full, ssmaxAt(pos)) else try qkStock(g, c, at.q_norm, at.k_norm, p.q, p.k, n, pos, lw.full);
+    const q = qk.q;
+    const k = qk.k;
+    const v = try heads4(g, p.v, n, kvh, hd);
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
     var out: T = undefined;
     if (lw.full) {
-        q = try scaled(g, c, q, try ssmaxScale(g, pos, nu));
         const view = try cache.slabs[lw.slot].append(g, k, v, pos, nu);
         out = if (n > 1) try sdpa(g, q, view.k, view.v, scale, "causal", .{}) else try sdpa(g, q, view.k, view.v, scale, "", .{});
     } else {
-        q = try rope(g, q, c.head_dim, c.rope_theta, pos);
-        k = try rope(g, k, c.head_dim, c.rope_theta, pos);
         const view = try cache.rings[lw.slot].append(k, v, nu);
         const vk = try g.adopt(view.k);
         const vv = try g.adopt(view.v);
@@ -613,10 +795,9 @@ pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const 
             out = try sdpa(g, q, vk, vv, scale, "array", try windowMask(g, a, pos, nu, @intCast(span.first_key), span.key_count, c.sliding_window));
         } else out = try sdpa(g, q, vk, vv, scale, "", .{});
     }
-    // [1, n, heads, d], gated per head: attn * sigmoid(gate_proj(x) + gate_bias).
+    // [1, n, heads, d], gated per head: attn * sigmoid(gate_proj(x) + gate_bias), one compiled kernel.
     const o = try g.transposeAxes(out, &.{ 0, 2, 1, 3 });
-    const gate = try g.sigmoid(try g.add(try g.reshape(try project(g, at.gate, xn), &.{ 1, n, heads, hd }), at.gate_bias));
-    const gated = try g.mul(o, gate);
+    const gated = try gateOut(g, c, o, try g.reshape(p.gate, &.{ 1, n, heads, hd }), at.gate_bias);
     return project(g, at.o, try g.reshape(gated, &.{ n, heads * hd }));
 }
 
@@ -650,6 +831,22 @@ fn mlpTiles(g: *G, a: std.mem.Allocator, c: *const beam.Config, m: Mlp, x: T, ro
 }
 
 pub const Routing = struct { indices: T, weights: T };
+
+/// The forward's construction-time routes: the decode glue's texts (glue.zig; null under `decode_glue: ops`, or before
+/// the construction installed them).
+pub const Routes = struct {
+    glue: ?*const glue.Kernels = null,
+};
+
+/// A call's routing of `x` [n, hidden]: the decode glue's texts on a decode-lane call (`decode`) where installed, else
+/// the stock ops (`route`). The two give the same ids and weights bit for bit (glue.zig).
+fn routeOf(g: *G, c: *const beam.Config, routes: Routes, r: Router, x: T, decode: bool) !Routing {
+    if (decode) if (routes.glue) |k| {
+        const out = try glue.routeRows(g, k, r.w, r.bias, x, @intCast(g.shapeOf(x).dim(0)));
+        return .{ .indices = out.ids, .weights = out.weights };
+    };
+    return route(g, c, r, x);
+}
 
 /// DeepSeek-V3's noaux_tc group top-k (modeling_beam.py `BeamTopKRouter`): f32 logits on the F32 weight, sigmoid; the
 /// choice scores (+ the correction bias) in `n_group` groups, each group scored by the sum of its top-2; the
@@ -718,14 +915,14 @@ pub const ForcedRoutes = struct {
 };
 
 /// Routed layer `l`'s routing of rows [start, start + n) under forced routes: the forced ids, the weights at them; the
-/// router's own choice evaluated and recorded.
-fn forcedRoute(g: *G, c: *const beam.Config, r: Router, x: T, f: *const ForcedRoutes, l: u32, start: u32) !Routing {
+/// router's own choice (the call's route: `routeOf`) evaluated and recorded.
+fn forcedRoute(g: *G, c: *const beam.Config, routes: Routes, r: Router, x: T, f: *const ForcedRoutes, l: u32, start: u32, decode: bool) !Routing {
     const n: usize = @intCast(g.shapeOf(x).dim(0));
     const k: c_int = @intCast(c.n_experts_per_tok);
     const moe = l - c.first_k_dense;
     if (f.k != c.n_experts_per_tok or start + n > f.positions) return error.BeamForcedRoutes;
     const s = try routerScores(g, r, x);
-    const own = try select(g, c, s.choice);
+    const own = (try routeOf(g, c, routes, r, x, decode)).indices;
     try g.evalAll(&.{own});
     _ = try g.readU32(own, f.chosen[f.at(moe, start)..][0 .. n * f.k]);
     const inds = try g.hostArray(std.mem.sliceAsBytes(f.ids[f.at(moe, start)..][0 .. n * f.k]), &.{ @intCast(n), k }, .uint32);
@@ -757,10 +954,11 @@ fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, s
 pub const Head = enum { last, all };
 
 /// One forward of `ids` at positions [start, start + ids.len) through every layer (each layer's state advanced in
-/// `cache`), the routed experts through `src`: the last row's logits f32 [1, vocab] (soft-capped), a kept handle the
-/// caller frees; under `head == .all` every row's, f32 [rows, vocab]. `force` is `{}` when served, or the parity test's
-/// `*const ForcedRoutes` (its own comptime instance: the served forward has no branch on it).
-pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, src: anytype, comptime head: Head, force: anytype) !T {
+/// `cache`), the routed experts through `src`, the construction's `routes`: the last row's logits f32 [1, vocab]
+/// (soft-capped), a kept handle the caller frees; under `head == .all` every row's, f32 [rows, vocab]. `force` is `{}`
+/// when served, or the parity test's `*const ForcedRoutes` (its own comptime instance: the served forward has no branch
+/// on it).
+pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Weights, routes: Routes, ids: []const u32, start: u32, cache: *Cache, src: anytype, comptime head: Head, force: anytype) !T {
     const rows: u32 = @intCast(ids.len);
     if (rows == 0 or rows > experts.call_rows) return error.BeamCallRows;
     if (start + rows > cache.cap) return error.ContextOverBill;
@@ -776,6 +974,12 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
     const n_tiles: usize = (rows + tile_rows - 1) / tile_rows;
     const outs = try a.alloc(T, n_tiles);
     defer a.free(outs);
+    // A one-row call under the decode glue: each sublayer boundary (its norm, the depth-scaled add, the next sublayer's
+    // norm) in one text (glue.zig `addNorm`); the next layer's normed input carries from the previous layer's boundary,
+    // the last layer's boundary normed by the final norm.
+    const boundary_glue: ?*const glue.Kernels = if (rows == 1) routes.glue else null;
+    var xn_next: ?T = null;
+    defer if (xn_next) |v| g.release(v);
     for (w.layers, 0..) |*stored, li| {
         const l: u32 = @intCast(li);
         const m = g.mark();
@@ -787,7 +991,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         if (prompt and lw.router != null) try postReadAhead(g, c, lw, l, x, src);
         // The attention, tile by tile (the rings and slabs carry from one tile to the next); in a prompt call each tile
         // is committed as built and the tile before it waited, so at most `tiles_in_flight` run at once.
-        const xn = try rmsNorm(g, x, lw.input_norm, c.rms_norm_eps);
+        const xn = if (xn_next) |v| v else try rmsNorm(g, x, lw.input_norm, c.rms_norm_eps);
         var n_kept: usize = 0;
         defer for (outs[0..n_kept]) |o| g.release(o);
         for (0..n_tiles) |i| {
@@ -795,7 +999,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             const hi: u32 = @min(rows, lo + tile_rows);
             const ms = g.mark();
             const tile = if (n_tiles == 1) xn else try g.slice(xn, &.{ @intCast(lo), 0 }, &.{ @intCast(hi), hidden }, &.{ 1, 1 });
-            outs[i] = g.keep(try attention(g, a, c, lw, tile, start + lo, cache));
+            outs[i] = g.keep(try attention(g, a, c, lw, tile, start + lo, cache, routes.glue));
             n_kept += 1;
             g.resetTo(ms);
             if (!prompt) continue;
@@ -803,15 +1007,22 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             if (i > 0) try g.evalAll(&.{outs[i - 1]});
         }
         const attn = if (n_tiles == 1) outs[0] else try g.concat(outs[0..n_tiles], 0);
-        const x1 = try depthAdd(g, c, try rmsNorm(g, attn, lw.post_attn_norm, c.rms_norm_eps), x, beam.Config.residualIndex(l, false));
-        const h = try rmsNorm(g, x1, lw.pre_ff_norm, c.rms_norm_eps);
+        const b1 = if (boundary_glue) |k| try glue.addNorm(g, k, attn, x, lw.post_attn_norm, lw.pre_ff_norm, beam.Config.residualIndex(l, false)) else try boundaryStock(g, c, attn, x, lw.post_attn_norm, lw.pre_ff_norm, beam.Config.residualIndex(l, false));
+        const x1 = b1.res;
+        const h = b1.out;
         const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, h, rows) else try mlp(g, d, h)) else blk: {
-            const r = if (comptime @TypeOf(force) == void) try route(g, c, lw.router.?, h) else try forcedRoute(g, c, lw.router.?, h, force, l, start);
+            const r = if (comptime @TypeOf(force) == void) try routeOf(g, c, routes, lw.router.?, h, !prompt) else try forcedRoute(g, c, routes, lw.router.?, h, force, l, start, !prompt);
             if (prompt) try g.asyncEval(&.{ r.indices, r.weights });
             const routed = try g.adopt(try src.forward(l, h, r.indices, r.weights));
             break :blk try scaled(g, c, routed, try g.scalar(c.routed_scaling, .float32));
         };
-        const x2 = try depthAdd(g, c, try rmsNorm(g, f, lw.post_ff_norm, c.rms_norm_eps), x1, beam.Config.residualIndex(l, true));
+        const x2 = if (boundary_glue) |k| blk: {
+            const next_norm = if (l + 1 < w.layers.len) w.layers[l + 1].input_norm else w.norm;
+            const b2 = try glue.addNorm(g, k, f, x1, lw.post_ff_norm, next_norm, beam.Config.residualIndex(l, true));
+            if (xn_next) |v| g.release(v);
+            xn_next = g.keep(b2.out);
+            break :blk b2.res;
+        } else try depthAdd(g, c, try rmsNorm(g, f, lw.post_ff_norm, c.rms_norm_eps), x1, beam.Config.residualIndex(l, true));
         const next = g.keep(x2);
         g.release(x);
         x = next;
@@ -826,6 +1037,8 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         }
     }
     cache.len = start + rows;
+    // The decode glue's last boundary normed the one row by the final norm already: the head's lm_head and soft cap.
+    if (xn_next) |xn| return g.keep(try softcap(g, c, try project(g, w.head, xn)));
     if (head == .all) return g.keep(try logitsOf(g, c, w, x));
     const last = try g.slice(x, &.{ @intCast(rows - 1), 0 }, &.{ @intCast(rows), hidden }, &.{ 1, 1 });
     return g.keep(try logitsOf(g, c, w, last));
@@ -1116,5 +1329,89 @@ test "beam graph GPU: the f32 SwiGLU's one kernel is the op chain bit for bit (r
         const gate = try testBf16(a, &g, &shape, 3.0, 100 + i);
         const up = try testBf16(a, &g, &shape, 3.0, 200 + i);
         try expectBits("swiglu_f32", &g, try sdk_ext.quant.swigluF32Chain(G, &g, gate, up), try sdk_ext.quant.activation(G, &g, .swiglu_f32, gate, up));
+    }
+}
+
+test "beam graph GPU: the fused projections' one GEMV (q8: one qmv) is the four bit for bit; the prompt's GEMMs on their row views are the GEMMs on their own buffers (BF16 and q8)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try G.init(a, stream);
+    defer g.deinit();
+    const c: beam.Config = .{};
+    const h: c_int = @intCast(c.hidden_size);
+    const qd: c_int = @intCast(c.n_heads * c.head_dim);
+    const kd: c_int = @intCast(c.n_kv_heads * c.head_dim);
+    inline for (.{ beam.ResidentsFormat.bf16, beam.ResidentsFormat.affine8_g64 }) |fmt| {
+        var map = sdk.Weights.init(a);
+        defer map.deinit();
+        // One layer's projections as the residents hold them (their own buffers), in the weight map under their names.
+        const names = [_][]const u8{ "q_proj", "k_proj", "v_proj", "gate_proj" };
+        const rows = [_]c_int{ qd, kd, kd, qd };
+        var kept: [12]T = undefined;
+        var n_kept: usize = 0;
+        defer for (kept[0..n_kept]) |x| g.release(x);
+        var orig: [4]Linear = undefined;
+        for (&orig, names, rows, 0..) |*o, nm, r, i| {
+            const wt = try testBf16(a, &g, &.{ r, h }, 0.02, 1100 + i);
+            var parts: [3]T = .{ wt, undefined, undefined };
+            var np: usize = 1;
+            if (fmt == .affine8_g64) {
+                parts = try ops_be.quantizeAffine(&g, wt, beam.q8_group, beam.q8_bits);
+                np = 3;
+            }
+            const tails = [_][]const u8{ "weight", "scales", "biases" };
+            for (parts[0..np], tails[0..np]) |x, tail| {
+                kept[n_kept] = g.keep(x);
+                n_kept += 1;
+                try g.evalAll(&.{x});
+                var nb: [96]u8 = undefined;
+                try map.map.put(try a.dupe(u8, try std.fmt.bufPrint(&nb, "model.layers.0.self_attn.{s}.{s}", .{ nm, tail })), g.keep(x));
+            }
+            o.* = if (fmt == .bf16) .{ .bf16 = kept[n_kept - 1] } else .{ .q8 = .{ .w = kept[n_kept - 3], .scales = kept[n_kept - 2], .biases = kept[n_kept - 1] } };
+        }
+        const layers = try a.alloc(Layer, 1);
+        var w: Weights = .{ .embed = undefined, .norm = undefined, .head = undefined, .layers = layers };
+        defer w.deinit(a);
+        layers[0] = .{ .input_norm = undefined, .post_attn_norm = undefined, .pre_ff_norm = undefined, .post_ff_norm = undefined, .full = false, .slot = 0, .attn = .{ .q = orig[0], .k = orig[1], .v = orig[2], .o = undefined, .gate = orig[3], .gate_bias = undefined, .q_norm = undefined, .k_norm = undefined } };
+        try w.fuseProjections(a, &g, &map, &.{ .n_layers = 1, .first_k_dense = 1 });
+        try testing.expectEqual(@as(u32, 0), map.count());
+        const at = &w.layers[0].attn;
+        try testing.expect(at.qkvg != null);
+        const plain: Attention = .{ .q = orig[0], .k = orig[1], .v = orig[2], .o = undefined, .gate = orig[3], .gate_bias = undefined, .q_norm = undefined, .k_norm = undefined };
+        for ([_]c_int{ 1, 3, 512 }, 0..) |n, i| {
+            const m = g.mark();
+            defer g.resetTo(m);
+            const x = try testBf16(a, &g, &.{ n, h }, 1.0, 1200 + i);
+            const want = try attnProjections(&g, &c, &plain, x);
+            const got = try attnProjections(&g, &c, at, x);
+            inline for (.{ "q", "k", "v", "gate" }) |f| try expectBits(@tagName(fmt) ++ " projection " ++ f, &g, @field(want, f), @field(got, f));
+        }
+    }
+}
+
+test "beam graph GPU: the output gate is one kernel, the op chain bit for bit (a step's row, a tile; the attention's transposed rows)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try G.init(a, stream);
+    defer g.deinit();
+    const c: beam.Config = .{};
+    try prepareFused(&g, &c);
+    const heads: c_int = @intCast(c.n_heads);
+    const hd: c_int = @intCast(c.head_dim);
+    for ([_]c_int{ 1, 512 }, 0..) |n, i| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        // The attention's output as SDPA gives it, [1, heads, n, d], seen as [1, n, heads, d]; the gate's rows and bias.
+        const out = try testBf16(a, &g, &.{ 1, heads, n, hd }, 1.0, 1500 + i);
+        const o = try g.transposeAxes(out, &.{ 0, 2, 1, 3 });
+        const gate = try g.reshape(try testBf16(a, &g, &.{ n, heads * hd }, 4.0, 1600 + i), &.{ 1, n, heads, hd });
+        const bias = try g.reshape(try testBf16(a, &g, &.{heads}, 2.0, 1700 + i), &.{ 1, 1, heads, 1 });
+        try expectBits("gate_out", &g, try gateOutChain(&g, o, gate, bias), try gateOut(&g, &c, o, gate, bias));
     }
 }

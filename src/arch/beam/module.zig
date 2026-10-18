@@ -1,8 +1,9 @@
 //! beam's module: Reflection Beam 1.0 served from its pack (config.json, the residents in BF16 or the q8 tier, the NVFP4
 //! expert bank).
 //! Construction, once: the bill and the rows (the fill, or the operator's pin), the trunk's residents (the kept ones read
-//! now, the rest dropped from the weight map unread), the owned tables, the expert source on MiMo's route at the plan's
-//! rows, the KV lanes allocated at the billed context, the rate tally, the usage record and seed, the receipt's lines.
+//! now, the rest dropped from the weight map unread), the owned tables, the decode glue's texts (`decode_glue`), the
+//! expert source on MiMo's route at the plan's rows, the KV lanes allocated at the billed context, the rate tally, the
+//! usage record and seed, the receipt's lines.
 //! A request: the prompt pass in calls of at most `experts.call_rows` rows, the phase change to decode rows, serial
 //! steps; the request's end logs its decode memory. Single-flight: one request's state at a time.
 
@@ -15,6 +16,7 @@ const settings = @import("settings.zig");
 const bill = @import("bill.zig");
 const graph = @import("graph.zig");
 const experts = @import("experts.zig");
+const glue = @import("glue.zig");
 const route = @import("../mimo_v2/route.zig");
 const route_bill = @import("../mimo_v2/route_bill.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
@@ -45,6 +47,10 @@ pub const Module = struct {
     sampler: Sampler,
     /// The rate tally, the usage record and the usage seed (sdk_ext/expert/residency.zig).
     res: residency.Residency = .{},
+    /// The decode glue's texts (`decode_glue: fused`), installed at construction; `routes.glue` points here.
+    glue_kernels: glue.Kernels = .{},
+    /// The forward's construction-time routes (graph.zig `Routes`).
+    routes: graph.Routes = .{},
     /// A forward failed after it advanced the KV lanes (a sliding ring appends its rows before the forward ends, the
     /// committed length only at its end): the request's state is lost and every step refuses by name
     /// (`BeamDecodeStateLost`) until the next prompt pass restarts the lanes.
@@ -81,6 +87,28 @@ pub const Module = struct {
         const read_ns: u64 = @intCast(t_read.untilNow(io, .awake).nanoseconds);
         self.gates = try self.w.gates(gpa);
         errdefer gpa.free(self.gates);
+        // The decode glue (`decode_glue`): each layer's attention projections in one buffer (graph.zig
+        // `fuseProjections`, checked on the first layer), then the texts installed on the first layers' tables (the
+        // router's on the first routed layers', the q / k norms' and the boundaries' on layer 0's: their geometry, the
+        // launches per decode-lane width, the self-check against the stock ops); the stock ops otherwise.
+        const glue_route = try self.c.decodeGlueRoute(mlx.streamIsGpu(s));
+        if (glue_route == .fused) {
+            self.w.fuseProjections(gpa, &self.g, weights, model) catch |e| {
+                log.err("beam: the decode glue's fused projections refused ({s})\n", .{@errorName(e)});
+                return e;
+            };
+            const first = &self.w.layers[model.first_k_dense];
+            const next = if (model.moeLayers() > 1) &self.w.layers[model.first_k_dense + 1] else first;
+            const l0 = &self.w.layers[0];
+            self.glue_kernels = glue.install(gpa, s, model, .{ .w = first.router.?.w, .bias = first.router.?.bias, .next_w = next.router.?.w, .next_bias = next.router.?.bias, .q_norm = l0.attn.q_norm, .k_norm = l0.attn.k_norm, .post_attn_norm = l0.post_attn_norm, .pre_ff_norm = l0.pre_ff_norm }, &diag) catch |e| {
+                log.err("beam: the decode glue refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
+                diag = .{};
+                return e;
+            };
+            self.routes.glue = &self.glue_kernels;
+            log.info("beam decode glue installed: q/k/v/gate one GEMV, q/k norms and RoPE (or the query scale) one launch, each sublayer boundary one launch, router {d} threadgroups + select, predictor {d} threadgroups (decode_glue=fused); self-check passed\n", .{ model.n_routed_experts / glue.rows_per_group, model.n_routed_experts / glue.rows_per_group });
+        }
+        errdefer self.glue_kernels.deinit();
         // The expert source at the plan's rows, split between the routed layers at the same total (`layerSplit`: the
         // setting, else the calibrated offsets on Beam 1.0, `uniform` on another geometry).
         const n_moe = model.moeLayers();
@@ -102,6 +130,7 @@ pub const Module = struct {
         const want: experts.bank.Topology = .{ .hidden_size = model.hidden_size, .intermediate_size = model.moe_intermediate_size, .num_experts = model.n_routed_experts, .first_moe_layer = model.first_k_dense, .num_moe_layers = n_moe };
         self.src = try experts.Source.init(gpa, io, dir, want, model.n_experts_per_tok, prompt_rows, decode_rows, self.gates, s, warm_route, self.c.tally, self.c.prompt_residents, decode_moe);
         errdefer self.src.deinit();
+        if (self.routes.glue) |k| self.src.bindPredictor(k.predictor());
         // The rate tally (`expert_resident_ratio` > 0): its file read once (the first request's pins), its line.
         try self.res.openTally(gpa, io, "beam", self.c.tally, dir, std.mem.min(u32, decode_rows), self.src);
         errdefer self.res.closeTally(gpa);
@@ -113,7 +142,7 @@ pub const Module = struct {
         errdefer self.cache.deinit(&self.g);
         // The usage seed (`resident_seed`): before the first request; one line.
         try residency.seedResidents(gpa, io, "beam", &self.c.residency, dir, self.src);
-        log.info("beam routes: residents={s} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} expert_rows_by_layer={s} call_rows={d} tile_rows={d} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ @tagName(model.residents_format), @tagName(self.src.combine_route), @tagName(route.read_schedule), @tagName(route.drain), @tagName(route.bank_view), @tagName(decode_moe), @tagName(split), experts.call_rows, graph.tile_rows, @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
+        log.info("beam routes: residents={s} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} decode_glue={s} expert_rows_by_layer={s} call_rows={d} tile_rows={d} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ @tagName(model.residents_format), @tagName(self.src.combine_route), @tagName(route.read_schedule), @tagName(route.drain), @tagName(route.bank_view), @tagName(decode_moe), @tagName(glue_route), @tagName(split), experts.call_rows, graph.tile_rows, @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
         log.info("mlx-stream beam installed: {d} layers ({d} sliding, {d} full; {d} dense, {d} routed); residents {s} {d} tensors read in {d:.2} s; experts NVFP4 g16 streamed, top-{d} of {d}, {d} resident expert rows/layer, call {d}\n", .{ model.n_layers, model.nSliding(), model.nFull(), model.first_k_dense, n_moe, @tagName(model.residents_format), weights.count(), @as(f64, @floatFromInt(read_ns)) / 1e9, model.n_experts_per_tok, model.n_routed_experts, plan.rows.prompt, experts.call_rows });
         log.info("beam memory: target={d} baseline={d} process_bound={d} prompt_rows={d} decode_rows={d} reserve_tokens={d} kv=bf16 phase_rows=on growth_rows={d} forced={s}\n", .{ plan.target, plan.baseline, plan.bill.processBound(plan.rows), plan.rows.prompt, plan.rows.decode, plan.reserve, plan.rows.decode - plan.rows.prompt, if (bill.isForced(cfg)) "yes" else "no" });
         // Once (every command retired, MLX's cache cleared): the footprint beside the bill's construction terms. A report.
@@ -139,6 +168,8 @@ pub const Module = struct {
         self.res.closeTally(self.gpa);
         self.res.closeUsage();
         self.src.deinit();
+        // The source's predictor read the glue's kernels: they go after it.
+        self.glue_kernels.deinit();
         self.cache.deinit(&self.g);
         self.w.deinit(self.gpa);
         self.gpa.free(self.gates);
@@ -202,7 +233,7 @@ pub const Module = struct {
             const end = @min(ids.len, at + experts.call_rows);
             if (logits) |x| self.g.release(x);
             logits = null;
-            logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids[at..end], self.cache.len, &self.cache, self.src, head, force);
+            logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, self.routes, ids[at..end], self.cache.len, &self.cache, self.src, head, force);
             at = end;
         }
         try self.g.evalAll(&.{logits.?});
@@ -239,7 +270,7 @@ pub const Module = struct {
             try self.src.beginDecode();
             return logits;
         }
-        const logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids, self.cache.len, &self.cache, self.src, .last, force);
+        const logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, self.routes, ids, self.cache.len, &self.cache, self.src, .last, force);
         errdefer self.g.release(logits);
         // Committed, not waited on: the host's read of the step's token (its eval of the sampler's row over these
         // logits) is the step's one wait after its routing barriers, with the sampler queued behind the head.

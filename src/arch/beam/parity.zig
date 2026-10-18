@@ -422,6 +422,82 @@ test "beam parity: on the real-weight slice the fused decode experts and the hit
     }
 }
 
+const Glued = struct { logits: []f32, stats: @import("../../sdk_ext.zig").expert.Stats };
+
+/// Every row's logits of one reference's ids served at `rows` (null: the fill's) under `decode_glue`, on the served
+/// routes (the router's own choices: the glue's subject): the prompt pass's rows, then each decode step's (teacher
+/// forced); and the stream's counts (the predictor's scores choose the lookahead's reads). Caller frees the logits.
+fn gluedLogits(a: std.mem.Allocator, dir: []const u8, prefix: []const u8, rows: ?u32, decode_glue: settings.DecodeGlue) !Glued {
+    const io = testing.io;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const old_wired = try wireAsServed();
+    defer unwire(old_wired);
+    var pack_dir = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+    const text = try pack_dir.readFileAlloc(io, "config.json", a, .limited(1 << 20));
+    pack_dir.close(io);
+    defer a.free(text);
+    var diag: beam.Diag = .{};
+    const model = try beam.Config.parse(a, text, &diag);
+    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off, .expert_rows = rows, .expert_prefill_rows = rows, .decode_glue = decode_glue, .decode_glue_requested = true };
+    try cfg.validate();
+    var weights = try sdk.loader.dir(io, a, dir, .{});
+    defer weights.deinit();
+    const m = try module.Module.init(a, io, &cfg, &weights, s, 64 << 30, 2 << 30);
+    defer m.deinit();
+    if ((m.routes.glue != null) != (decode_glue == .fused)) return error.BeamParityGlueRoute;
+    var ref = try readRef(a, io, prefix, model.moeLayers());
+    defer ref.deinit(a);
+    const out = try a.alloc(f32, ref.ids.len * ref.vocab);
+    errdefer a.free(out);
+    const prompt = ref.ids[0..ref.prompt];
+    try m.beginPrompt(prompt);
+    const all = try m.promptCalls(prompt, .all, {});
+    defer m.g.release(all);
+    @memcpy(out[0 .. prompt.len * ref.vocab], try hostRows(m, all, prompt.len, ref.vocab));
+    try m.enterDecode(prompt.len);
+    for (ref.prompt..ref.ids.len) |i| {
+        const x = try m.stepWith(ref.ids[i .. i + 1], {});
+        defer m.g.release(x);
+        @memcpy(out[i * ref.vocab ..][0..ref.vocab], try hostRows(m, x, 1, ref.vocab));
+    }
+    m.requestEnd();
+    return .{ .logits = out, .stats = m.src.stats() };
+}
+
+/// `gluedLogits` under fused and under ops for every reference of `refs`: the logits bit for bit, the same reads.
+fn glueRun(dir: []const u8, refs: []const u8, rows: ?u32) !void {
+    const a = testing.allocator;
+    var it = std.mem.splitScalar(u8, refs, ',');
+    while (it.next()) |prefix| {
+        const stock = try gluedLogits(a, dir, prefix, rows, .ops);
+        defer a.free(stock.logits);
+        const fused = try gluedLogits(a, dir, prefix, rows, .fused);
+        defer a.free(fused.logits);
+        var differ: usize = 0;
+        for (stock.logits, fused.logits) |x, y| differ += @intFromBool(@as(u32, @bitCast(x)) != @as(u32, @bitCast(y)));
+        const st = stock.stats;
+        const fs = fused.stats;
+        std.debug.print("BEAM PARITY {s} decode glue fused vs ops (served routes): {d} logits, {d} differ; stream misses {d}/{d}, hits {d}/{d}, B read {d}/{d}\n", .{ std.fs.path.basename(prefix), stock.logits.len, differ, st.expert_cache_misses, fs.expert_cache_misses, st.expert_cache_hits, fs.expert_cache_hits, st.expert_bytes_read, fs.expert_bytes_read });
+        try testing.expectEqual(@as(usize, 0), differ);
+        try testing.expectEqual(st.expert_cache_misses, fs.expert_cache_misses);
+        try testing.expectEqual(st.expert_cache_hits, fs.expert_cache_hits);
+        try testing.expectEqual(st.expert_bytes_read, fs.expert_bytes_read);
+    }
+}
+
+test "beam parity: the fixture's decode glue gives the stock ops' logits, bit for bit (BEAM_PARITY, BEAM_PARITY_REF)" {
+    const dir = std.mem.span(std.c.getenv("BEAM_PARITY") orelse return error.SkipZigTest);
+    const refs = std.mem.span(std.c.getenv("BEAM_PARITY_REF") orelse return error.SkipZigTest);
+    try glueRun(dir, refs, null);
+}
+
+test "beam parity: on the real-weight slice the decode glue gives the stock ops' logits, bit for bit (BEAM_PARITY_SLICE, BEAM_PARITY_SLICE_REF)" {
+    const dir = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE") orelse return error.SkipZigTest);
+    const refs = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE_REF") orelse return error.SkipZigTest);
+    try glueRun(dir, refs, slice_rows);
+}
+
 test "beam parity: the real-weight slice at 64 of 256 rows (BEAM_PARITY_SLICE, BEAM_PARITY_SLICE_REF)" {
     const dir = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE") orelse return error.SkipZigTest);
     const refs = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE_REF") orelse return error.SkipZigTest);

@@ -349,6 +349,12 @@ pub const Source = struct {
         return g.keep(output);
     }
 
+    /// The decode lookahead's predictor (the stock route's `route.scoresStored` until bound): the decode glue's texts
+    /// (glue.zig `Kernels.predictor`), bound once at construction, before any decode step.
+    pub fn bindPredictor(self: *Self, p: mimo_math.Predictor) void {
+        self.ex.math.predictor = p;
+    }
+
     /// P1: layer `layer`'s predicted experts, hottest first, read into its free persistent rows ahead of its call.
     pub fn readAheadSeed(self: *Self, layer: u32, ranked: []const u16) !void {
         try self.ex.at(layer).readAheadSeed(ranked);
