@@ -281,14 +281,21 @@ test "beam lane: the speculative verify's device rows give the host reference's 
             var qx: [W - 1]f32 = undefined;
             var drafts: [W - 1]u32 = undefined;
             for (0..W - 1) |r| {
-                // 16 distinct ids (a shuffled range), their weights; the draft drawn from q at the drafter's uniform.
+                // The row's 16 likeliest tokens under p (a drafter's candidates), weighted p^0.8 with noise: a q near p,
+                // so that drafts are kept and rejected; the draft drawn from q at the drafter's uniform.
+                var dr: [V]f64 = undefined;
+                acc.distribution(lg[r * V ..][0..V], sm, &dr);
                 var perm: [V]u32 = undefined;
                 for (&perm, 0..) |*x, i| x.* = @intCast(i);
-                rng.random().shuffle(u32, &perm);
+                std.mem.sort(u32, &perm, &dr, struct {
+                    fn more(pp: *const [V]f64, a: u32, b: u32) bool {
+                        return pp[a] > pp[b] or (pp[a] == pp[b] and a < b);
+                    }
+                }.more);
                 var wts: [K]f32 = undefined;
                 var z: f32 = 0;
-                for (&wts) |*x| {
-                    x.* = @exp(rng.random().floatNorm(f32) * 1.5);
+                for (&wts, perm[0..K]) |*x, id| {
+                    x.* = @as(f32, @floatCast(std.math.pow(f64, dr[id] + 1e-4, 0.8))) * @exp(rng.random().floatNorm(f32) * 0.3);
                     z += x.*;
                 }
                 for (perm[0..K], wts) |id, x| qd[r * V + id] = x / z;
