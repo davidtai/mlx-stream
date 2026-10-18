@@ -841,26 +841,72 @@ static int spec_containing(int fd, int64_t off, int64_t total) {
 }
 
 /* ---------------------------------------------------------------- speculative: demand-side adoption */
+/* PROGRESSIVE ADOPT (beam/misspath M1b): bytes [a, b) of a range copied from `src` (the range's byte 0) into its parts */
+static void adopt_copy(const range_t *rg, const char *src, int64_t a, int64_t b) {
+    int64_t at = 0;
+    for (int32_t d = 0; d < rg->ndst && a < b; d++) {
+        int64_t end = at + rg->len[d];
+        if (a < end) {
+            int64_t n = (b < end ? b : end) - a;
+            memcpy((char *)(uintptr_t)rg->dst[d] + (a - at), src + a, (size_t)n);
+            a += n;
+        }
+        at = end;
+    }
+}
+
 /* Serve one demand range from a speculative record.  Returns -1 when no record serves it (the caller reads
- * it the stock way), else the range status (ST_OK, or ST_DEADLINE when the deadline passed while waiting). */
+ * it the stock way), else the range status (ST_OK, or ST_DEADLINE when the deadline passed while waiting).
+ * PROGRESSIVE ADOPT (M1b): a range of a claimed record in flight copies each part of it that has landed (the prefix
+ * of finished chunks) while the rest is read, so only the last chunk's part is left to copy when the record lands;
+ * a record that fails, or lands short of the range, after a part was copied leaves the range to the stock read,
+ * which writes every byte of its rows again. */
 static int try_adopt(const job_t *job, const range_t *rg, int64_t *out) {
     if (!nspec) return -1;
     int64_t total = range_total(rg);
     int64_t t0 = q3ld_monotonic_ns(), waited = 0;
     pthread_mutex_lock(&mu);
-    int i;
-    for (;;) {
-        i = spec_containing(job->fd, rg->offset, total);
-        if (i < 0) { pthread_mutex_unlock(&mu); return -1; }
-        spec_t *s = &spec[i];
-        int64_t need = rg->offset + total - s->base;
-        if (s->landed >= need && (s->state == SP_LANDED || s->state == SP_INFLIGHT)) break;
-        /* adoptable only if it will land: a landed-short record (EOF) or an unclaimed / queued one is not */
-        if (s->state != SP_INFLIGHT || !s->claimed || s->failed) { pthread_mutex_unlock(&mu); return -1; }
+    int i = spec_containing(job->fd, rg->offset, total);
+    if (i < 0) { pthread_mutex_unlock(&mu); return -1; }
+    spec_t *s = &spec[i];
+    int64_t start = rg->offset - s->base, need = start + total;
+    int now = s->landed >= need && (s->state == SP_LANDED || s->state == SP_INFLIGHT);
+    /* adoptable only if it will land: a landed-short record (EOF) or an unclaimed / queued one is not */
+    if (!now && (s->state != SP_INFLIGHT || !s->claimed || s->failed)) { pthread_mutex_unlock(&mu); return -1; }
+    /* An adopting copy reads s->buf until it drops `readers`. A landed record a demand range adopts without a claim
+     * (its bytes landed before any submit claimed it) could otherwise be abandoned (settle, re-validation, quiesce) and
+     * its slot reissued while the copy runs: spec_end frees it without looking at `readers`, issue() takes the free
+     * slot, and its preadv overwrites the buffer mid-copy (the range then publishes OK with torn bytes). Claiming it
+     * here, under `mu`, keeps it out of every abandon path until the copy is done. */
+    s->readers += 1;
+    s->claimed = 1;
+    s->abandon = 0;
+    const char *src = s->buf + (s->base - s->aligned) + start;
+    int64_t copied = 0, t_start = 0;
+    for (;;) {                                             /* holds mu at the loop's top */
+        int64_t have = s->landed - start;
+        if (have > total) have = total;
+        if (s->failed || (have < total && s->state != SP_INFLIGHT)) {   /* it will not land the range: stock read */
+            s->readers -= 1;
+            pthread_cond_broadcast(&land_cv);
+            pthread_mutex_unlock(&mu);
+            return -1;
+        }
+        if (have > copied) {
+            if (!t_start) { t_start = q3ld_monotonic_ns(); EV(5, rg->offset); }
+            pthread_mutex_unlock(&mu);
+            adopt_copy(rg, src, copied, have);
+            pthread_mutex_lock(&mu);
+            copied = have;
+            continue;
+        }
+        if (copied >= total) break;
         if (!waited) { waited = 1; sc[SC_ADOPT_WAITS] += 1; }
         if (job->deadline >= 0) {
             int64_t left = job->deadline - q3ld_monotonic_ns();
             if (left <= 0) {
+                s->readers -= 1;
+                pthread_cond_broadcast(&land_cv);
                 pthread_mutex_unlock(&mu);
                 out[1] = out[2] = out[3] = out[4] = 0;
                 out[5] = t0; out[6] = q3ld_monotonic_ns();
@@ -873,25 +919,8 @@ static int try_adopt(const job_t *job, const range_t *rg, int64_t *out) {
             pthread_cond_wait(&land_cv, &mu);
         }
     }
-    spec_t *s = &spec[i];
-    s->readers += 1;
-    /* An adopting copy reads s->buf until it drops `readers`. A landed record a demand range adopts without a claim
-     * (its bytes landed before any submit claimed it) could otherwise be abandoned (settle, re-validation, quiesce) and
-     * its slot reissued while the copy runs: spec_end frees it without looking at `readers`, issue() takes the free
-     * slot, and its preadv overwrites the buffer mid-copy (the range then publishes OK with torn bytes). Claiming it
-     * here, under `mu`, keeps it out of every abandon path until the copy is done. */
-    s->claimed = 1;
-    s->abandon = 0;
     if (waited) sc[SC_ADOPT_WAIT_NS] += q3ld_monotonic_ns() - t0;
-    EV(5, rg->offset);
-    const char *src = s->buf + (s->base - s->aligned) + (rg->offset - s->base);
-    pthread_mutex_unlock(&mu);
-    int64_t t_start = q3ld_monotonic_ns();
-    for (int32_t d = 0; d < rg->ndst; d++) {
-        if (rg->len[d]) memcpy((char *)(uintptr_t)rg->dst[d], src, (size_t)rg->len[d]);
-        src += rg->len[d];
-    }
-    pthread_mutex_lock(&mu);
+    if (!t_start) t_start = q3ld_monotonic_ns();
     s->readers -= 1;
     s->adopted += 1;
     sc[SC_ADOPT_RANGES] += 1;
