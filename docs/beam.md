@@ -225,7 +225,19 @@ at 173 / 183 rows, temperature 0.7, top_p 0.99, seeds 1234 and 4321. Each seed g
 | `decode_kernels` | The fused texts' set, its pipelines and prepared launches under `decode_moe: fused`: 20 MiB declared. At the pack's load the fused route's construction footprint is 18.6 MB more than the stock route's (host side 416.1 MB against 397.5 MB; MLX active the same). |
 
 The fill gives the most decode rows and prompt rows that fit the host's ceiling less its wired margin. The floor is 8
-rows. On the 256 GB M5 Ultra (ceiling 240 GiB, margin 2 GiB, baseline 12.6 GB, context 32,768) the bill test prints
+rows. The fill bills the rows beside the host's non-file baseline (wired + anonymous - purgeable + compressor, the
+host's `memory_baseline_bytes`), as GLM-5.3's bill does (`route_bill.Baseline.non_file`). Other files' page cache does
+not count against the rows: the kernel reclaims those pages when the rows need them. glm5_next and MiMo bill beside
+the box baseline (physical used, file cache included, less the pack's own cache). The bill at the two baselines, at
+context 32,768 and the 255.55 GB target, on the quiet M5 Ultra after the eviction:
+
+| Baseline | Value | Rows (prompt / decode) | Process bound |
+|---|---|---|---|
+| Box (MiMo's; Beam before 6fa9759) | 33.03 GB | 175 / 185 | 222.45 GB |
+| Non-file (Beam from 6fa9759) | 22.68 GB | 184 / 194 | 232.22 GB |
+
+Each pair of rows bills 1.085 GB. At the non-file fill the target still leaves about 7 GB of RAM free beside 11.5 GB
+of other users' file cache. On the 256 GB M5 Ultra (ceiling 240 GiB, margin 2 GiB, baseline 12.6 GB, context 32,768) the bill test prints
 the fill's rows (`BEAM BILL fixture`). `BEAM_BANK=<pack>` prints every term and the rows at the served contexts (the
 bill tool).
 
@@ -341,18 +353,22 @@ This recipe served the full pack (`Beam-1.0-501B-A23B-NVFP4-mlx-stream`) on the 
 splits the Harmony channels and parses Beam's tool calls).
 
 1. Get the GPU lock.
-2. Remove the page cache of each large file that is not the pack. The admission baseline counts every other file's
-   page cache as used memory. Before this step, 155 GB of cache from the source checkpoint gave a baseline of 174.0 GB
-   and only 45 prompt rows. After it, the baseline was 35.1 GB and the fill gave 173 prompt rows and 183 decode rows.
-   You can use `msync(MS_INVALIDATE)` on each file (no sudo) or `purge`.
-3. Start the server with a fresh `~/.mlx-serve`:
+2. Remove the page cache of each large file that is not the pack. You can use `msync(MS_INVALIDATE)` on each file
+   (no sudo) or `purge`. Before 6fa9759 the admission baseline counted every other file's page cache as used memory:
+   155 GB of cache from the source checkpoint gave a baseline of 174.0 GB and only 45 prompt rows; after the eviction
+   the baseline was 35.1 GB and the fill gave 173 prompt rows and 183 decode rows. From 6fa9759 the fill bills the
+   host's non-file baseline, so the cache no longer takes rows; the eviction still frees RAM for the run.
+3. Pin the rows. Set `expert_prefill_rows` and `expert_rows` (in `expert_streaming.settings`, or in the host's model
+   settings) so that the process is near 240 GB of memory. The published recipe pins them explicitly: the fill decides
+   only an unpinned load, and its rows move with the box's other memory.
+4. Start the server with a fresh `~/.mlx-serve`:
 
 ```sh
 MLX_SERVE_GPU_CEILING_MB=245760 mlx-serve --model <pack> --serve --port 11391 --ctx-size 32768 --no-vision \
   --no-warmup-eager --prefix-cache-entries 0 --metrics --log-file off --kv-quant off --wired-margin-gib 2
 ```
 
-4. To seed the residents, run one request with `expert_usage_record` set to an absolute path. Then put that
+5. To seed the residents, run one request with `expert_usage_record` set to an absolute path. Then put that
    `expert-usage-v1.json` beside the pack (or in a copy of the pack with hard links). The next load reads it
    (`resident_seed: usage`, the default when the file is there).
 

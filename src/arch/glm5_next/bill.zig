@@ -57,6 +57,10 @@ pub fn dsaKernelsBytes(c: *const glm.Config) u64 {
 }
 
 pub const Plan = route_bill.Plan;
+/// The rest of the box the fill bills beside: MiMo's box baseline (`route_bill.Baseline.box`: other files' page cache
+/// counts against the rows). Beam bills the host's non-file baseline as GLM-5.3 does; glm5_next keeps the box route
+/// until an ABBA of its own measures the change.
+pub const fill_baseline: route_bill.Baseline = .box;
 
 // ── The residents (the shards' headers: no payload is read) ──
 

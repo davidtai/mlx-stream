@@ -16,7 +16,7 @@ const bill = @import("bill.zig");
 const graph = @import("graph.zig");
 const experts = @import("experts.zig");
 const route = @import("../mimo_v2/route.zig");
-const pagecache = @import("../mimo_v2/pagecache.zig");
+const route_bill = @import("../mimo_v2/route_bill.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const sdk_ext = @import("../../sdk_ext.zig");
 const residency = @import("../../sdk_ext/expert/residency.zig");
@@ -269,14 +269,12 @@ pub const Module = struct {
     }
 };
 
-/// The construction config the module fills on: the host's facts, with the fill's baseline the box as the window guard
-/// counts it (MiMo's `pagecache.admissionBaseline`: physical used less the pack's own page cache, evicted here, floored
-/// at the host's non-file baseline).
+/// The construction config the module fills on: the host's facts, with the fill's baseline by beam's route
+/// (`bill.fill_baseline`: the host's non-file baseline; the pack's own page cache evicted here; one line with the box's
+/// readings beside it).
 pub fn admitted(io: std.Io, c: *const settings.Config, facts: *const sdk.LoadFacts) !settings.Config {
     var built = c.withFacts(facts);
-    if (facts.memory_baseline_bytes) |nonfile| if (c.model_dir) |dir| {
-        built.memory_baseline_bytes = try pagecache.admissionBaseline(io, dir, nonfile);
-    };
+    built.memory_baseline_bytes = try route_bill.admissionBaseline(io, "beam", bill.fill_baseline, c.model_dir, facts);
     return built;
 }
 

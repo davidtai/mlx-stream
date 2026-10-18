@@ -33,6 +33,12 @@ pub const wire_buffer_bytes = dsv_bill.wire_buffer_bytes;
 pub const min_rows: u32 = beam.default_expert_rows;
 pub const construction_tolerance_bytes = route_bill.construction_tolerance_bytes;
 pub const Plan = route_bill.Plan;
+/// The rest of the box the fill bills beside: the host's non-file baseline, as GLM-5.3's bill (`route_bill.Baseline`).
+/// On the quiet M5 Ultra the box route counted 11.5 GB of other users' file cache (33.0 against 21.5 GB), which the
+/// kernel reclaims when the rows need its pages: the process bound rises from about 222.5 to about 233 GB of the
+/// 255.55 GB target. The target (the GPU ceiling less the wired margin) still leaves about 7 GB of RAM free beside
+/// that file cache at the fill.
+pub const fill_baseline: route_bill.Baseline = .non_file;
 
 const bf16: u64 = 2;
 const f32b: u64 = 4;
@@ -413,6 +419,24 @@ test "beam bill: the decode wave holds the dense layers and the first routed att
     // The f32 SwiGLU is one kernel (bf16 in and out): the projection tile's activation is within MiMo's 24 B a column.
     const nr: u64 = 1024;
     try testing.expectEqual(nr * (20 * @as(u64, c.hidden_size) + 24 * @as(u64, c.moe_intermediate_size) + 32), route_bill.tileBytes(&ri, nr));
+}
+
+test "beam bill: on the host's non-file baseline the fill takes other users' file cache as rows, within the target" {
+    const a = testing.allocator;
+    const in = try fixtureInputs(32_768);
+    const b = try billOf(a, &in);
+    defer b.free(a);
+    const target = box_ceiling - box_stop;
+    // The quiet M5 Ultra after the eviction (CONTROL.md sec. 3): physical used 33.04 GB, the pack's cache 0.01 GB, the
+    // host's non-file reading 22.68 GB.
+    const box = route_bill.baselineOf(.box, 22_680_000_000, 33_040_000_000, 10_000_000);
+    const nonfile = route_bill.baselineOf(fill_baseline, 22_680_000_000, 33_040_000_000, 10_000_000);
+    try testing.expectEqual(@as(u64, 22_680_000_000), nonfile);
+    const rows_box = try sdk.fill(b, box, target, 256, min_rows);
+    const rows = try sdk.fill(b, nonfile, target, 256, min_rows);
+    try testing.expect(rows.decode > rows_box.decode and rows.prompt > rows_box.prompt);
+    try testing.expect(b.total(.prompt, nonfile, rows.prompt) <= target and b.total(.decode, nonfile, rows.decode) <= target);
+    std.debug.print("\nBEAM BILL baselines (ctx 32,768, target {d}): box {d} -> rows {d}/{d} process_bound {d}; non-file {d} -> rows {d}/{d} process_bound {d}\n", .{ target, box, rows_box.prompt, rows_box.decode, b.processBound(rows_box), nonfile, rows.prompt, rows.decode, b.processBound(rows) });
 }
 
 test "beam bill: every term is non-decreasing in the billed context (the ladder bounds a rung by the next table)" {

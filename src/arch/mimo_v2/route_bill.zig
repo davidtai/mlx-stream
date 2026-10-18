@@ -15,6 +15,8 @@ const safetensors = @import("../../sdk_ext/safetensors.zig");
 const mimo_math = @import("math.zig");
 const mimo_stream = @import("stream.zig");
 const route = @import("route.zig");
+const pagecache = @import("pagecache.zig");
+const phase_mem = @import("../../phase_memory.zig");
 const dsv_bill = @import("../deepseek_v41/bill.zig");
 
 const Term = sdk.MemoryBill.Term;
@@ -168,6 +170,46 @@ pub fn compose(a: std.mem.Allocator, arch: []const Term, src: sdk.MemoryBill) !s
 /// How far the constructed footprint may sit above the construction terms before the construction check reports it.
 pub const construction_tolerance_bytes: u64 = 250_000_000;
 
+// ── The fill's baseline ──
+
+/// The rest of the box an arch's fill bills its rows beside, chosen by the arch (its bill's `fill_baseline`).
+pub const Baseline = enum {
+    /// MiMo's admission baseline (`pagecache.admissionBaseline`): the box's physical used (vm_stat wired + active +
+    /// inactive + compressor: every file's page cache included) less the pack's own cache (evicted at the load), at
+    /// least the host's non-file baseline. Other users' file cache counts against the rows.
+    box,
+    /// The host's non-file baseline (`LoadFacts.memory_baseline_bytes`: wired + anonymous - purgeable + compressor), as
+    /// GLM-5.3's bill takes it (`phase_memory.restOfBox`, no floor): other files' page cache is the kernel's to reclaim
+    /// when the rows need its pages, so it does not count against them. The pack's own cache is still evicted at the
+    /// load (its residents and records load past the page cache).
+    non_file,
+};
+
+/// The fill's baseline under `route` from the load's readings (pure): `nonfile` the host's non-file baseline,
+/// `physical` the box's physical used, `pack_cached` the pack's own page cache.
+pub fn baselineOf(route_: Baseline, nonfile: u64, physical: u64, pack_cached: u64) u64 {
+    return switch (route_) {
+        .box => pagecache.baselineOf(physical, pack_cached, nonfile),
+        .non_file => phase_mem.restOfBox(nonfile, null),
+    };
+}
+
+/// The construction's fill baseline (once, at the load): the host's non-file reading (`facts`), the box's physical
+/// used and the pack's own page cache (evicted here), combined by `route`; one line with every reading. Null where the
+/// host gave no baseline (the bill then refuses by name); the host's reading where the pack has no directory.
+pub fn admissionBaseline(io: std.Io, comptime arch: []const u8, comptime route_: Baseline, pack_dir: ?[]const u8, facts: *const sdk.LoadFacts) !?u64 {
+    const nonfile = facts.memory_baseline_bytes orelse return null;
+    const dir = pack_dir orelse return nonfile;
+    const physical = sdk.memory.physicalUsedBytes(sdk.memory.vmBytes());
+    const pack_cached = try pagecache.packCachedBytes(io, dir, true);
+    const baseline = baselineOf(route_, nonfile, physical, pack_cached);
+    switch (route_) {
+        .box => sdk.log.info(arch ++ " admission baseline: physical_used={d} pack_cached={d} nonfile={d} -> baseline={d}\n", .{ physical, pack_cached, nonfile, baseline }),
+        .non_file => sdk.log.info(arch ++ " admission baseline: nonfile={d} -> baseline={d} (the host's non-file baseline, as glm_moe_dsa bills it; other files' page cache aside: physical_used={d} pack_cached={d} evicted, the box baseline would be {d})\n", .{ nonfile, baseline, physical, pack_cached, baselineOf(.box, nonfile, physical, pack_cached) }),
+    }
+    return baseline;
+}
+
 /// The bill at the load's reserve and the rows (forced or the fill's).
 pub const Plan = struct {
     bill: sdk.MemoryBill,
@@ -215,6 +257,22 @@ pub fn forcedRowsLine(buf: []u8, rows: sdk.Rows, over: u64, baseline: u64) []con
 }
 
 const testing = std.testing;
+
+test "route bill baseline: the box route counts every file's cache but the pack's; the non-file route the host's reading only" {
+    // The quiet M5 Ultra after the eviction (work/beam-eval/CONTROL.md sec. 3): physical used 33.04 GB, the pack's
+    // cache 0.01 GB, the host's non-file reading 22.68 GB (11.5 GB of other users' file cache between them).
+    const nonfile: u64 = 22_680_000_000;
+    const physical: u64 = 33_040_000_000;
+    const cached: u64 = 10_000_000;
+    try testing.expectEqual(@as(u64, 33_030_000_000), baselineOf(.box, nonfile, physical, cached));
+    try testing.expectEqual(nonfile, baselineOf(.non_file, nonfile, physical, cached));
+    // The box route never bills under the host's reading; the non-file route is GLM-5.3's (`restOfBox`, no floor).
+    try testing.expectEqual(nonfile, baselineOf(.box, nonfile, 1, 0));
+    try testing.expectEqual(phase_mem.restOfBox(nonfile, null), baselineOf(.non_file, nonfile, physical, cached));
+    // No host reading: no baseline (the bill refuses by name); no pack directory: the host's reading.
+    try testing.expectEqual(@as(?u64, null), try admissionBaseline(testing.io, "test", .non_file, "/nonexistent", &.{ .wired_margin_bytes = 0 }));
+    try testing.expectEqual(@as(?u64, nonfile), try admissionBaseline(testing.io, "test", .box, null, &.{ .memory_baseline_bytes = nonfile, .wired_margin_bytes = 0 }));
+}
 
 test "mimo route bill: the source's terms keep their order, the arch's texts before the slot wiring, the one row term" {
     const a = testing.allocator;
