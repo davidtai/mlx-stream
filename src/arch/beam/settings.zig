@@ -310,7 +310,7 @@ test "beam settings: every bad value refuses by name; an unknown key (a lane, a 
         .{ .text = "{\"decode_moe\":\"banked\"}", .err = error.BeamDecodeMoeSetting },
         .{ .text = "{\"decode_moe\":1}", .err = error.BeamDecodeMoeSetting },
     }) |case| try testing.expectError(case.err, (try parseSettings(case.text)).validate());
-    for ([_][]const u8{ "{\"mtp_lane\":true}", "{\"decode_glue\":\"fused\"}", "{\"draft_depth\":2}" }) |text|
+    for ([_][]const u8{ "{\"mtp_lane\":true}", "{\"decode_dsa\":\"fused\"}", "{\"draft_depth\":2}" }) |text|
         try testing.expectError(error.BeamSettingUnknown, parseSettings(text));
     var c: Config = .{};
     c.kv_quant_bits = 8;
