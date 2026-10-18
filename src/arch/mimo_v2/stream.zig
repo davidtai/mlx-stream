@@ -572,6 +572,12 @@ fn p7RunCallStaged(f: *HitFixture, ss: *StreamSource, layer: u32, ids: []const u
     if (next != null) try std.testing.expect(!ss.stream.stage_next.live);
 }
 
+/// `P7Pool.stage_wait`'s probe: the stage's reads landed before the call's plans (a call's posts copy only landed staged
+/// records: `p7Submit`), so a script without reader timing copies what it staged.
+fn p7AwaitStage(f: *HitFixture, _: *StreamSource) anyerror!void {
+    try f.stream.awaitStage();
+}
+
 /// P1's early ranking in the script: the read-ahead's own, its 3 hottest moved last (an early prediction's errors: the
 /// stage past the empty rows then takes records the read-ahead admits, whose staged rows its admissions copy).
 fn p7Early(pred: []const u16, out: *[64]u16) []const u16 {
@@ -610,7 +616,8 @@ fn p7Ids(rng: std.Random, rows: usize, span: u16, out: []u16) []u16 {
 /// `stage_rows`: P6's staging rows (`Options.prompt_stage_rows`, Beam's route; MiMo's 0). `stage_ahead`: P1's cold
 /// schedule (Beam's route): a prompt's first call stages its own layer at its start (the hottest of its early ranking,
 /// `p7Early`), and each call stages the next call's layer of the prompt once it has posted its last read (`P7Next`);
-/// `stage_wait`: the start's stage landed before the read-ahead (its admissions copy it).
+/// `stage_wait`: the start's stage landed before the read-ahead (its admissions copy it), and each call's stage before
+/// its plans (`p7AwaitStage`: its posts copy it).
 const P7Pool = struct { workers: u32 = io_workers, hold_ns: i64 = 0, delay_ns: i64 = 0, relocate: bool = false, stage_rows: u32 = 0, stage_ahead: bool = false, stage_wait: bool = false };
 
 fn p7Fixture(f: *HitFixture, a: std.mem.Allocator, rows: []const u32, schedule: ReadSchedule) !StreamSource {
@@ -722,7 +729,7 @@ fn p7RunScriptOn(a: std.mem.Allocator, schedule: ReadSchedule, rows: []const u32
             .{ .rel = @intCast((i + 1) % 2), .pred = p7Early(script.pred[i + 1], &next_early) }
         else
             null;
-        try p7RunCallStaged(&f, &ss, layer, ids, pred, &out.calls[i], null, next);
+        try p7RunCallStaged(&f, &ss, layer, ids, pred, &out.calls[i], if (pool.stage_wait) p7AwaitStage else null, next);
         // X20: every call of a request runs the post its start chose (an overlap stream; a stock stream has no post).
         if (f.stream.prompt_reads == .overlap) try std.testing.expectEqual(aheadPost(out.chosen[out.n_requests - 1]), f.stream.prompt_ahead);
         if ((i + 1) % script.per_prompt == 0) {
@@ -1151,8 +1158,8 @@ test "mimo p6 staged reads CPU (beam's route): a call over full rows stages its 
     // Beam's route (early_whole_trim + relocation) under three reader timings.
     const Arm = struct { schedule: ReadSchedule, pool: P7Pool };
     const arms = [_]Arm{
-        .{ .schedule = .early_whole, .pool = .{ .relocate = true, .stage_rows = 16 } },
-        .{ .schedule = .early_whole_trim, .pool = .{ .relocate = true, .stage_rows = 16 } },
+        .{ .schedule = .early_whole, .pool = .{ .relocate = true, .stage_rows = 16, .stage_wait = true } },
+        .{ .schedule = .early_whole_trim, .pool = .{ .relocate = true, .stage_rows = 16, .stage_wait = true } },
         .{ .schedule = .early_whole_trim, .pool = .{ .workers = 1, .delay_ns = 2 * std.time.ns_per_ms, .relocate = true, .stage_rows = 16 } },
         .{ .schedule = .early_whole_trim, .pool = .{ .workers = 1, .hold_ns = 50 * std.time.ns_per_ms, .relocate = true, .stage_rows = 64 } },
     };
@@ -1169,7 +1176,10 @@ test "mimo p6 staged reads CPU (beam's route): a call over full rows stages its 
         try testing.expectEqual(cur.stats.expert_cache_misses, run.stats.expert_cache_misses);
         // Every staged record is copied by one load or counted unused; its bytes are read once, into its staged row.
         const s = run.stats;
-        try testing.expect(s.staged > 0 and s.stage_copies > 0);
+        try testing.expect(s.staged > 0);
+        // The stage landed before the plans: the posts copy it (with the reader held back, a staged read still in flight
+        // at the posts is read again by its load and counted unused).
+        if (arm.pool.stage_wait) try testing.expect(s.stage_copies > 0);
         try testing.expectEqual(s.staged, s.stage_copies + s.stage_unused);
         try testing.expectEqual(s.staged * record, s.staged_bytes);
         // A copy replaces its load's read: the reads are the schedule's own and the unused staged records.
