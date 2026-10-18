@@ -79,8 +79,8 @@ adds only its residents. The shard pass then reads only the residents of each sh
 
 ### The expert record
 
-`src/arch/glm5_next/bank.zig` is the specification. A record has nine parts, back to back. Each projection (gate, up,
-down) has three parts:
+The specification is `src/expert/nvfp4_bank.zig`, or `src/arch/glm5_next/bank.zig` in a tree without it. A record
+has nine parts, back to back. Each projection (gate, up, down) has three parts:
 
 | part | dtype | shape | source |
 |---|---|---|---|

@@ -34,7 +34,11 @@ import prepare_nvfp4_pack as conv  # noqa: E402
 from packlib import PrepError, affine, drafter, manifest, nocache, usage  # noqa: E402
 from packlib.st import E2M1, E4M3, StFile, header_bytes, nbytes  # noqa: E402
 
-BANK_ZIG = HERE.parent / "src" / "arch" / "glm5_next" / "bank.zig"
+# The NVFP4 bank's Zig source, the spec: src/expert/nvfp4_bank.zig, else (a tree without it)
+# src/arch/glm5_next/bank.zig.
+SPEC_PATHS = (HERE.parent / "src" / "expert" / "nvfp4_bank.zig",
+              HERE.parent / "src" / "arch" / "glm5_next" / "bank.zig")
+BANK_ZIG = next((p for p in SPEC_PATHS if p.exists()), SPEC_PATHS[-1])
 SEED = 7
 # beam_fixture.py --drafter --seed 0: model.safetensors (docs/nvfp4-pack.md)
 TINY_DRAFTER = (2_587_744, "8452b030b568245314b3bed9931934b4cf46ecc473174bd05687b95e28643995")

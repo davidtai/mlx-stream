@@ -1,6 +1,6 @@
-"""The NVFP4 expert bank's record and manifest (format mlx-stream-nvfp4-expert-bank-v1, layout nvfp4-gud-9part):
-src/arch/glm5_next/bank.zig is the spec. `Geometry` is its Geometry.init, `check` its Bank.parseFor, each refusal named
-by the Zig error."""
+"""The NVFP4 expert bank's record and manifest (format mlx-stream-nvfp4-expert-bank-v1, layout nvfp4-gud-9part). The
+spec is src/expert/nvfp4_bank.zig, or src/arch/glm5_next/bank.zig in a tree without it. `Geometry` is its
+Geometry.init, `check` its Bank.parseFor, each refusal named by the Zig error."""
 from __future__ import annotations
 
 import json

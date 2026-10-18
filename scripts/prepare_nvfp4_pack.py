@@ -2,11 +2,12 @@
 """Build an mlx-stream NVFP4 pack from a ModelOpt NVFP4 Hugging Face checkpoint (docs/nvfp4-pack.md).
 
 The routed experts become one NVFP4 expert bank (experts.bin + expert-manifest.json, format
-mlx-stream-nvfp4-expert-bank-v1, layout nvfp4-gud-9part: src/arch/glm5_next/bank.zig is the spec); every other tensor
-becomes the residents (model.safetensors + index, each tensor's sha256 in the index). The residents tier
-(`--residents`): bf16 (the default) writes the release's bytes and dtypes, nothing quantized or rounded; q8 writes every
-linear of the trunk and the head as MLX affine 8-bit group 64 (packlib/affine.py: U32 codes, BF16 scales and biases;
-config.json `residents_format: affine8_g64`) and every other resident as released.
+mlx-stream-nvfp4-expert-bank-v1, layout nvfp4-gud-9part; the spec is src/expert/nvfp4_bank.zig, or
+src/arch/glm5_next/bank.zig in a tree without it); every other tensor becomes the residents (model.safetensors +
+index, each tensor's sha256 in the index). The residents tier (`--residents`): bf16 (the default) writes the
+release's bytes and dtypes, nothing quantized or rounded; q8 writes every linear of the trunk and the head as MLX
+affine 8-bit group 64 (packlib/affine.py: U32 codes, BF16 scales and biases; config.json `residents_format:
+affine8_g64`) and every other resident as released.
 
 Families (`--family`):
   beam       reflection/Beam-1.0-501B-A23B-NVFP4 at 3bd1dccf13c8f7aa3d6732c5aaa48ba107a2c086 (model_type beam). The
