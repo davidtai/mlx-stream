@@ -507,8 +507,9 @@ test "beam parity: the real-weight slice at 64 of 256 rows (BEAM_PARITY_SLICE, B
 /// P5's one prompt call against the chunked calls it replaced: one prompt of `long_rows` ids (the coding prompt's
 /// length, past the old call of `old_call_rows`) served as one call (`experts.call_rows`), and as the calls of 16,384
 /// and 61 rows that the module made before P5; then `long_steps` decode steps. Both paths take the same forced routes
-/// (a fixed spread of experts a row: a near tie of the tiny model's router moves no row) and record the router's own
-/// choices beside them.
+/// (a fixed spread of experts a row: a near tie of the router moves no row) and record the router's own choices beside
+/// them. On the real-weight slice only: the fixture's geometry takes MiMo's stock combine, which refuses a call past
+/// 16,384 rows (`MimoCombineTokens`), so it cannot serve P5's call.
 pub const long_rows: usize = 16_445;
 pub const old_call_rows: usize = 16_384;
 pub const long_steps: usize = 4;
@@ -569,9 +570,9 @@ fn longRun(a: std.mem.Allocator, dir: []const u8, rows: ?u32, ids: []const u32, 
 /// The long case on one pack: its ids (a fixed sequence over the vocabulary) and its forced routes (row p of routed
 /// layer l takes the k experts from (p x 2,654,435,761 + l x 40,503) mod E on), served in one call and in the old calls;
 /// the logits compared bit for bit, their largest difference, the argmax on every row whose top-2 margin is past twice
-/// `abs_tol`, and the router's own choices (as sets) by position: before the old call's end, after it, in decode.
-/// `bounded`: the logits hold `abs_tol` and the argmax (the fixture); else a report (the slice's bound needs a twin).
-fn longCase(dir: []const u8, rows: ?u32, bounded: bool) !void {
+/// `abs_tol`, and the router's own choices (as sets) by position: before the old call's end, after it, in decode. A
+/// report: the slice's bound is its reference twin's (`twin_factor`), and this prompt has no reference.
+fn longCase(dir: []const u8, rows: ?u32) !void {
     const a = testing.allocator;
     const io = testing.io;
     var pack_dir = try std.Io.Dir.openDirAbsolute(io, dir, .{});
@@ -633,16 +634,9 @@ fn longCase(dir: []const u8, rows: ?u32, bounded: bool) !void {
         choice_differ[span] += @intFromBool(!same);
     };
     std.debug.print("BEAM PARITY {s} one call vs calls of {d} rows ({d} prompt rows, {d} decode steps, forced routes): {d} logits, {d} differ, max_diff {d:.5} (abs_tol {d:.4}), argmax {d} of {d} decisive rows differ; router choices differ: {d} of {d} before row {d}, {d} of {d} after, {d} of {d} in decode\n", .{ std.fs.path.basename(dir), old_call_rows, long_rows, long_steps, one.logits.len, differ, max_diff, abs_tol, argmax_differ, decisive, choice_differ[0], choices[0], old_call_rows, choice_differ[1], choices[1], choice_differ[2], choices[2] });
-    if (bounded) {
-        try testing.expect(max_diff <= abs_tol);
-        try testing.expectEqual(@as(usize, 0), argmax_differ);
-    }
 }
 
-test "beam parity: a prompt past the old 16,384-row call: P5's one call against the chunked calls (BEAM_PARITY, BEAM_PARITY_SLICE)" {
-    const fixture = std.c.getenv("BEAM_PARITY");
-    const slice = std.c.getenv("BEAM_PARITY_SLICE");
-    if (fixture == null and slice == null) return error.SkipZigTest;
-    if (fixture) |d| try longCase(std.mem.span(d), null, true);
-    if (slice) |d| try longCase(std.mem.span(d), slice_rows, false);
+test "beam parity: on the real-weight slice a prompt past the old 16,384-row call: P5's one call against the chunked calls (BEAM_PARITY_SLICE)" {
+    const dir = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE") orelse return error.SkipZigTest);
+    try longCase(dir, slice_rows);
 }
