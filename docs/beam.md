@@ -106,6 +106,33 @@ time on one row, so that MLX builds them at the load.
 The router's group top-k sums the kept groups' hits as bools (MLX sums them as int32: no cast) and masks the grouped
 scores (no [rows, 256] mask copy). The scheduler reads the router's u32 ids as they are (no cast to int32).
 
+### The decode glue
+
+A decode row runs small trunk steps between its large GEMVs. With the stock ops (`decode_glue: ops`) they are: the
+router's input cast, its GEMV and 17 ops; the predictor's cast, GEMV, sigmoid and add; four projection GEMVs (q, k, v
+and gate); two norms and two ropes on a sliding layer, or two norms and the query scale on a full layer; and at each
+sublayer boundary two norms and the depth-scaled add. `decode_glue: fused` (the default) installs texts for these
+steps at construction (`glue.zig`; the texts in `src/kernels/decode_glue/`, pinned by `manifest_beam.json`):
+
+- `glue_router_gemv` and `glue_router_select`: the router's product, then its tail (the sigmoid, the correction, the
+  group top-k, the top-k and the normalized weights), in two launches. The predictor's scores in one launch (the
+  GEMV's second epilogue, on the next routed layer's router).
+- One buffer for each layer's q, k, v and gate projections, and one GEMV a decode row (`graph.zig`
+  `fuseProjections`). Prompt calls read the four projections as row views of the buffer, with the stock ops.
+- `glue_qk_norm`: the q / k norms with RoPE, or with the full layer's query scale, in one launch.
+- `glue_add_norm`: each sublayer boundary (the sublayer's norm, the depth-scaled add and the next sublayer's norm) in
+  one launch. The last boundary norms the row with the final norm.
+
+Each text gives the stock ops' bits: the ids, the weights, the predictor's scores and the normed rows. The
+construction checks each text against the stock ops on the model's own tables, and refuses the load by name when one
+differs. The parity tests run the fixture and the real-weight slice under `fused` and under `ops`: 0 logits differ,
+and the stream reads the same records. At more than one row the router's product stays MLX's GEMM. The attention's
+output gate is one compiled kernel on every call (`graph.zig` `gateOut`).
+
+Measured on fold 2 (the q8 pack, rows 190 / 200, seeds 1234 and 4321, ABBA `rtr2-65df8e4-vs-ctl-stack-1fbcc62-q8-232`):
+decode 20.19 / 19.81 -> 21.64 / 21.27 tok/s (+7.3 %), 50.01 -> 46.62 ms a step, prefill 696.6 -> 691.0 tok/s
+(-0.8 %). Each seed gives the same text in the two arms, with the same SSD bytes a token.
+
 ### The routing barrier, measured
 
 A decode step has 49 routing barriers, one for each routed layer. At a barrier the router has ended and the hit wave
@@ -219,11 +246,13 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 | `prompt_residents` | `keep`, `forget` | `keep` |
 | `gpu_keep_warm` | `waits`, `off` | `waits` on a GPU stream |
 | `decode_moe` | `hitpass`, `fused`, `stock` | `hitpass` where registered, on a GPU stream |
+| `decode_glue` | `fused`, `ops` | `fused` where the texts register the model's router, on a GPU stream |
 
 One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV quantization must be off
 (`BeamKvQuantUnsupported`). `decode_moe: hitpass` or `fused` named for a model where the texts are not registered
 refuses the load (`BeamDecodeMoeUnregistered`); named on a CPU stream it refuses at construction
-(`BeamDecodeMoeNeedsGpu`).
+(`BeamDecodeMoeNeedsGpu`). `decode_glue: fused` named for a model whose router the texts do not register refuses the
+load (`BeamDecodeGlueUnregistered`); named on a CPU stream it refuses at construction (`BeamDecodeGlueNeedsGpu`).
 
 `expert_rows_by_layer` moves decode rows between the routed layers. The prompt rows and the decode total stay the
 plan's, so the bill does not change. Each offset adds to the plan's decode rows of one routed layer (model layer 3
@@ -263,6 +292,7 @@ at 173 / 183 rows, temperature 0.7, top_p 0.99, seeds 1234 and 4321. Each seed g
 | `sampler`, `gpu_warm` | The plugin's sampler. MiMo's keep-warm engine when it is on. |
 | `decode_kernels` | The fused texts' set, its pipelines and prepared launches under `decode_moe: hitpass` and `fused`: 20 MiB declared. At the pack's load the fused route's construction footprint is 18.6 MB more than the stock route's (host side 416.1 MB against 397.5 MB; MLX active the same). |
 | `hitpass_luts` | Under `decode_moe: hitpass`: a LUT pair for each model layer, each LUT a page (52 x 2 x 16 KiB). |
+| `glue_kernels` | Under `decode_glue: fused`: the glue's texts, their pipelines and launch configurations (`glue.zig`): 8 MiB declared, from construction. |
 
 The fill gives the most decode rows and prompt rows that fit the host's ceiling less its wired margin. The floor is 8
 rows. The fill bills the rows beside the host's non-file baseline (wired + anonymous - purgeable + compressor, the
