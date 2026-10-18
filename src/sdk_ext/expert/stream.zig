@@ -491,8 +491,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// geometry; 0: none, the control). A prompt layer whose persistent rows hold no empty row (the usage seed's or
             /// the kept residents, a later call of a prompt) reads its predicted records that are not resident into these
             /// rows while its attention runs, hottest first (`readAheadSeed`). A load of the layer's call that reads such a
-            /// record copies it from its staged row into its planned row instead (`p7Submit`, on the copier); the waits of
-            /// the load's part and its gate hold until the copy is done. Needs `overlap` and one slot geometry. The plans,
+            /// record copies it from its staged row into its planned row instead (`p7Submit`, on the copier) when the staged
+            /// read has completed (one still in flight: the load reads the record itself); the waits of the load's part and
+            /// its gate hold until the copy is done. Needs `overlap` and one slot geometry. The plans,
             /// slots and kernels are the control's, and a planned row holds its record's bytes before a kernel reads it:
             /// exact by construction. P1's cold schedule (`stageAhead`) stages a layer with empty rows before its read-ahead;
             /// that read-ahead's admissions of landed staged records copy them too (`postAheadJobs`).
@@ -2655,8 +2656,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const loc = self.locate(r.layer, l.slot);
                     const m = loc.meta;
                     if (m.pins != 0 or m.state == .loading) return self.fail(error.SlotStillPinned);
-                    if (r.reads[li]) if (self.stagedRow(r.layer, l.expert)) |srow| {
-                        // Its job landed first (its row holds the record); the row is the load's own once the copy is done.
+                    if (r.reads[li]) if (self.stagedRow(r.layer, l.expert)) |srow| if (self.stageJobDone(self.stage.job_of[srow])) {
+                        // Its job has completed (landed here without a wait); the row is the load's own once the copy is
+                        // done. A staged read still in flight is not waited for: the load reads the record itself, and the
+                        // staged record stays unused (the host never stalls the call's posts on the stage).
                         try self.landStageJob(self.stage.job_of[srow]);
                         for (0..n_components) |c| {
                             const dst = loc.rows.row(@enumFromInt(c), loc.row);
