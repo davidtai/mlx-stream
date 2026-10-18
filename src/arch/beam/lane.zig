@@ -63,6 +63,27 @@ pub const Stats = struct {
     draft_ns: u64 = 0,
     verify_ns: u64 = 0,
     commit_ns: u64 = 0,
+    /// By draft position i (0: the first draft): the rounds that verified a draft there, and those that accepted it.
+    pos_drafted: [drafter.max_block - 1]u64 = @splat(0),
+    pos_accepted: [drafter.max_block - 1]u64 = @splat(0),
+
+    /// A round of `k` verified drafts and `accepted` accepted ones in the counters by position.
+    pub fn addPositions(st: *Stats, k: u32, accepted: u32) void {
+        std.debug.assert(accepted <= k and k <= st.pos_drafted.len);
+        for (st.pos_drafted[0..k]) |*x| x.* += 1;
+        for (st.pos_accepted[0..accepted]) |*x| x.* += 1;
+    }
+
+    /// The acceptance by draft position: `accepted/verified` at each position that a round verified, in order.
+    pub fn positions(st: *const Stats, buf: []u8) []const u8 {
+        var n: usize = 0;
+        for (st.pos_drafted, st.pos_accepted, 0..) |d, acc_n, i| {
+            if (d == 0) break;
+            const w = std.fmt.bufPrint(buf[n..], "{s}{d}/{d}", .{ if (i == 0) "" else ",", acc_n, d }) catch break;
+            n += w.len;
+        }
+        return buf[0..n];
+    }
 
     /// The receipt's line: MiMo's (rounds, drafts, accepted and tokens a round, the stream's misses and bytes a round),
     /// then the chunks, the gate, typical's deviations, the phases' time a round.
@@ -287,6 +308,7 @@ pub fn roundWith(m: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, s
     const tokens = try a.dupe(u32, ids[0 .. walk.accepted + 1]);
     const t_end = m.nowNs();
     self.stats.base.add(k, walk.accepted);
+    self.stats.addPositions(k, walk.accepted);
     self.stats.chunks += n_chunks;
     self.stats.deviated += deviated;
     self.stats.draft_ns += t_draft - t0;
@@ -334,6 +356,17 @@ test "beam lane: a verify's chunks, their drafts and the walk: early exit at the
         const verified = @min(16, (rejected_chunk + 1) * chunk_rows);
         if (acc_n < 15) try testing.expect(verified - (acc_n + 1) < chunk_rows);
     }
+}
+
+test "beam lane: the acceptance by draft position counts each round's verified and accepted drafts" {
+    var st: Stats = .{};
+    st.addPositions(3, 3);
+    st.addPositions(3, 1);
+    st.addPositions(2, 0);
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("2/3,1/3,1/2", st.positions(&buf));
+    const none: Stats = .{};
+    try testing.expectEqualStrings("", none.positions(&buf));
 }
 
 test "beam lane: the label names the rule, the delta, the depth and a gate" {

@@ -357,6 +357,11 @@ pub const Module = struct {
         self.res.endUsage(self.io, "beam", self.src, d.prompt_tokens, d.tokens);
         self.res.endTally(self.gpa, self.io, "beam", self.c.tally, self.src);
         log.info("beam decode: steps={d} tokens={d} wall_s={d:.3} tok_s={d:.2} ssd_bytes={d} ssd_bytes_per_token={d} direct_ranges={d}\n", .{ d.steps, d.tokens, @as(f64, @floatFromInt(d.wall_ns)) / 1e9, tok_s, s1.expert_bytes_read -| d.s0.expert_bytes_read, if (d.tokens > 0) (s1.expert_bytes_read -| d.s0.expert_bytes_read) / d.tokens else 0, s1.direct_ranges -| d.s0.direct_ranges });
+        // The draft lane's acceptance by draft position over the request (accepted/verified at draft 1, 2, ...).
+        if (self.armedLane()) |l| if (l.stats.base.rounds > 0) {
+            var pb: [512]u8 = undefined;
+            log.info("beam draft lane: lane=\"{s}\" rounds={d} accepted_by_position={s}\n", .{ l.name(), l.stats.base.rounds, l.stats.positions(&pb) });
+        };
     }
 };
 
