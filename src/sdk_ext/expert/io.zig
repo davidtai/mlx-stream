@@ -64,9 +64,10 @@ pub const test_abi = if (builtin.is_test) struct {
     pub const status_words = res_w;
 } else struct {};
 
-/// The C pool's ABI (`q3ld_abi`): 2026101401, DIRECT reads as a construction-time route (2026101201: the submit-wide
+/// The C pool's ABI (`q3ld_abi`): 2026101801, a claimed speculative record's chunks read by every speculative thread
+/// (CO-READ) and its counter (2026101401: DIRECT reads as a construction-time route; 2026101201: the submit-wide
 /// WITHDRAW over the range-job queue).
-pub const abi_version = 2026101401;
+pub const abi_version = 2026101801;
 pub const max_workers = 8;
 /// Records per job (one fill unit).
 pub const max_items = 8;
@@ -161,8 +162,10 @@ pub const Counter = enum(u8) {
     ev_host_released = 69,
     ev_stop_released = 70,
     direct_ranges = 71,
+    /// Claimed chunks started while another speculative thread read the same record (the co-read's second call).
+    co_reads = 72,
 };
-pub const counters_n = 72;
+pub const counters_n = 73;
 
 /// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
 /// read by `threads` threads in `chunk_bytes` preadv steps.

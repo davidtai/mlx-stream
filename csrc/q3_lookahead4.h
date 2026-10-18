@@ -4,7 +4,8 @@
  * ticket in an ordered log, then the sequence (RELEASE). Three construction-time classes ride on it, all keyed
  * by file offset or ticket (never by layer, expert or slot):
  *   speculative  whole records read ahead into their own staging slots, only while demand is idle; a demand
- *                submit claims the record holding its range and copies it out instead of reading;
+ *                submit claims the record holding its range and copies it out instead of reading; a claimed
+ *                record's chunks that no thread has started are read by every speculative thread at once;
  *   pre-read     a layer call's certain misses queued as ranges before its plan; the submit binds them;
  *   event gate   per-wave gates over tickets; the satisfied prefix is handed to an MTLSharedEvent (or a host
  *                word) by the publishing worker, and a watchdog forces a gate whose bytes never land.
@@ -88,7 +89,7 @@ int q3ld_ev_config(int32_t kind, uint64_t obj, int64_t timeout_ns, uint64_t star
 int32_t q3ld_ev_gates(int32_t n, const uint64_t *values, const int32_t *counts, const int64_t *tickets);
 int32_t q3ld_ev_release(uint64_t value);    /* force every live gate <= value; forced count, -1 off */
 int32_t q3ld_ev_state(int64_t *out);        /* 10 words; returns the live gate count */
-int32_t q3ld_abi(void);                     /* 2026101001 */
+int32_t q3ld_abi(void);                     /* 2026101801 */
 int32_t q3ld_max_gates(void);
 int32_t q3ld_max_gate_tickets(void);
 int32_t q3ld_max_pre(void);
