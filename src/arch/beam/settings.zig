@@ -1,7 +1,8 @@
 //! beam's construction config: the pack's model (config.zig), the pack's `expert_streaming.settings` (read once at
 //! construction; a key that is not a setting refuses the load by name) and the host's load facts. MiMo's contract: the
 //! operator pins the rows with `expert_prefill_rows` / `expert_rows` (either alone forces both); `expert_rows_by_layer`
-//! splits the decode rows between the routed layers (`uniform`, the default, or offsets summing to 0); the rate tally's
+//! splits the decode rows between the routed layers (`uniform`, or offsets summing to 0; by default the calibrated
+//! offsets on Beam 1.0's 49 routed layers, `uniform` on any other geometry: `layerSplit`); the rate tally's
 //! keys (`expert_resident_ratio`, `expert_tally_window`, `expert_tally_file`: sdk_ext/expert/tally.zig, every streamed
 //! arch's), the usage seed and record (`resident_seed`, `expert_usage_record`, `expert_usage_label`: usage.zig),
 //! `prompt_residents` (keep, the default, or forget), MiMo's X12 keep-warm (`gpu_keep_warm`: waits, the default, or
@@ -47,6 +48,28 @@ pub fn unknownSetting(o: std.json.ObjectMap) ?[]const u8 {
     return sdk_settings.unknownSetting(o, &setting_keys);
 }
 
+/// Beam 1.0's default decode split (`expert_rows_by_layer`): 49 offsets (routed layer 0, model layer 3, first) that sum to
+/// 0, each at least -10, so that every layer keeps its prompt rows at the pinned 173 / 183. They come from two prompts
+/// that are not the benchmark's (`explainer.json`, `prose.json`: 16,695 and 16,456 prompt tokens, 1,024 generated, seed
+/// 1234, uniform 173 / 183 rows), never from the benchmark prompt's own trace. Each routed layer's decode is replayed from
+/// its recorded handover under the stream's decode policy at each decode row count (the replay matches the recorded
+/// hits on each step of a fresh request). The 490 rows above the prompt rows then go one at a time to the layer whose
+/// next row removes the most gated steps (a step with at least one miss), over the two prompts' mean.
+pub const default_layer_offsets = [_]i16{ 58, 70, 70, 50, 58, 8, 34, 10, -2, -6, -6, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -10, -6, -6, -10, -6, -6, -6, -6, -2, -10, -10, -6, -10 };
+
+comptime {
+    var sum: i32 = 0;
+    for (default_layer_offsets) |x| sum += x;
+    const model: beam.Config = .{};
+    if (sum != 0 or default_layer_offsets.len != model.moeLayers()) @compileError("beam: the default per-layer offsets must be one a routed layer, summing to 0");
+}
+
+pub fn defaultLayerRows() LayerRows {
+    var o: LayerRows.Offsets = .{ .len = default_layer_offsets.len };
+    @memcpy(o.d[0..default_layer_offsets.len], &default_layer_offsets);
+    return .{ .offsets = o };
+}
+
 /// The per-layer rows of both phases (sdk_ext/expert/layer_rows.zig), refused by beam's names.
 pub fn layerRows(split: LayerRows, rows: sdk.Rows, n_experts: u32, prompt: []u32, decode: []u32) !void {
     sdk_settings.layerRows(split, rows, n_experts, prompt, decode) catch |e| return switch (e) {
@@ -63,7 +86,8 @@ pub const Config = struct {
     /// The operator's rows (`expert_rows` the decode rows, `expert_prefill_rows` the prompt rows); null = the bill's fill.
     expert_rows: ?u32 = null,
     expert_prefill_rows: ?u32 = null,
-    expert_rows_by_layer: LayerRows = .uniform,
+    /// The pack's or the host's `expert_rows_by_layer`; null when neither names one (`layerSplit` gives the default).
+    expert_rows_by_layer: ?LayerRows = null,
     prompt_residents: PromptResidents = .keep,
     residency: expert_usage.Settings = .{},
     tally: expert_tally.Settings = .{ .ratio = default_tally_ratio },
@@ -118,6 +142,13 @@ pub const Config = struct {
         return if (c.decode_moe == .fused and c.fusedRegistered()) .fused else .stock;
     }
 
+    /// The split the construction installs: the setting when one is named; else `default_layer_offsets` on a model of
+    /// their 49 routed layers (Beam 1.0) and `uniform` on any other (the fixtures' geometries).
+    pub fn layerSplit(c: *const Config) LayerRows {
+        if (c.expert_rows_by_layer) |r| return r;
+        return if (c.model.moeLayers() == default_layer_offsets.len) defaultLayerRows() else .uniform;
+    }
+
     /// The keep-warm route the construction installs on a stream (`gpu`: the stream runs on the GPU): the setting's,
     /// except that the DEFAULT on a CPU stream resolves to `off` (its waits are host waits; MiMo's rule).
     pub fn warmRoute(c: *const Config, gpu: bool) gpu_warm.Route {
@@ -151,7 +182,7 @@ pub const Config = struct {
         if (c.decode_moe_requested and c.decode_moe == .fused and !c.fusedRegistered()) return error.BeamDecodeMoeUnregistered;
         try c.tally.check("beam");
         try c.residency.check("beam");
-        c.expert_rows_by_layer.check(c.model.moeLayers()) catch |e| return switch (e) {
+        c.layerSplit().check(c.model.moeLayers()) catch |e| return switch (e) {
             error.ExpertRowsByLayer => error.BeamExpertRowsByLayer,
             error.ExpertRowsByLayerLength => error.BeamExpertRowsByLayerLength,
             error.ExpertRowsByLayerSum => error.BeamExpertRowsByLayerSum,
@@ -181,7 +212,9 @@ fn parseSettings(text: []const u8) !Config {
 test "beam settings: the defaults, the operator's rows, the split and the shared groups' keys" {
     const d: Config = .{};
     try d.validate();
-    try testing.expectEqual(LayerRows.uniform, d.expert_rows_by_layer);
+    try testing.expect(d.expert_rows_by_layer == null);
+    const split = d.layerSplit();
+    try testing.expectEqualSlices(i16, &default_layer_offsets, split.offsets.slice());
     try testing.expectEqual(PromptResidents.keep, d.prompt_residents);
     try testing.expectEqual(@as(f64, 0), d.tally.ratio);
     try testing.expectEqual(gpu_warm.Route.off, d.warmRoute(false));
@@ -192,6 +225,38 @@ test "beam settings: the defaults, the operator's rows, the split and the shared
     try testing.expectEqual(@as(?u32, 100), c.expert_prefill_rows);
     try testing.expectEqual(@as(f64, 0.25), c.tally.ratio);
     try testing.expectEqual(PromptResidents.forget, c.prompt_residents);
+}
+
+test "beam settings: expert_rows_by_layer: the calibrated offsets by default on Beam 1.0, uniform on another geometry and by name; the rows keep the plan's totals" {
+    var prompt: [49]u32 = undefined;
+    var decode: [49]u32 = undefined;
+    const d: Config = .{};
+    // The default at the pinned rows: every layer keeps its 173 prompt rows, the decode rows are 183 + the offset.
+    try layerRows(d.layerSplit(), .{ .prompt = 173, .decode = 183 }, 256, &prompt, &decode);
+    for (prompt, decode, default_layer_offsets) |p, r, off| {
+        try testing.expectEqual(@as(u32, 173), p);
+        try testing.expectEqual(@as(i64, 183 + off), @as(i64, r));
+    }
+    // At other plan rows the totals stay the plan's: prompt rows uniform, decode rows >= prompt rows, at most 256.
+    for ([_]sdk.Rows{ .{ .prompt = 178, .decode = 189 }, .{ .prompt = 180, .decode = 183 }, .{ .prompt = 120, .decode = 140 } }) |rows| {
+        try layerRows(d.layerSplit(), rows, 256, &prompt, &decode);
+        var sum_d: u64 = 0;
+        for (prompt, decode) |p, r| {
+            try testing.expectEqual(rows.prompt, p);
+            try testing.expect(r >= p and r <= 256);
+            sum_d += r;
+        }
+        try testing.expectEqual(@as(u64, 49) * rows.decode, sum_d);
+    }
+    // Uniform by name.
+    const uni = try parseSettings("{\"expert_rows_by_layer\":\"uniform\"}");
+    try uni.validate();
+    try testing.expect(uni.layerSplit() == .uniform);
+    // Another geometry (a fixture's 3 routed layers): uniform by default, and it validates.
+    var small: Config = .{};
+    small.model.n_layers = 6;
+    try small.validate();
+    try testing.expect(small.layerSplit() == .uniform);
 }
 
 test "beam settings: every bad value refuses by name; an unknown key (a lane, a route) is not a beam setting" {

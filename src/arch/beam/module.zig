@@ -79,16 +79,17 @@ pub const Module = struct {
         const read_ns: u64 = @intCast(t_read.untilNow(io, .awake).nanoseconds);
         self.gates = try self.w.gates(gpa);
         errdefer gpa.free(self.gates);
-        // The expert source at the plan's rows: every routed layer alike (`expert_rows_by_layer: uniform`, the default),
-        // or the operator's offsets of the decode rows at the same total.
+        // The expert source at the plan's rows, split between the routed layers at the same total (`layerSplit`: the
+        // setting, else the calibrated offsets on Beam 1.0, `uniform` on another geometry).
         const n_moe = model.moeLayers();
         const prompt_rows = try arena.allocator().alloc(u32, n_moe);
         const decode_rows = try arena.allocator().alloc(u32, n_moe);
-        settings.layerRows(self.c.expert_rows_by_layer, plan.rows, model.n_routed_experts, prompt_rows, decode_rows) catch |e| {
+        const split = self.c.layerSplit();
+        settings.layerRows(split, plan.rows, model.n_routed_experts, prompt_rows, decode_rows) catch |e| {
             log.err("beam: load refused: expert_rows_by_layer does not fit the plan's rows {d}/{d} ({s})\n", .{ plan.rows.prompt, plan.rows.decode, @errorName(e) });
             return e;
         };
-        if (self.c.expert_rows_by_layer == .offsets) log.info("beam expert rows by layer installed: decode {any}, prompt {any}; bill unchanged\n", .{ decode_rows, prompt_rows });
+        if (split == .offsets) log.info("beam expert rows by layer installed: decode {any}, prompt {any}; bill unchanged\n", .{ decode_rows, prompt_rows });
         // `gpu_keep_warm` (MiMo's X12): the DEFAULT on a CPU stream resolves to the control, once, with one line.
         const warm_route = self.c.warmRoute(gpu_warm.gpuStream(s));
         if (warm_route != self.c.gpu_keep_warm) log.info("beam route gpu_keep_warm=off reason=default {s} on a CPU stream (its waits are host waits)\n", .{@tagName(self.c.gpu_keep_warm)});
@@ -110,7 +111,7 @@ pub const Module = struct {
         errdefer self.cache.deinit(&self.g);
         // The usage seed (`resident_seed`): before the first request; one line.
         try residency.seedResidents(gpa, io, "beam", &self.c.residency, dir, self.src);
-        log.info("beam routes: residents={s} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} call_rows={d} tile_rows={d} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ @tagName(model.residents_format), @tagName(self.src.combine_route), @tagName(route.read_schedule), @tagName(route.drain), @tagName(route.bank_view), @tagName(decode_moe), experts.call_rows, graph.tile_rows, @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
+        log.info("beam routes: residents={s} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} expert_rows_by_layer={s} call_rows={d} tile_rows={d} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ @tagName(model.residents_format), @tagName(self.src.combine_route), @tagName(route.read_schedule), @tagName(route.drain), @tagName(route.bank_view), @tagName(decode_moe), @tagName(split), experts.call_rows, graph.tile_rows, @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
         log.info("mlx-stream beam installed: {d} layers ({d} sliding, {d} full; {d} dense, {d} routed); residents {s} {d} tensors read in {d:.2} s; experts NVFP4 g16 streamed, top-{d} of {d}, {d} resident expert rows/layer, call {d}\n", .{ model.n_layers, model.nSliding(), model.nFull(), model.first_k_dense, n_moe, @tagName(model.residents_format), weights.count(), @as(f64, @floatFromInt(read_ns)) / 1e9, model.n_experts_per_tok, model.n_routed_experts, plan.rows.prompt, experts.call_rows });
         log.info("beam memory: target={d} baseline={d} process_bound={d} prompt_rows={d} decode_rows={d} reserve_tokens={d} kv=bf16 phase_rows=on growth_rows={d} forced={s}\n", .{ plan.target, plan.baseline, plan.bill.processBound(plan.rows), plan.rows.prompt, plan.rows.decode, plan.reserve, plan.rows.decode - plan.rows.prompt, if (bill.isForced(cfg)) "yes" else "no" });
         // Once (every command retired, MLX's cache cleared): the footprint beside the bill's construction terms. A report.

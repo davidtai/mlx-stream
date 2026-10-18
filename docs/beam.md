@@ -175,7 +175,7 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 |---|---|---|
 | `expert_rows` | decode rows a routed layer, 1 .. 256 | the fill |
 | `expert_prefill_rows` | prompt rows a routed layer, at most the decode rows | the fill |
-| `expert_rows_by_layer` | `uniform`, or 49 offsets that sum to 0 | `uniform` |
+| `expert_rows_by_layer` | `uniform`, or 49 offsets that sum to 0 | the calibrated offsets on Beam 1.0; `uniform` on another geometry |
 | `expert_resident_ratio`, `expert_tally_window`, `expert_tally_file` | the rate tally (sdk_ext/expert/tally.zig) | ratio 0 (off) |
 | `resident_seed`, `expert_usage_record`, `expert_usage_label` | the usage seed and record (sdk_ext/expert/usage.zig) | off |
 | `prompt_residents` | `keep`, `forget` | `keep` |
@@ -185,6 +185,27 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV quantization must be off
 (`BeamKvQuantUnsupported`). `decode_moe: fused` named for a model where the texts are not registered refuses the load
 (`BeamDecodeMoeUnregistered`); named on a CPU stream it refuses at construction (`BeamDecodeMoeNeedsGpu`).
+
+`expert_rows_by_layer` moves decode rows between the routed layers. The prompt rows and the decode total stay the
+plan's, so the bill does not change. Each offset adds to the plan's decode rows of one routed layer (model layer 3
+first). A layer keeps at least its prompt rows. The default (`settings.zig` `default_layer_offsets`) gives model
+layers 3 to 7 50 to 70 more decode rows, layers 8 to 10 8 to 34 more, and keeps model layers 14 to 39 at their prompt
+rows. At 173 / 183 rows, layers 3 to 7 get 233 to 253 decode rows.
+
+The default comes from two prompts that are not the benchmark's: `explainer.json` and `prose.json` (16,695 and 16,456
+prompt tokens, 1,024 generated, seed 1234, uniform 173 / 183 rows). The calibration replays each routed layer's decode
+from its recorded handover under the stream's decode policy, at each decode row count. Then it gives the 490 rows above
+the prompt rows, one at a time, to the layer whose next row removes the most gated steps (steps with at least one
+miss). On the coding workload, which is not in the calibration, the replay predicts 7.90 gated layers a step against
+9.31 at uniform rows. An offsets table fitted to the coding workload's own trace predicts 7.79.
+
+Measured on the coding workload: an ABBA of `uniform` against these offsets as a setting, on feat/beam-stack 557e6f4
+at 173 / 183 rows, temperature 0.7, top_p 0.99, seeds 1234 and 4321. Each seed gives the same text in both arms.
+
+| Arm | Prefill | Decode | ms a step | TTFT | SSD read a decode token | Expert hits in decode | Peak footprint |
+|---|---|---|---|---|---|---|---|
+| `uniform` | 682.4 tok/s | 16.62 tok/s | 60.18 | 24.70 s | 249 MB | 97.13 % | 217.5 GB |
+| The default offsets | 681.8 tok/s | 17.63 tok/s (+6.1 %) | 56.72 | 24.68 s | 202 MB (-18.9 %) | 97.67 % | 217.5 GB |
 
 ## The bill
 
