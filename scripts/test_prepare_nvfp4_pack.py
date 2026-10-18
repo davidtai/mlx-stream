@@ -24,7 +24,7 @@ sys.dont_write_bytecode = True
 
 import beam_fixture as fx  # noqa: E402
 import prepare_nvfp4_pack as conv  # noqa: E402
-from packlib import PrepError, manifest  # noqa: E402
+from packlib import PrepError, manifest, usage  # noqa: E402
 from packlib.st import E2M1, E4M3, StFile  # noqa: E402
 
 BANK_ZIG = HERE.parent / "src" / "arch" / "glm5_next" / "bank.zig"
@@ -389,6 +389,85 @@ class Slice(unittest.TestCase):
                 self.assertIn(want, log)
         finally:
             shutil.rmtree(tmp)
+
+
+def usage_doc(layers=fx.L - fx.DENSE, experts=fx.E, model_type="beam", source=None):
+    """An expert-usage-v1.json of the fixture's geometry, usage.zig's second form (one session) unless `source`."""
+    session = {"prompt_set": "unit", "binary_sha256": "0" * 64, "requests": 1, "prompt_tokens": 12, "decode_tokens": 3}
+    return {"model_type": model_type, "layers": layers, "experts": experts,
+            "counts": [[(7 * li + 3 * e) % 5 for e in range(experts)] for li in range(layers)],
+            "source": source or {"requests": 1, "prompt_tokens": 12, "decode_tokens": 3, "sessions": [session]}}
+
+
+class Usage(unittest.TestCase):
+    """--usage: the resident seed's profile checked as usage.zig's load reads it, copied into the pack and listed in
+    pack-sha256.txt; verify holds the pack's copy to it."""
+
+    def test_the_usage_file_ships_in_the_pack(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            fx.build(tmp / "f", SEED)
+            u = tmp / "u.json"
+            u.write_text(json.dumps(usage_doc()))
+            rc, log = run("all", *build_args(tmp / "f", tmp / "p", "--usage", str(u)))
+            self.assertEqual(rc, 0, log)
+            self.assertIn('"usage": "unit, 1 sessions, 1 requests, 12 prompt + 3 decode tokens"', log)
+            self.assertEqual(sorted(p.name for p in (tmp / "p").iterdir() if p.name != ".prepare"),
+                             sorted(conv.PACK_FILES + [usage.FILE, "pack-sha256.txt"]))
+            self.assertEqual((tmp / "p" / usage.FILE).read_bytes(), u.read_bytes())
+            sums = dict(reversed(ln.split("  ")) for ln in (tmp / "p" / "pack-sha256.txt").read_text().splitlines())
+            self.assertEqual(sorted(sums), sorted(conv.PACK_FILES + [usage.FILE]))
+            self.assertEqual(sums[usage.FILE], hashlib.sha256(u.read_bytes()).hexdigest())
+            # Without --usage the file is an extra entry; a copy that is not the given file fails.
+            rc, log = run("verify", *build_args(tmp / "f", tmp / "p"))
+            self.assertEqual(rc, 1, log)
+            self.assertIn(f"unexpected entries in the pack: ['{usage.FILE}']", log)
+            (tmp / "p" / usage.FILE).write_text(u.read_text() + " ")
+            rc, log = run("verify", *build_args(tmp / "f", tmp / "p", "--usage", str(u)))
+            self.assertEqual(rc, 1, log)
+            self.assertIn(f"sha256 mismatch: {usage.FILE}", log)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_a_file_of_another_geometry_refuses_before_the_copy(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            fx.build(tmp / "f", SEED)
+            u = tmp / "u.json"
+            u.write_text(json.dumps(usage_doc(layers=3)))
+            rc, log = run("all", *build_args(tmp / "f", tmp / "p", "--usage", str(u)))
+            self.assertEqual(rc, 1, log)
+            self.assertIn("ExpertUsageMismatch: model_type beam, 3 layers x 8 experts; the pack is beam, 4 routed "
+                          "layers x 8 experts", log)
+            self.assertFalse((tmp / "p" / usage.FILE).exists())
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_the_checks_are_usage_zig_readers(self):
+        good = usage_doc()
+        first = {"requests": 2, "prompt_tokens": 9, "decode_tokens": 1, "prompt_set": "first", "binary_sha256": "ab"}
+        self.assertEqual(usage.check(usage_doc(source=first), "beam", 4, 8),
+                         "first, 1 sessions, 2 requests, 9 prompt + 1 decode tokens")
+        cases = [
+            (usage_doc(model_type="glm5_next"), "ExpertUsageMismatch: model_type glm5_next"),
+            (usage_doc(experts=16), "ExpertUsageMismatch"),
+            (dict(good, counts=good["counts"][:-1]), "ExpertUsageMalformed: 3 count rows for 4 layers"),
+            (dict(good, counts=[r[:-1] for r in good["counts"]]), "ExpertUsageMalformed: a count row is not 8 experts"),
+            (dict(good, counts=[[-1] * 8] * 4), "ExpertUsageMalformed: counts is not a list"),
+            (dict(good, layers="4"), "ExpertUsageMalformed: layers '4'"),
+            (dict(good, source=dict(first, sessions=good["source"]["sessions"])),
+             "ExpertUsageMalformed: source has both sessions"),
+            (dict(good, source={"requests": 1, "prompt_tokens": 1, "decode_tokens": 0}),
+             "ExpertUsageMalformed: source has neither sessions"),
+            (dict(good, source=dict(good["source"], sessions=[])), "ExpertUsageMalformed: 4 count rows for 4 layers, "
+                                                                  "8 experts, 0 sessions"),
+            ([], "ExpertUsageMalformed: not an object"),
+        ]
+        for doc, want in cases:
+            with self.subTest(want):
+                with self.assertRaises(PrepError) as cm:
+                    usage.check(doc, "beam", 4, 8)
+                self.assertIn(want, str(cm.exception))
 
 
 def _ws2_inexact(cfg, hfq, shards):

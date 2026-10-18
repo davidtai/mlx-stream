@@ -16,6 +16,8 @@ Families (`--family`):
 The pack is exactly these 9 files, plus pack-sha256.txt:
   config.json, model.safetensors, model.safetensors.index.json, experts.bin, expert-manifest.json, tokenizer.json,
   tokenizer_config.json, generation_config.json, chat_template.jinja
+With --usage FILE it holds a tenth file, expert-usage-v1.json: the resident seed's profile
+(src/sdk_ext/expert/usage.zig), which the server reads at the load to fill its prompt rows before the first request.
 The build's journal and state live in a work directory (default OUT/.prepare); delete it once the pack verifies.
 
 Run:
@@ -38,10 +40,13 @@ build.
              experts.bin; each record read back and compared; input_scale dropped; then expert-manifest.json
   config     config.json by rule from the release's (model_type kept, quantization_config removed, the
              expert_streaming block added, a null eos/pad/bos id filled from generation_config.json), and the
-             tokenizer files, generation_config.json and chat_template.jinja copied
+             tokenizer files, generation_config.json and chat_template.jinja copied; with --usage, the usage file
+             checked as usage.zig's load reads it (the v1 form, the pack's model_type, routed layers and experts)
+             and copied as expert-usage-v1.json
   verify     the pack's file set, the config and the manifest against the spec, a seeded random sample of records
              against the source shards (bytes and manifest sha256), a dequant spot check of a few rows per projection,
-             every resident tensor's sha256, then pack-sha256.txt
+             every resident tensor's sha256, with --usage the pack's usage file against the given one, then
+             pack-sha256.txt
 
 --layers 0-N builds a slice: the first N + 1 layers (from 0, with a full_attention layer), config.json cut to them,
 the embedding, final norm and head kept, the manifest's source pin with "layers": [0, N] (docs/nvfp4-pack.md).
@@ -89,7 +94,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))  # packlib, beside this script (python3 -I keeps the script's directory off sys.path)
 
 from packlib import PrepError, ShaMismatch  # noqa: E402
-from packlib import bank, fetch, journal, manifest, verify  # noqa: E402
+from packlib import bank, fetch, journal, manifest, usage, verify  # noqa: E402
 from packlib.manifest import GROUP, PROJ, Geometry  # noqa: E402
 from packlib.nocache import (copy_verified, open_nocache, pwrite_all, read_exact, sha256_file, stamp,  # noqa: E402
                              write_text_atomic)
@@ -107,6 +112,11 @@ PACK_FILES = ["config.json", "model.safetensors", "model.safetensors.index.json"
 META_FILES = ["config.json", "generation_config.json", "hf_quant_config.json", "model.safetensors.index.json",
               "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"]
 COPIES = ["tokenizer.json", "tokenizer_config.json", "generation_config.json", "chat_template.jinja"]
+
+
+def pack_files(a):
+    """The pack's file set: PACK_FILES, and the resident seed's profile with --usage."""
+    return PACK_FILES + ([usage.FILE] if a.usage else [])
 RESIDENTS_META = {"format": "mlx"}
 STATE = "shards-state.json"
 
@@ -640,6 +650,16 @@ def step_bank(a, ctx, pass_parts=("bank",)):
 
 # ---- config ----------------------------------------------------------------------------------------------------------
 
+def usage_input(a, plan):
+    """--usage FILE checked against the pack's model and geometry (usage.zig's load): its path, sha256 and
+    provenance."""
+    path = Path(a.usage).expanduser().resolve()
+    if not path.is_file():
+        raise PrepError(f"--usage {path}: not a file")
+    line = usage.load(path, plan.fam.model_type, plan.geom.layers, plan.geom.experts)
+    return path, sha256_file(path), line
+
+
 def step_config(a, ctx):
     plan = ctx.plan()
     gen = json.loads((ctx.src / "generation_config.json").read_text())
@@ -647,8 +667,12 @@ def step_config(a, ctx):
     write_text_atomic(ctx.out / "config.json", json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
     for n in COPIES:
         copy_verified(ctx.src / n, ctx.out / n, ctx.table[n]["sha256"])
-    ctx.log("config", "done", settings=a.settings_obj is not None,
-            outputs=ctx.outputs("out/config.json", *(f"out/{n}" for n in COPIES)))
+    outs, seed = ["out/config.json", *(f"out/{n}" for n in COPIES)], {}
+    if a.usage:
+        path, sha, seed["usage"] = usage_input(a, plan)
+        copy_verified(path, ctx.out / usage.FILE, sha)
+        outs.append(f"out/{usage.FILE}")
+    ctx.log("config", "done", settings=a.settings_obj is not None, **seed, outputs=ctx.outputs(*outs))
 
 
 # ---- verify ----------------------------------------------------------------------------------------------------------
@@ -780,24 +804,30 @@ def verify_residents(ctx, plan):
 
 def step_verify(a, ctx):
     plan = ctx.plan()
-    verify.check_pack_files(ctx.out, ctx.work, PACK_FILES)
+    files = pack_files(a)
+    verify.check_pack_files(ctx.out, ctx.work, files)
     verify_config(ctx, plan)
     bank_sha = verify_bank(a, ctx, plan)
     verify_residents(ctx, plan)
+    if a.usage:
+        _, want, _ = usage_input(a, plan)
+        got = sha256_file(ctx.out / usage.FILE)
+        if got != want:
+            raise ShaMismatch(usage.FILE, want, got)
     shas, hashes = {}, {}
-    for n in PACK_FILES:
+    for n in files:
         key = f"out/{n}"
         sha = bank_sha if n == "experts.bin" else (ctx.cached_sha(key) or sha256_file(ctx.out / n))
         shas[n] = sha
         hashes[key] = {"stamp": stamp(ctx.out / n), "sha256": sha}
-    write_text_atomic(ctx.out / "pack-sha256.txt", "".join(f"{shas[n]}  {n}\n" for n in sorted(PACK_FILES)))
+    write_text_atomic(ctx.out / "pack-sha256.txt", "".join(f"{shas[n]}  {n}\n" for n in sorted(files)))
     if a.delete_verified:
         for s in sorted(keep_set(a, plan)):
             if (ctx.src / s).exists():
                 os.unlink(ctx.src / s)
                 ctx.forget_verified(s)
                 ctx.log("verify", "shard_deleted", shard=s)
-    ctx.log("verify", "done", files=len(PACK_FILES), hashes=hashes, outputs=ctx.outputs("out/pack-sha256.txt"))
+    ctx.log("verify", "done", files=len(files), hashes=hashes, outputs=ctx.outputs("out/pack-sha256.txt"))
 
 
 # ---- all ---------------------------------------------------------------------------------------------------------
@@ -842,6 +872,9 @@ def parse_args(argv):
     g.add_argument("--seed", type=int, default=20261017,
                    help="seed of the keep set (seed), the parity sample (seed + 1) and the dequant rows (seed + 2)")
     g.add_argument("--settings", metavar="JSON", help="a JSON object written verbatim as expert_streaming.settings")
+    g.add_argument("--usage", metavar="FILE",
+                   help="config: an expert-usage-v1.json (the resident seed's profile, usage.zig) checked against "
+                        "the pack's model and geometry and copied into the pack; verify: the pack's copy must be it")
     g.add_argument("--files", choices=("all", "meta"), default="all",
                    help="fetch: every release file (default), or the 7 metadata files")
     g.add_argument("--fetch-with", choices=("http", "hf"), default="http",

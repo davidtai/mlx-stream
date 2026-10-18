@@ -18,7 +18,8 @@ past the page cache. GB are decimal.
 | `experts.bin` | The expert records (next section). |
 | `expert-manifest.json` | Format `mlx-stream-nvfp4-expert-bank-v1`, layout `nvfp4-gud-9part`: the geometry, the nine parts, each record's offset, length and sha256, the source repository, revision and per-file sha256, and the size and sha256 of `experts.bin`. |
 | `tokenizer.json`, `tokenizer_config.json`, `generation_config.json`, `chat_template.jinja` | Copies of the checkpoint's files. |
-| `pack-sha256.txt` | The sha256 of the other nine files. |
+| `expert-usage-v1.json` | Only with `--usage FILE`: the resident seed's profile (`src/sdk_ext/expert/usage.zig`). Per routed layer and expert, the routed count over a set of requests. At the load the server fills each layer's prompt rows with the layer's most used experts, so the first request does not start cold. |
+| `pack-sha256.txt` | The sha256 of the other files (nine, or ten with `--usage`). |
 
 The `expert_streaming` block in `config.json`:
 
@@ -91,15 +92,26 @@ The steps of `all`, in order. Each step is also a subcommand.
 3. **residents**: moves `model.safetensors` into the pack and writes its index.
 4. **bank**: the sha256 of `experts.bin`, then `expert-manifest.json`. The script checks the manifest with a port of
    bank.zig's `Bank.parseFor` before it writes it.
-5. **config**: `config.json` by the rules above, and the four copied files.
+5. **config**: `config.json` by the rules above, and the four copied files. With `--usage FILE`, the usage file too:
+   the script checks it as the server's load reads it (the v1 form; the pack's `model_type`, routed layers and
+   experts), then copies it as `expert-usage-v1.json`.
 6. **verify**: the file set; `config.json`; the manifest; a seeded sample of records (`--samples`, default 16)
    against the records made again from the source shards, byte for byte; for three of them, four rows of each
    projection dequantized both ways (the checkpoint's and the bank's, within 2 f32 ulps); every resident tensor's
-   sha256; then `pack-sha256.txt`. With `--delete-verified` it then deletes the keep set.
+   sha256; with `--usage`, the pack's usage file against the given file; then `pack-sha256.txt`. With
+   `--delete-verified` it then deletes the keep set.
 
 The script also refuses: a missing or an extra tensor in the index or a shard; an E4M3 block scale that is NaN; a
 quantization that is not NVFP4 with group size 16; a resident linear that `hf_quant_config.json` does not exclude
 from the quantization; an expert projection that it excludes; a geometry that bank.zig refuses.
+
+### The resident seed (`--usage`)
+
+Give `--usage FILE` to `all`, or to both `config` and `verify`. Without it, `verify` refuses a pack that holds the
+file. Make the file from general traffic: a server run with `expert_usage_record` writes it (`usage.zig`). Do not make
+it from a benchmark's own prompt. Such a seed puts that prompt's experts in the rows before its first token, so the
+measured request is warmer than serving traffic. A refusal names the load's error: `ExpertUsageMalformed` (not the v1
+form) or `ExpertUsageMismatch` (another `model_type`, or other counts of routed layers or experts).
 
 ### A layer slice
 

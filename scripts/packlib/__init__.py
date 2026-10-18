@@ -1,6 +1,6 @@
 """The pack converters' shared library (docs/nvfp4-pack.md): uncached I/O (`nocache`), safetensors (`st`), the run
-journal (`journal`), pinned Hub downloads (`fetch`), record writes (`bank`), the NVFP4 bank manifest (`manifest`) and
-the sampled checks (`verify`). Stdlib and numpy only.
+journal (`journal`), pinned Hub downloads (`fetch`), record writes (`bank`), the NVFP4 bank manifest (`manifest`), the
+resident seed's usage profile (`usage`) and the sampled checks (`verify`). Stdlib and numpy only.
 
 A converter puts its own directory (scripts/) first on sys.path and imports `packlib`: under `python3 -I` the script's
 directory is not on sys.path, and the working directory and the downloaded files never are.
