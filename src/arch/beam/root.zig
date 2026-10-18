@@ -227,7 +227,7 @@ test "beam parse: the settings block is applied at parse; a non-object block or 
     for ([_]Case{
         .{ .block = nvfp4_block ++ ",\"settings\":{\"expert_prefill_rows\":100,\"expert_rows\":120}},", .err = null },
         .{ .block = nvfp4_block ++ ",\"settings\":[1]},", .err = error.BeamSettingsBlock },
-        .{ .block = nvfp4_block ++ ",\"settings\":{\"decode_moe\":\"fused\"}},", .err = error.BeamSettingUnknown },
+        .{ .block = nvfp4_block ++ ",\"settings\":{\"draft_head\":\"q4\"}},", .err = error.BeamSettingUnknown },
         .{ .block = "", .err = error.BeamPackRequired },
     }) |case| {
         const text = try beam.beamConfigJson(arena.allocator(), case.block);
