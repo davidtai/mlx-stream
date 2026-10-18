@@ -311,6 +311,26 @@ Both seeds are faster (+6.8 % and +2.4 %); tokens a round +6.1 %. The verify's s
 the greedy lane gave sum min(p, q) 7.0 % more tokens a round than the greedy draft's p(d). The host reference keeps
 0.7163 of 20,000 drafts drawn from q against sum min(p, q) 0.7163 on the test's row.
 
+The lane at equal memory against the stack's control: the drafter's 4.1 GB is 4 rows, so the control runs at 183 /
+193 rows and the lane at 179 / 189 (the fallback pin: the box's other users held 39 to 42 GB). Both arms seeded (the
+pack's shipped `expert-usage-v1.json`), the same workload and sampling, two ABBAs on the bundle of feat/beam-dflash2
+b113ef6 over fold 5 (88d903e), means of the two seeds:
+
+| ABBA | Arm | Decode | Tokens a round | Accepted at draft 1 / 2 / 3 | Prefill | TTFT | SSD read a decode token | Peak footprint |
+|---|---|---|---|---|---|---|---|---|
+| 1 | control | 26.04 tok/s | 1 | - | 994.9 tok/s | 17.00 s | 173 MB | 221.7 GB |
+| 1 | `exact`, depth 3, `draft_path: sampled` | 26.82 tok/s (+3.0 %) | 2.56, 2.59 | 73.1 / 50.4 / 34.1 % | 964.7 tok/s (-3.0 %) | 17.46 s | 233 MB | 221.5 GB |
+| 2 | control | 25.92 tok/s | 1 | - | 981.3 tok/s | 17.23 s | 173 MB | 221.7 GB |
+| 2 | `typical` 0.2, depth 3 (lossy) | 31.45 tok/s (+21.3 %) | 3.26, 3.11 | 87.9 / 72.9 / 58.3 % | 925.0 tok/s (-5.7 %) | 18.28 s | 212 MB | 221.5 GB |
+
+`exact` gains +1.9 % and +4.1 % (the seeds) and loses prefill: it does not meet the keep bar (+2 % decode on both seeds,
+prefill within noise), so `mtp_lane` stays off by default and the defaults serve no change. `typical` 0.2 gains +22.0 %
+and +20.6 %; 262 of its 1,405 accepted drafts are not the target's own draw (lossy: an opt-in). The prefill loss is the
+4 prompt rows (at equal rows the lane's prompt pass costs +0.2 %); the lane does the same prompt work in both ABBAs, so
+the difference between -3.0 % and -5.7 % is the box's variance. The lane reads more from the SSD a token (the 4 fewer
+rows and the verify's 4-row union of experts), so its value rises with the expert hit rate: at the 240 GB pin (more
+rows a layer) it is not measured.
+
 Depth and delta, on the lane over the stack's fold 1 (5df1fc9), the BF16 pack, 168 / 178 rows, seed 1234: `exact`
 depth 3 is the fastest exact depth (18.97 tok/s against 15.58 serial; depths 1 to 8, 11 and 15 measured);
 `typical` 0.2 and 0.6 at depth 3 are the fastest deltas (22.41 and 22.40 tok/s; 0.2 to 0.8 at depths 2 and 3).
