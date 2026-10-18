@@ -12,7 +12,8 @@
 //! `draft_depth` is its drafts a round (1 .. the drafter's block less one, default `default_draft_depth`), `draft_gate`
 //! its confidence gate (theta in [0, 1), default 0: off), `mtp_acceptance` its rule (`exact`, the default, or `typical`:
 //! lossy, an opt-in), `mtp_typical_delta` typical's delta ((0, 1], default `default_typical_delta`, named only with
-//! `typical`) and `draft_path` the drafter's path on a sampled request (`greedy`, the default, or `sampled`: `DraftPath`).
+//! `typical`) and `draft_path` the drafter's path on a sampled request (`sampled`, the default under `exact`, or `greedy`:
+//! `DraftPath`).
 //! A draft key without `mtp_lane: true` refuses: an inert knob is a lie.
 
 const std = @import("std");
@@ -75,13 +76,14 @@ pub const max_draft_depth: u32 = acc.max_rows - 2;
 pub const default_typical_delta: f32 = 0.5;
 /// The lane's acceptance rule (`mtp_acceptance`), installed at construction.
 pub const MtpAcceptance = enum { exact, typical };
-/// The drafter's path on a sampled request (`draft_path`), installed at construction: `greedy` (the default) the
-/// selector's greedy walk, a point mass, verified by sample-then-verify (each emitted token the target's draw at its
-/// position); `sampled` each draft drawn from the selector's distribution q over its candidates (the softmax of the
-/// scores at the request's temperature, drafter.zig `sampledPathOf`), verified by speculative sampling (a draft kept with
-/// min(1, p / q), the residual (p - q)+ drawn on a rejection: `acceptance.speculativeRows`). Both emit tokens
-/// distributed as the target; `sampled`'s are not the serial path's draws. `sampled` takes the exact rule only
-/// (`BeamDraftPathTypical`). A greedy request takes the greedy walk under both.
+/// The drafter's path on a sampled request (`draft_path`), installed at construction: `sampled` (the default under the
+/// exact rule: the measured and kept path, docs/beam.md) each draft drawn from the selector's distribution q over its
+/// candidates (the softmax of the scores at the request's temperature, drafter.zig `sampledPathOf`), verified by
+/// speculative sampling (a draft kept with min(1, p / q), the residual (p - q)+ drawn on a rejection:
+/// `acceptance.speculativeRows`); `greedy` the selector's greedy walk, a point mass, verified by sample-then-verify (each
+/// emitted token the target's draw at its position). Both emit tokens distributed as the target; `sampled`'s are not the
+/// serial path's draws. `sampled` takes the exact rule only: under `typical` the path is `greedy` unless named, and
+/// `sampled` named with it refuses (`BeamDraftPathTypical`). A greedy request takes the greedy walk under both.
 pub const DraftPath = enum { greedy, sampled };
 
 pub const PromptResidents = expert_usage.PromptResidents;
@@ -149,7 +151,8 @@ pub const Config = struct {
     mtp_acceptance: MtpAcceptance = .exact,
     mtp_typical_delta: f32 = default_typical_delta,
     mtp_typical_delta_set: bool = false,
-    draft_path: DraftPath = .greedy,
+    draft_path: DraftPath = .sampled,
+    draft_path_set: bool = false,
     /// A draft key other than `mtp_lane` was named.
     draft_named: bool = false,
     malformed: Malformed = .{},
@@ -217,7 +220,13 @@ pub const Config = struct {
             c.draft_named = true;
             const m: ?DraftPath = if (v == .string) std.meta.stringToEnum(DraftPath, v.string) else null;
             if (m) |x| c.draft_path = x else c.malformed.draft_path = true;
+            c.draft_path_set = true;
         }
+    }
+
+    /// The lane's path on a sampled request (construction): the setting's, `greedy` under `typical` unless named.
+    pub fn draftPath(c: Config) DraftPath {
+        return if (c.mtp_acceptance == .typical and !c.draft_path_set) .greedy else c.draft_path;
     }
 
     /// The lane's rule (construction): exact, or typical at the setting's delta.
@@ -307,7 +316,7 @@ pub const Config = struct {
         if (c.malformed.mtp_acceptance) return error.BeamMtpAcceptanceSetting;
         if (c.malformed.mtp_typical_delta) return error.BeamMtpTypicalDeltaSetting;
         if (c.malformed.draft_path) return error.BeamDraftPathSetting;
-        if (c.draft_path == .sampled and c.mtp_acceptance == .typical) return error.BeamDraftPathTypical;
+        if (c.draft_path_set and c.draft_path == .sampled and c.mtp_acceptance == .typical) return error.BeamDraftPathTypical;
         if (c.draft_depth == 0) return error.BeamDraftDepthRange;
         if (!(c.draft_gate >= 0 and c.draft_gate < 1)) return error.BeamDraftGateRange;
         if (c.draft_named and !c.mtp_lane) return error.BeamDraftSettingWithoutLane;
@@ -473,11 +482,15 @@ test "beam settings: the draft lane's keys (off by default; exact the default ru
     try testing.expect(!d.mtp_lane);
     try testing.expectEqual(acc.Rule.exact, d.draftRule());
     try testing.expectEqual(@as(u32, 3), d.draft_depth);
-    try testing.expectEqual(DraftPath.greedy, d.draft_path);
-    const sampled = try parseSettings("{\"mtp_lane\":true,\"draft_path\":\"sampled\"}");
-    try sampled.validate();
-    try testing.expectEqual(DraftPath.sampled, sampled.draft_path);
-    try testing.expectEqual(acc.Rule.exact, sampled.draftRule());
+    try testing.expectEqual(DraftPath.sampled, d.draftPath());
+    const greedy = try parseSettings("{\"mtp_lane\":true,\"draft_path\":\"greedy\"}");
+    try greedy.validate();
+    try testing.expectEqual(DraftPath.greedy, greedy.draftPath());
+    try testing.expectEqual(acc.Rule.exact, greedy.draftRule());
+    // typical keeps the greedy path unless sampled is named (and refuses it then, below).
+    const typ = try parseSettings("{\"mtp_lane\":true,\"mtp_acceptance\":\"typical\"}");
+    try typ.validate();
+    try testing.expectEqual(DraftPath.greedy, typ.draftPath());
     const on = try parseSettings("{\"mtp_lane\":true,\"draft_depth\":15,\"draft_gate\":0.5,\"mtp_acceptance\":\"typical\",\"mtp_typical_delta\":0.2}");
     try on.validate();
     try testing.expectEqual(@as(u32, 15), on.draft_depth);

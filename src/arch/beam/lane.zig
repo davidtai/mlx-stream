@@ -135,8 +135,8 @@ pub const Lane = struct {
     /// Drafts a round at most (`settings.draft_depth`); the block is depth + 1 rows.
     depth: u32,
     gate: f32,
-    /// The drafter's path on a sampled request (`settings.draft_path`).
-    path: settings.DraftPath = .greedy,
+    /// The drafter's path on a sampled request (`settings.Config.draftPath`).
+    path: settings.DraftPath = .sampled,
     /// `draft_path: sampled`: the round's drafts' rows of q over the vocabulary (depth x `vocab` f32, 0 off each row's
     /// candidates: the speculative verify's residual; host memory, allocated at the first sampled round), the ids each
     /// row wrote (cleared at the next round) and the rows written.
@@ -165,7 +165,7 @@ pub const Lane = struct {
         var g = try G.init(a, s);
         errdefer g.deinit();
         const self = try a.create(Lane);
-        self.* = .{ .a = a, .dr = dr, .rule = cfg.draftRule(), .depth = cfg.draft_depth, .gate = cfg.draft_gate, .path = cfg.draft_path, .g = g, .vocab = cfg.model.vocab_size };
+        self.* = .{ .a = a, .dr = dr, .rule = cfg.draftRule(), .depth = cfg.draft_depth, .gate = cfg.draft_gate, .path = cfg.draftPath(), .g = g, .vocab = cfg.model.vocab_size };
         self.name_len = (nameOf(&self.name_buf, self.rule, self.depth, self.gate, self.path) catch unreachable).len;
         return self;
     }
