@@ -64,8 +64,9 @@ pub const DecodeGlue = enum { fused, ops };
 /// The draft lane's keys (glm5_next's names).
 pub const draft_keys = [_][]const u8{ "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta" };
 
-/// The lane's default drafts a round: 7, the drafter's serving block of 8 (its model card; trained at 16).
-pub const default_draft_depth: u32 = 7;
+/// The lane's default drafts a round: 3, the depth measured and kept (docs/beam.md, the draft lane: exact depth 3 is
+/// the fastest exact depth on the stack's fold 1, and its ABBA on fold 4 gives +19.8 % decode).
+pub const default_draft_depth: u32 = 3;
 /// The most drafts a round names: the acceptance graphs' rows less the bonus row and one (`acceptance.max_rows` 17), the
 /// trained block's 15. The lane refuses a depth past its drafter's own block less one (`BeamDraftDepthOverBlock`).
 pub const max_draft_depth: u32 = acc.max_rows - 2;
@@ -454,7 +455,7 @@ test "beam settings: the draft lane's keys (off by default; exact the default ru
     const d: Config = .{};
     try testing.expect(!d.mtp_lane);
     try testing.expectEqual(acc.Rule.exact, d.draftRule());
-    try testing.expectEqual(@as(u32, 7), d.draft_depth);
+    try testing.expectEqual(@as(u32, 3), d.draft_depth);
     const on = try parseSettings("{\"mtp_lane\":true,\"draft_depth\":15,\"draft_gate\":0.5,\"mtp_acceptance\":\"typical\",\"mtp_typical_delta\":0.2}");
     try on.validate();
     try testing.expectEqual(@as(u32, 15), on.draft_depth);
