@@ -1748,3 +1748,80 @@ test "beam io M1: a claimed record's chunks that no thread started are read by b
     try testing.expect(!specStateIs(B, 2));
     std.debug.print("BEAM_M1_COREAD B/C: parks={d} co_reads={d}\n", .{ pool.counter(.parks) - parks0, pool.counter(.co_reads) - co0 });
 }
+
+test "beam io M1b: a demand range of a claimed record copies its landed chunks while the rest is read; a record that fails after a part was copied leaves the range to the stock read" {
+    // Each chunk sleeps 150 ms in the pool (injected rules), so the first chunks land well before the record does.
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(64 * page);
+    defer f.deinit();
+    const fd = f.ufd.fd;
+    const size: i64 = @intCast(f.ufd.size);
+    const pg: i64 = @intCast(page);
+    const rec: u64 = 4 * page;
+    const gu_len: i64 = 3 * pg - 100;
+    const down_len: i64 = pg + 100;
+    const hold: i64 = 150 * std.time.ns_per_ms;
+    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 4 * page, .tickets = 128, .spec = .{ .threads = 2, .slots = 4, .record_bytes = rec, .chunk_bytes = page } });
+    defer pool.stop();
+    defer clearFaults();
+    const buf = try testing.allocator.alloc(u8, rec);
+    defer testing.allocator.free(buf);
+    _ = q3raw.q3ld_test_events(&CoReadLog.buf, 64);
+    defer _ = q3raw.q3ld_test_events(&CoReadLog.off, 0);
+
+    // A: the gate/up range (chunks 1-3) copies chunks 1 and 2 when they land, before the record lands (event 5 before 4).
+    const A: i64 = 10 * pg;
+    var o4: [4]i64 = undefined;
+    for (&o4, 0..) |*o, k| o.* = A + @as(i64, @intCast(k)) * pg;
+    injectFaults(&o4, &@as([4]i64, @splat(5)), &@as([4]i64, @splat(hold)));
+    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 1, &.{A}, rec));
+    try waitFor(pool, specStarted(1).f);
+    if (pool.counter(.spec_chunks) >= 1) {
+        std.debug.print("SPECPROBE skipped: A's first chunk landed before its claim (box loaded)\n", .{});
+        return error.SkipZigTest;
+    }
+    _ = q3raw.q3ld_test_events(&CoReadLog.buf, 64);
+    @memset(buf, 0xAA);
+    try testing.expectEqual(@as(c_int, 0), rawSubmit(pool, fd, size, -1, @intCast(A), @intCast(A + gu_len), &.{gu_len}, &.{down_len}, buf, 0));
+    try pool.wait(0, 2, 10 * std.time.ns_per_s);
+    try testing.expectEqualSlices(u8, f.image[@intCast(A)..][0..rec], buf);
+    for (0..2) |k| {
+        try testing.expectEqual(Status.ok, pool.result(@intCast(k)).status);
+        try testing.expectEqual(@as(i64, 0), pool.result(@intCast(k)).preadv_calls);
+    }
+    try waitFor(pool, landed1);
+    const n_ev: usize = @intCast(q3raw.q3ld_test_events(null, 0));
+    var t_adopt: ?i64 = null;
+    var t_end: ?i64 = null;
+    for (0..@min(n_ev, 64)) |i| {
+        const e = CoReadLog.buf[5 * i ..][0..5];
+        if (e[0] == 5 and t_adopt == null) t_adopt = e[3];
+        if (e[0] == 4 and e[4] == A and t_end == null) t_end = e[3];
+    }
+    try testing.expect(t_adopt != null and t_end != null);
+    try testing.expect(t_adopt.? < t_end.?);
+    std.debug.print("BEAM_M1B_ADOPT A: the first adopt copy {d:.1} ms before the record landed\n", .{@as(f64, @floatFromInt(t_end.? - t_adopt.?)) / 1e6});
+
+    // B: chunk 3 fails (EIO) after the gate/up range copied chunks 1 and 2: both ranges are read the stock way.
+    clearFaults();
+    const B: i64 = 30 * pg;
+    injectFaults(&[_]i64{ B, B + pg, B + 2 * pg, B + 3 * pg }, &[_]i64{ 5, 5, 2, 5 }, &[_]i64{ hold, hold, 0, hold });
+    const failed0 = pool.counter(.failed);
+    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 2, &.{B}, rec));
+    try waitFor(pool, specStarted(2).f);
+    @memset(buf, 0xAA);
+    try testing.expectEqual(@as(c_int, 0), rawSubmit(pool, fd, size, -1, @intCast(B), @intCast(B + gu_len), &.{gu_len}, &.{down_len}, buf, 2));
+    try pool.wait(2, 2, 10 * std.time.ns_per_s);
+    try testing.expectEqualSlices(u8, f.image[@intCast(B)..][0..rec], buf);
+    for (2..4) |k| {
+        try testing.expectEqual(Status.ok, pool.result(@intCast(k)).status);
+        try testing.expect(pool.result(@intCast(k)).preadv_calls >= 1);
+    }
+    // The record ends FAILED when its last reader leaves (chunk 4's, after the stock reads served the ranges).
+    var t: u32 = 0;
+    while (pool.counter(.failed) < failed0 + 1) : (t += 1) {
+        if (t > 10_000) return error.Timeout;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(specStateIs(B, 4));
+}
