@@ -328,8 +328,8 @@ prefill within noise), so `mtp_lane` stays off by default and the defaults serve
 and +20.6 %; 262 of its 1,405 accepted drafts are not the target's own draw (lossy: an opt-in). The prefill loss is the
 4 prompt rows (at equal rows the lane's prompt pass costs +0.2 %); the lane does the same prompt work in both ABBAs, so
 the difference between -3.0 % and -5.7 % is the box's variance. The lane reads more from the SSD a token (the 4 fewer
-rows and the verify's 4-row union of experts), so its value rises with the expert hit rate: at the 240 GB pin (more
-rows a layer) it is not measured.
+rows and the verify's 4-row union of experts), so its value rises with the expert hit rate. At the 240 GB pin (more
+rows a layer) `exact` has no ABBA; `typical` has two (below).
 
 Depth and delta, on the lane over the stack's fold 1 (5df1fc9), the BF16 pack, 168 / 178 rows, seed 1234: `exact`
 depth 3 is the fastest exact depth (18.97 tok/s against 15.58 serial; depths 1 to 8, 11 and 15 measured);
@@ -346,6 +346,32 @@ on that fold-1 bundle and the BF16 pack, each lane's 1,024 tokens forced through
 | `exact` | 100.0 % | 0 nats | 0 nats |
 | `typical` 0.2 | 91.7 % | 0.106 nats | 0.418 nats |
 | `typical` 0.8 | 95.8 % | 0.0099 nats | 0 nats |
+
+The stability of `typical` over long texts, on the bundle of fold 7 (2769fbd), the q8 pack with the drafter's sidecar,
+193 / 203 rows, depth 3: 3 prompts (the coding, explainer and prose workloads, 16.4K to 16.7K prompt tokens), 2,048
+greedy tokens each. The serial model scores every position of each text in one prompt pass (diag/beam-tf-rows
+59592d6), 6,144 positions a rule. The excess surprisal of a token is ln p(the top choice) - ln p(the token).
+
+| Rule | Top-1 agreement with the serial model | Mean excess surprisal | Tokens more than 2 nats below the top choice | Repeated 4-grams, first / second half |
+|---|---|---|---|---|
+| `exact` | 98.78 % | 0.0016 nats | 0 | 7.4 / 10.5 % |
+| `typical` 0.2 | 87.39 % | 0.119 nats | 74 | 8.3 / 19.4 % |
+| `typical` 0.6 | 92.56 % | 0.042 nats | 0 | 8.2 / 13.8 % |
+
+No rule drifts: the mean excess surprisal does not grow from the first quarter of the texts to the last (`typical`
+0.2: 0.135, 0.126, 0.110 and 0.107 nats; 0.6: 0.050, 0.047, 0.033 and 0.038). No text degenerates: all 9 texts run to
+the 2,048-token cap, the host's loop guard does not fire, and no text ends in a cycle. The `exact` texts' deviations are
+near ties (ranks 2 to 5, none over 1 nat), where the 4-row verify and the prompt pass round differently.
+
+At equal memory on the 240 GB pin (the control at 197 / 207 rows, the lane at 193 / 203), with the workload, the
+sampling and the seeds above and both arms seeded, two ABBAs on the bundle of fold 7: `typical` 0.6 gives decode
+29.25 -> 33.26 tok/s (+13.7 %) and prefill -4.0 %, and 101 tokens a 1,024 are not the target's own draw. `typical` 0.2
+gives 29.31 -> 35.93 tok/s (+22.6 %) and prefill -3.7 %, with 130.5 tokens a 1,024.
+
+The recommended opt-in is `typical` at delta 0.6, the default of `mtp_typical_delta`: +13.7 % decode at equal memory
+(33.3 tok/s). Delta 0.2 is 8 % faster (35.9 tok/s), but its excess surprisal a token is 2.8 times that of 0.6, 74 of its
+6,144 tokens are more than 2 nats below the top choice (0.6: none), and its second half repeats more. The lane stays
+off by default (`mtp_lane: false`), and `exact` stays its default rule.
 
 ## Settings
 
@@ -368,7 +394,7 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 | `draft_depth` | drafts a round, 1 .. 15 (the drafter's block of 16 less one) | 3 (the measured depth) |
 | `draft_gate` | theta in [0, 1): verify the leading drafts whose cumulative drafter probability stays at theta or more | 0 (off) |
 | `mtp_acceptance` | `exact`, `typical` (lossy) | `exact` |
-| `mtp_typical_delta` | (0, 1], named only with `typical` | 0.5 |
+| `mtp_typical_delta` | (0, 1], named only with `typical` | 0.6 |
 | `draft_path` | `sampled` (drafts drawn from q, speculative sampling), `greedy`: the drafter's path on a sampled request | `sampled` (`greedy` under `typical`) |
 
 One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV quantization must be off

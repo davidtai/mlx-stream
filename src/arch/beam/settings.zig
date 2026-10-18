@@ -72,8 +72,9 @@ pub const default_draft_depth: u32 = 3;
 /// The most drafts a round names: the acceptance graphs' rows less the bonus row and one (`acceptance.max_rows` 17), the
 /// trained block's 15. The lane refuses a depth past its drafter's own block less one (`BeamDraftDepthOverBlock`).
 pub const max_draft_depth: u32 = acc.max_rows - 2;
-/// Typical acceptance's default delta (glm5_next's).
-pub const default_typical_delta: f32 = 0.5;
+/// Typical acceptance's default delta: 0.6, the measured opt-in (docs/beam.md, the draft lane: +13.7 % decode at equal
+/// memory on the 240 GB pin; 0.2 is 8 % faster at 2.8 times the excess surprisal a token). glm5_next's is 0.5.
+pub const default_typical_delta: f32 = 0.6;
 /// The lane's acceptance rule (`mtp_acceptance`), installed at construction.
 pub const MtpAcceptance = enum { exact, typical };
 /// The drafter's path on a sampled request (`draft_path`), installed at construction: `sampled` (the default under the
@@ -491,6 +492,8 @@ test "beam settings: the draft lane's keys (off by default; exact the default ru
     const typ = try parseSettings("{\"mtp_lane\":true,\"mtp_acceptance\":\"typical\"}");
     try typ.validate();
     try testing.expectEqual(DraftPath.greedy, typ.draftPath());
+    // typical's delta, when not named, is the measured opt-in's 0.6.
+    try testing.expectEqual(acc.Rule{ .typical = .{ .delta = 0.6 } }, typ.draftRule());
     const on = try parseSettings("{\"mtp_lane\":true,\"draft_depth\":15,\"draft_gate\":0.5,\"mtp_acceptance\":\"typical\",\"mtp_typical_delta\":0.2}");
     try on.validate();
     try testing.expectEqual(@as(u32, 15), on.draft_depth);
