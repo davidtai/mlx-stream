@@ -20,7 +20,7 @@ const bank = @import("nvfp4_bank.zig");
 
 const T = mlx.mlx_array;
 
-extern "c" fn glm5_gather_qmm_nvfp4(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, scales: mlx.mlx_array, global_scale: mlx.mlx_array, lhs_indices: mlx.mlx_array, rhs_indices: mlx.mlx_array, sorted: bool, s: mlx.mlx_stream) c_int;
+extern "c" fn glm5_gather_qmm_nvfp4(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, scales: mlx.mlx_array, global_scale: mlx.mlx_array, rhs_indices: mlx.mlx_array, sorted: bool, s: mlx.mlx_stream) c_int;
 extern "c" fn dsv41_alloc_last_error() [*:0]const u8;
 
 pub const Params = struct {
@@ -41,10 +41,16 @@ pub fn FormatOf(comptime params: Params) type {
             return bank.Arrays(A);
         }
 
-        /// MLX's gather_qmm in nvfp4 mode with the slots' global scales: x [.., M, in] against the slots `rhs` names. x's
-        /// batch rows index themselves (`identityRows`: host data, so MLX makes no arange a call).
+        /// MLX's gather_qmm in nvfp4 mode with the slots' global scales: x [.., M, in] against the slots `rhs` names.
         fn gatherQmm(g: *ops.MlxOps, x: T, p: Projection(T), rhs: T, sorted: bool) !T {
-            return gatherNvfp4(g, x, p, try identityRows(g, x), rhs, sorted);
+            const gs = try perExpertScale(g, p);
+            var res = mlx.mlx_array_new();
+            if (glm5_gather_qmm_nvfp4(&res, x, p.w, p.scales, gs, rhs, sorted, g.s) != 0) {
+                _ = mlx.mlx_array_free(res);
+                sdk.log.err("nvfp4: gather_qmm nvfp4: {s}\n", .{std.mem.span(dsv41_alloc_last_error())});
+                return error.MlxError;
+            }
+            return g.adopt(res);
         }
 
         /// A prompt tile's sorted gather: x [rows, in], rhs u32 [rows] sorted by slot -> [rows, out] (MiMo's
@@ -92,42 +98,6 @@ pub fn FormatOf(comptime params: Params) type {
         }
     };
 }
-
-/// MLX's gather_qmm in nvfp4 mode (group 16, bits 4, transposed) with the slots' global scales (`perExpertScaleOf`):
-/// x [.., M, in] against the slots `rhs` names, `sorted` its order. `lhs`: x's batch rows' identity index
-/// (`identityRows`), or a null handle for MLX's own (an arange a call).
-pub fn gatherNvfp4(g: *ops.MlxOps, x: T, p: bank.Arrays(T), lhs: T, rhs: T, sorted: bool) !T {
-    const gs = try perExpertScaleOf(g, p);
-    var res = mlx.mlx_array_new();
-    if (glm5_gather_qmm_nvfp4(&res, x, p.w, p.scales, gs, lhs, rhs, sorted, g.s) != 0) {
-        _ = mlx.mlx_array_free(res);
-        sdk.log.err("nvfp4: gather_qmm nvfp4: {s}\n", .{std.mem.span(dsv41_alloc_last_error())});
-        return error.MlxError;
-    }
-    return g.adopt(res);
-}
-
-/// The identity index of x's batch rows (all of x's axes but the last two), u32 in their shape, as MLX's gather_qmm
-/// makes it when it is given no lhs (`arange(rows)` in the batch shape, one kernel a call): host data from
-/// `identity_table`, so the index is evaluated when the gather is built. A null handle (MLX's own arange) past the
-/// table's rows; the prompt tiles' sorted gathers take at most `identity_table.len` rows (MiMo's `projection_rows`).
-pub fn identityRows(g: *ops.MlxOps, x: T) !T {
-    const sx = g.shapeOf(x);
-    if (sx.n < 2) return .{ .ctx = null };
-    const batch = sx.d[0 .. sx.n - 2];
-    var rows: usize = 1;
-    for (batch) |d| rows *= @intCast(d);
-    if (rows > identity_table.len) return .{ .ctx = null };
-    return g.hostArray(std.mem.sliceAsBytes(identity_table[0..rows]), batch, .uint32);
-}
-
-/// 0, 1, ..., 1,023: the identity index's values (`identityRows`).
-pub const identity_table: [1024]u32 = blk: {
-    @setEvalBranchQuota(4096);
-    var t: [1024]u32 = undefined;
-    for (&t, 0..) |*v, i| v.* = @intCast(i);
-    break :blk t;
-};
 
 /// MLX's per-expert global scale of `p`: column 0 (each slot's word) of the first `slots` rows of the line-isolated
 /// array [>= slots, 32] (nvfp4_bank.zig `scale_line_bytes`), f32 [slots], `slots` the words' leading dimension as MLX's
