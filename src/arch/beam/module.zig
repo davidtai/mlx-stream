@@ -364,12 +364,14 @@ pub const Module = struct {
         std.debug.assert(ids.len > 0 and ids.len <= lane_mod.chunk_rows and self.src.decodeLaneAt(@intCast(ids.len)));
         if (self.cache.len + ids.len > self.cache.cap) return error.ContextOverBill;
         errdefer self.state_lost = true;
+        if (comptime prof.enabled) prof.chunkBegin();
         return graph.forward(&self.g, self.gpa, &self.c.model, &self.w, self.routes, ids, self.cache.len, &self.cache, self.src, .all, {}, caps);
     }
 
     /// After a verify chunk's eval: the routes it consumed are released (the serial step's flush).
     pub fn flushVerify(self: *Module) !void {
         try self.src.flush();
+        if (comptime prof.enabled) prof.chunkEnd();
     }
 
     /// The draft lane's rollback: the newest `n` positions (the rejected verify rows) leave every KV lane.
@@ -383,6 +385,7 @@ pub const Module = struct {
     /// A draft round's start (lane.zig `roundWith`): the last step's or round's wall ends here (`closeStep`).
     pub fn openRound(self: *Module, now: u64) void {
         self.closeStep(now);
+        if (comptime prof.enabled) prof.roundBegin();
     }
 
     /// A round's tokens in the request's decode accounting (the `beam decode` line). Its wall is a serial step's: from

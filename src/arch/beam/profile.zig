@@ -71,7 +71,10 @@ const State = struct {
     reads_on: bool = false,
     phase: Phase = .none,
     s0: @import("../../sdk_ext.zig").expert.Stats = .{},
-    steps: u64 = 0,
+    /// A draft round's start and its first chunk's (`roundBegin`, `chunkBegin`); the round's draft is not charged yet.
+    round_t0: dt.Stamp = if (dt.enabled) 0 else {},
+    chunk_t0: dt.Stamp = if (dt.enabled) 0 else {},
+    round_drafting: bool = false,
     record_bytes: u64 = 1,
     hidden: u32 = 0,
     inter: u32 = 0,
@@ -80,6 +83,8 @@ const State = struct {
 var state: if (enabled) State else void = if (enabled) .{} else {};
 const Storage = struct {
     var reads: [max_reads][4]i64 = undefined;
+    /// Each cycle's open (`cycleOpen`: a serial step's forward begin, or a draft round's start), the timeline's clock.
+    var opens: [timeline.max_cycles]u64 = undefined;
 };
 
 fn envValue(comptime name: [:0]const u8) ?[]const u8 {
@@ -180,7 +185,6 @@ pub fn promptEnd(src: anytype) void {
 pub fn decodeBegin(src: anytype, budget: u64) void {
     if (comptime !enabled) return;
     startPhase(.decode, src);
-    state.steps = 0;
     if (!state.gpu_wanted) return;
     if (state.gpu_installed) {
         log.info("VERIFY_GPU_TIMELINE_UNAVAILABLE {{\"reason\": \"installed for the first request only\"}}\n", .{});
@@ -201,40 +205,76 @@ pub fn decodeBegin(src: anytype, budget: u64) void {
     }
 }
 
-/// A serial step's forward begins: the GPU timeline's cycle and verify; the kernel log stops past its steps.
+/// A cycle opens (a serial step's forward, or a draft round's start): the GPU timeline's checks and its cycle (the
+/// buffers committed until `verifyBegin` carry the `draft` phase), the cycle's open stamp; the kernel log stops past its
+/// steps.
+fn cycleOpen() void {
+    if (!state.gpu_on) return;
+    // After the first forward the hook must have seen its commits (before it, nothing has committed since the install
+    // at the phase change).
+    if (timeline.cycles == 1) if (timeline.unavailableReason()) |why| {
+        var buf: [1024]u8 = undefined;
+        log.info("{s}\n", .{timeline.unavailableLine(&buf, why)});
+        timeline.uninstall();
+        state.gpu_on = false;
+        return;
+    };
+    if (timeline.active and timeline.cycles >= timeline.max_cycles) {
+        timeline.disarm();
+        timeline.active = false;
+        state.gpu_truncated = true;
+    }
+    if (state.kernels_on and timeline.cycles >= state.kernel_steps) {
+        c.dsv41kl_arm(0);
+        state.kernels_on = false;
+    }
+    if (timeline.active) Storage.opens[timeline.cycles] = timeline.now();
+    timeline.cycleBegin();
+}
+
+/// A serial step's forward begins: a cycle and its verify window at once.
 pub fn stepBegin() dt.Stamp {
     if (comptime !enabled) return {};
-    if (state.gpu_on) {
-        // After the first forward the hook must have seen its commits (before it, nothing has committed since the
-        // install at the phase change).
-        if (timeline.cycles == 1) if (timeline.unavailableReason()) |why| {
-            var buf: [1024]u8 = undefined;
-            log.info("{s}\n", .{timeline.unavailableLine(&buf, why)});
-            timeline.uninstall();
-            state.gpu_on = false;
-        };
-        if (state.gpu_on and timeline.active and timeline.cycles >= timeline.max_cycles) {
-            timeline.disarm();
-            timeline.active = false;
-            state.gpu_truncated = true;
-        }
-        if (state.kernels_on and state.steps >= state.kernel_steps) {
-            c.dsv41kl_arm(0);
-            state.kernels_on = false;
-        }
-        timeline.cycleBegin();
-        timeline.verifyBegin();
-    }
+    cycleOpen();
+    if (state.gpu_on) timeline.verifyBegin();
     return dt.now();
 }
 
-/// The step's forward ended (its logits evaluated, the source flushed).
+/// The step's forward ended (its logits committed, the source flushed).
 pub fn stepEnd(t0: dt.Stamp) void {
     if (comptime !enabled) return;
     _ = dt.charge(.verify, t0);
     dt.countCycle();
     if (state.gpu_on) timeline.verifyEnd();
-    if (state.phase == .decode) state.steps += 1;
+}
+
+/// A draft round begins (module.zig `openRound`, lane.zig `roundWith`): one cycle for the round. The drafter's buffers
+/// carry the cycle's `draft` phase, the verify chunks' the `verify` phase, the commit's appends the `rest` phase.
+pub fn roundBegin() void {
+    if (comptime !enabled) return;
+    cycleOpen();
+    dt.countCycle();
+    state.round_t0 = dt.now();
+    state.round_drafting = true;
+}
+
+/// A verify chunk begins (module.zig `verifyChunk`): the round's draft (its graph, eval and host reads) is charged
+/// once, and the cycle's verify window opens at its first chunk (verify_timeline.zig keeps the first begin).
+pub fn chunkBegin() void {
+    if (comptime !enabled) return;
+    if (state.round_drafting) {
+        _ = dt.charge(.draft_build, state.round_t0);
+        state.round_drafting = false;
+    }
+    if (state.gpu_on) timeline.verifyBegin();
+    state.chunk_t0 = dt.now();
+}
+
+/// A verify chunk's routes released (module.zig `flushVerify`, after the lane's decision eval).
+pub fn chunkEnd() void {
+    if (comptime !enabled) return;
+    _ = dt.charge(.verify, state.chunk_t0);
+    if (state.gpu_on) timeline.verifyEnd();
 }
 
 /// The request's end (the decode phase's): the phase lines, `DECODE_TIMERS`, the GPU timeline's line and files, the
@@ -337,8 +377,8 @@ fn writeDecodeRows(base: []const u8) void {
         var aw: std.Io.Writer.Allocating = .init(state.a);
         defer aw.deinit();
         const w = &aw.writer;
-        w.writeAll("cycle\tbegin_ns\tend_ns\n") catch return;
-        for (st.verifies, 0..) |vf, i| w.print("{d}\t{d}\t{d}\n", .{ i, vf.begin, vf.end }) catch return;
+        w.writeAll("cycle\tbegin_ns\tend_ns\topen_ns\n") catch return;
+        for (st.verifies, 0..) |vf, i| w.print("{d}\t{d}\t{d}\t{d}\n", .{ i, vf.begin, vf.end, Storage.opens[i] }) catch return;
         writeOut(base, ".decode-steps.tsv", aw.written());
     }
     {
@@ -407,5 +447,8 @@ test "beam profile: a served build compiles every entry to nothing" {
     try std.testing.expect(@TypeOf(state) == void);
     try std.testing.expect(@TypeOf(stepBegin()) == void);
     stepEnd({});
+    roundBegin();
+    chunkBegin();
+    chunkEnd();
     try armEarly();
 }
