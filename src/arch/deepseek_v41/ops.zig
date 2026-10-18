@@ -2172,11 +2172,23 @@ test "dsv41 ops: both backends carry the kernels contract's launch, wave and sco
     }
 }
 
-test "dsv41 ops: a host read of routed ids takes the router's int32 only" {
+test "dsv41 ops: a host read of routed ids takes the routers' int32 or uint32 ids only" {
+    const Script = struct {
+        fn ids(_: *anyopaque, out: []u16) anyerror!void {
+            for (out, 0..) |*o, i| o.* = @intCast(i);
+        }
+        fn argmax(_: *anyopaque) anyerror!u32 {
+            return 0;
+        }
+    };
     var g = TraceOps.init(testing.allocator);
     defer g.deinit();
+    var ctx: u8 = 0;
+    g.host_values = .{ .ctx = &ctx, .ids = Script.ids, .argmax = Script.argmax };
     var out: [6]u16 = undefined;
-    try testing.expectError(error.HostIdsDtype, g.hostIds(try g.input(&.{ 2, 3 }, .uint32), &out));
+    // DeepSeek's int32 indices and an argpartition's uint32 indices read the same ids; any other dtype refuses.
+    for ([_]Dtype{ .int32, .uint32 }) |dt| try testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3, 4, 5 }, try g.hostIds(try g.input(&.{ 2, 3 }, dt), &out));
+    for ([_]Dtype{ .int64, .uint16, .float32 }) |dt| try testing.expectError(error.HostIdsDtype, g.hostIds(try g.input(&.{ 2, 3 }, dt), &out));
 }
 
 test "dsv41 ops: a host read copies an evaluated array in place through its strides (READBACK)" {
