@@ -966,8 +966,9 @@ fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, s
     try src.readAheadSeed(l, expert_policy.rankHottest(host, &src.ahead_ranked));
 }
 
-/// The head's rows: the last row's logits (served), or every row's (the parity test's).
-pub const Head = enum { last, all };
+/// The head's rows: the last row's logits (served), or every row's (the parity test's); DIAG (diag/beam-tf-rows, not
+/// for merge): `hidden`, the final residual stream [rows, hidden] before the final norm (tf_rows.zig).
+pub const Head = enum { last, all, hidden };
 
 /// One forward of `ids` at positions [start, start + ids.len) through every layer (each layer's state advanced in
 /// `cache`), the routed experts through `src`, the construction's `routes`: the last row's logits f32 [1, vocab]
@@ -1055,6 +1056,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         if (comptime @TypeOf(capture) != void) try capture.take(g, l, x, rows);
     }
     cache.len = start + rows;
+    if (head == .hidden) return g.keep(x); // DIAG (diag/beam-tf-rows)
     // The decode glue's last boundary normed the one row by the final norm already: the head's lm_head and soft cap.
     if (xn_next) |xn| return g.keep(try softcap(g, c, try project(g, w.head, xn)));
     if (head == .all) return g.keep(try logitsOf(g, c, w, x));

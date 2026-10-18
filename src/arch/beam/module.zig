@@ -26,6 +26,7 @@ const sdk_ext = @import("../../sdk_ext.zig");
 const residency = @import("../../sdk_ext/expert/residency.zig");
 const lane_mod = @import("lane.zig");
 const drafter = @import("drafter.zig");
+const tf_rows = @import("tf_rows.zig"); // DIAG, not for merge (diag/beam-tf-rows)
 
 const T = mlx.mlx_array;
 
@@ -250,6 +251,8 @@ pub const Module = struct {
     pub fn promptCalls(self: *Module, ids: []const u32, comptime head: graph.Head, force: anytype) !T {
         var logits: ?T = null;
         errdefer if (logits) |x| self.g.release(x);
+        // DIAG (diag/beam-tf-rows): with BEAM_TF_ROWS_FROM set, the served pass's last call logs its rows (tf_rows.zig).
+        const tf_from: ?u64 = if (head == .last and @TypeOf(force) == void) tf_rows.from() else null;
         var at: usize = 0;
         while (at < ids.len) {
             const end = @min(ids.len, at + experts.call_rows);
@@ -261,6 +264,8 @@ pub const Module = struct {
                 errdefer caps.release();
                 logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, self.routes, ids[at..end], start, &self.cache, self.src, head, force, &caps);
                 try l.appendCaptures(&self.g, &caps, start + (end - at), true);
+            } else if (tf_from != null and tf_rows.applies(tf_from.?, ids.len, at, end, start)) {
+                logits = try tf_rows.lastCall(self, ids, at, end, start, tf_from.?);
             } else logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, self.routes, ids[at..end], start, &self.cache, self.src, head, force, {});
             at = end;
         }
