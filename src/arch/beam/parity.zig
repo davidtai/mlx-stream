@@ -868,19 +868,23 @@ test "beam diag p5 layers: the long call's per-layer distance to the reference (
     defer for (bufs) |b| for (b) |t| a.free(t);
     var probes: [2]graph.Probe = undefined;
     for (&probes, bufs) |*p, b| p.* = .{ .positions = rows, .hidden = hidden, .x1 = b[0], .f = b[1], .x2 = b[2] };
+    var logits: [2][]f32 = undefined;
     for ([_]usize{ long_rows, old_call_rows }, 0..) |chunk, i| {
         graph.probe = &probes[i];
         defer graph.probe = null;
         const run = try longRun(a, dir, slice_rows, in.ids, in.routes, chunk);
-        a.free(run.logits);
         a.free(run.chosen);
+        logits[i] = run.logits;
     }
+    defer for (logits) |x| a.free(x);
+    // The spans: rows below the old call's end, the prompt rows past it, the decode steps.
+    const spans = [_][]const u8{ "below 16384", "16384-16444", "decode" };
     const taps = [_][]const u8{ "x1 (after attention)", "f (MLP / MoE out)", "x2 (layer out)" };
     for (0..n_layers) |l| for (0..3) |t| {
-        var sums: [2][2]f64 = .{ .{ 0, 0 }, .{ 0, 0 } };
-        var counts: [2]usize = .{ 0, 0 };
+        var sums: [2][3]f64 = .{ .{ 0, 0, 0 }, .{ 0, 0, 0 } };
+        var counts: [3]usize = .{ 0, 0, 0 };
         for (rows, 0..) |pos, r| {
-            const span: usize = @intFromBool(pos >= old_call_rows);
+            const span: usize = if (pos < old_call_rows) 0 else if (pos < long_rows) 1 else 2;
             counts[span] += hidden;
             const want = ref[t * per_tap + (l * n + r) * hidden ..][0..hidden];
             for (0..2) |path| {
@@ -888,6 +892,21 @@ test "beam diag p5 layers: the long call's per-layer distance to the reference (
                 for (got, want) |x, y| sums[path][span] += @as(f64, x - y) * (x - y);
             }
         }
-        std.debug.print("BEAM DIAG P5 layer {d} {s}: RMS vs the reference, below row {d} / past it: one call {d:.6} / {d:.6}, 16,384 + 61 {d:.6} / {d:.6}\n", .{ l, taps[t], old_call_rows, @sqrt(sums[0][0] / @as(f64, @floatFromInt(counts[0]))), @sqrt(sums[0][1] / @as(f64, @floatFromInt(counts[1]))), @sqrt(sums[1][0] / @as(f64, @floatFromInt(counts[0]))), @sqrt(sums[1][1] / @as(f64, @floatFromInt(counts[1]))) });
+        for (0..3) |sp| if (counts[sp] > 0) std.debug.print("BEAM DIAG P5 layer {d} {s} {s}: RMS vs the reference: one call {d:.6}, 16,384 + 61 {d:.6} ({d:.2} %)\n", .{ l, taps[t], spans[sp], @sqrt(sums[0][sp] / @as(f64, @floatFromInt(counts[sp]))), @sqrt(sums[1][sp] / @as(f64, @floatFromInt(counts[sp]))), 100 * (@sqrt(sums[0][sp] / sums[1][sp]) - 1) });
     };
+    // Each logit row's RMS distance to the reference (its .f32: the last prompt row, then each decode step).
+    const ref_logits_path = try std.fmt.allocPrint(a, "{s}.f32", .{prefix});
+    defer a.free(ref_logits_path);
+    const rl = try std.Io.Dir.cwd().readFileAlloc(io, ref_logits_path, a, .limited(1 << 30));
+    defer a.free(rl);
+    const vocab: usize = model.vocab_size;
+    if (rl.len != (1 + long_steps) * vocab * 4) return error.BeamParityRef;
+    const want_logits = std.mem.bytesAsSlice(f32, rl);
+    for (0..1 + long_steps) |r| {
+        var ss: [2]f64 = .{ 0, 0 };
+        for (0..2) |path| for (logits[path][r * vocab ..][0..vocab], want_logits[r * vocab ..][0..vocab]) |x, y| {
+            ss[path] += @as(f64, x - y) * (x - y);
+        };
+        std.debug.print("BEAM DIAG P5 logits row {d}: RMS vs the reference: one call {d:.5}, 16,384 + 61 {d:.5} ({d:.2} %)\n", .{ long_rows - 1 + r, @sqrt(ss[0] / @as(f64, @floatFromInt(vocab))), @sqrt(ss[1] / @as(f64, @floatFromInt(vocab))), 100 * (@sqrt(ss[0] / ss[1]) - 1) });
+    }
 }

@@ -368,7 +368,7 @@ def main() -> None:
                     help="write the logits of rows ROW on only (the trunk still runs every row)")
     ap.add_argument("--dump-rows", metavar="ROWS",
                     help="diag/beam-p5-layers: 'boundary' (the last row of each 512-row tile below the old 16,384-row "
-                         "call, then the 61 rows past it) or a comma list: PREFIX.layers.f32 holds each layer's residual "
+                         "call, then the 61 rows past it and the decode rows) or a comma list: PREFIX.layers.f32 holds each layer's residual "
                          "after the attention, MLP or MoE output and layer output at those rows, f32 [3][layers][rows][hidden]")
     ap.add_argument("--twin", action="store_true",
                     help="also write PREFIX.twin.f32: the same forward on the same routes with no BF16 rounding (every "
@@ -416,7 +416,7 @@ def main() -> None:
     forced = m.forced is not None
     if args.dump_rows is not None:
         m.dumps = []
-        m.dump_rows = (list(range(511, 16_384, 512)) + list(range(16_384, LONG_PROMPT)) if args.dump_rows == "boundary"
+        m.dump_rows = (list(range(511, 16_384, 512)) + list(range(16_384, LONG_PROMPT + LONG_DECODE)) if args.dump_rows == "boundary"
                        else [int(t) for t in args.dump_rows.split(",")])
     logits = m.forward(ids, head_from)
     if m.dump_rows is not None:

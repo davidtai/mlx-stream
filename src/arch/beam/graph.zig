@@ -963,7 +963,7 @@ fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, s
 /// The head's rows: the last row's logits (served), or every row's (the parity test's).
 pub const Head = enum { last, all };
 
-/// diag/beam-p5-layers (not for serving): a test's probe of each prompt call's per-layer arrays at chosen positions
+/// diag/beam-p5-layers (not for serving): a test's probe of each call's per-layer arrays (prompt calls and decode steps) at chosen positions
 /// (absolute rows): the residual after the attention (`x1`), the MLP's or the MoE's output (`f`) and the layer's output
 /// (`x2`), f32 [layer][position][hidden]. Set by parity.zig's per-layer diag around a long run; null otherwise.
 pub const Probe = struct {
@@ -1071,11 +1071,11 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             break :blk b2.res;
         } else try depthAdd(g, c, try rmsNorm(g, f, lw.post_ff_norm, c.rms_norm_eps), x1, beam.Config.residualIndex(l, true));
         const next = g.keep(x2);
-        if (prompt) if (probe) |p| {
+        if (probe) |p| {
             try p.put(g, p.x1, li, x1, start, rows);
             try p.put(g, p.f, li, f, start, rows);
             try p.put(g, p.x2, li, next, start, rows);
-        };
+        }
         g.release(x);
         x = next;
         // MiMo's tail: a prompt layer's output evaluated before the next layer starts (bounding its graph), then the
