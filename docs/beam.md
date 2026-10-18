@@ -101,6 +101,36 @@ and its NVFP4 projection format are shared with glm5_next (`src/expert/nvfp4_ban
 - The prompt combine uses MiMo's in-place text when the hidden size is a multiple of 1,024 and the model routes 8
   experts a token. Otherwise it uses MiMo's stock reduction (a test pack).
 
+### The decode experts, measured
+
+`decode_kernels_bench.zig` (`BEAM_DECODE_BENCH=<the slice>`, on the box) puts real records of the slice in the three
+banks (128, 8 and 16 slots). A round chains 49 routed layers of one route and evaluates them once. A layer is the
+route's experts, the join and the stock combine. Each value is the median of 9 rounds. At the end of each chain the two
+routes gave the same bits.
+
+| Wave | Pairs | Stock route's gather groups | Stock (µs a layer) | Fused (µs a layer) | Dispatches a layer, stock / fused | Distinct MB a layer | GB/s, stock / fused |
+|---|---|---|---|---|---|---|---|
+| One token, base bank | 8 | 1 | 229.5 | 213.5 | 17 / 8 | 176.9 | 771 / 829 |
+| One token, 2 pairs in the transient bank | 8 | 2 | 246.1 | 209.2 | 30 / 8 | 176.9 | 719 / 846 |
+| 4 tokens | 32 | 1 | 535.8 | 448.5 | 17 / 8 | 347.6 | 649 / 775 |
+| 8 tokens | 64 | 1 | 910.2 | 752.9 | 17 / 8 | 456.8 | 502 / 607 |
+
+One text that reads 4 GiB gives 997 GB/s (the median of 7 reads; the best is 1,031 GB/s). At that rate the routed
+weights of one decode step (392 records, 8.67 GB) take at least 8.70 ms. The fused one-token waves take 10.25 to
+10.46 ms for them (49 layers).
+
+On the pack (the coding workload at the model card's sampling, seed 1234, rows 173 / 183, one run of each route):
+
+| Route | Decode | ms a step | Prefill | SSD a decode token | Text |
+|---|---|---|---|---|---|
+| `stock` (bundle beam-tools-6cab6fd, 2 runs) | 16.23 tok/s | 61.62 | 641.4 to 643.4 tok/s | 260.4 MB | sha256 9a26ee3b87603ff2... |
+| `fused` (bundle beam-fused-84d1aaa) | 16.35 tok/s | 61.16 | 643.8 tok/s | 260.4 MB | the same |
+
+A profile run of the stock route on the same request logs 273 gathers a decode step (62 steps logged): 91 gather
+groups, 12 dispatches each. 10.5 routed layers a step have misses, at 1.04 miss parts each. The fused route runs each
+layer's hit wave in 3 dispatches, and the miss parts keep their gathers. Thus a step has about 280 expert dispatches
+instead of about 1,100.
+
 ## Settings
 
 The settings are in the `settings` object of `expert_streaming`. The module reads them one time, at construction. A
@@ -135,7 +165,7 @@ One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV qua
 | `resident_wiring`, `buffer_allowance` | The wiring of the wired bytes. DeepSeek's measured cost for each live buffer. |
 | `request`, `request_wiring` | The prompt wave at the widest call, the decode wave, and their wiring. |
 | `sampler`, `gpu_warm` | The plugin's sampler. MiMo's keep-warm engine when it is on. |
-| `decode_kernels` | The fused texts' set and prepared launches under `decode_moe: fused`: 16 MiB declared (glm5_next's value for the same set). |
+| `decode_kernels` | The fused texts' set, its pipelines and prepared launches under `decode_moe: fused`: 20 MiB declared. At the pack's load the fused route's construction footprint is 18.6 MB more than the stock route's (host side 416.1 MB against 397.5 MB; MLX active the same). |
 
 The fill gives the most decode rows and prompt rows that fit the host's ceiling less its wired margin. The floor is 8
 rows. On the 256 GB M5 Ultra (ceiling 240 GiB, margin 2 GiB, baseline 12.6 GB, context 32,768) the bill test prints
@@ -193,6 +223,10 @@ its bound.
 
 On the slice the stream missed 1,312 times, hit 409 times, evicted 209 times and read 32.0 GB.
 
+The slice runs `decode_moe: fused` (the default at its geometry) and gives the numbers above, which the stock route
+gave before. A second test serves the slice on each route, with the reference's routes forced, and compares every
+logit: 106,962,944 logits (704 rows), 0 differ.
+
 The fixture serves at the fill's rows only (8 of 8 experts). With fewer rows, the stream floors each slot array at
 one page. Then the E4M3 scales of a projection (2 KiB a slot on the fixture) hold more slots than its words, and
 MLX's `gather_qmm` refuses that. The construction refuses it first (`BeamSlotArrays`). Beam's own scales are 800 KiB a
@@ -247,3 +281,6 @@ arguments, on `/v1/chat/completions` and `/v1/messages`, streamed and not stream
 - A Beam reading of the host runtime and the compiled kernels. The bill uses MiMo's declared values.
 - The lookahead selector's top-k is the bank's fixed 8 (`routed_top_k`). It only selects reads.
 - A profile build and the benchmark record.
+- The fused texts run each routed layer's hit wave. A miss part (the gated route: its gathers wait on its read's
+  event) still runs MLX's gathers per bank.
+- The combine is a step of its own after the down text. glm5_next's down text does not fold it either.

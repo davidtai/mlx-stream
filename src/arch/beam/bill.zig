@@ -52,9 +52,10 @@ pub const Inputs = struct {
     page: u64 = 16_384,
 };
 
-/// The fused decode route's kernel set and prepared launches, declared (`decode_kernels` term): glm5_next's declaration
-/// for the same set's shape (two texts, four instantiations, 128 prepared launches).
-pub const fused_kernels_bytes: u64 = 16 << 20;
+/// The fused decode route's kernel set, its pipelines and prepared launches, declared (`decode_kernels` term): measured on
+/// the M5 Ultra at the pack's load, the fused route's construction footprint is 18.6 MB over the stock route's (host side
+/// 416.1 MB against 397.5 MB; MLX active the same), held here with a margin.
+pub const fused_kernels_bytes: u64 = 20 << 20;
 
 /// The pack's residents (graph.zig `keptResident`), refused by beam's names.
 pub fn residentBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const beam.Config, page: u64) !route_bill.Residents {
