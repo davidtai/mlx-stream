@@ -24,6 +24,7 @@ const sdk_ext = @import("../../sdk_ext.zig");
 const residency = @import("../../sdk_ext/expert/residency.zig");
 const lane_mod = @import("lane.zig");
 const drafter = @import("drafter.zig");
+const lane_tf = @import("lane_tf.zig"); // DIAG, not for merge (diag/beam-dflash-tf)
 
 const T = mlx.mlx_array;
 
@@ -224,10 +225,13 @@ pub const Module = struct {
             if (logits) |x| self.g.release(x);
             logits = null;
             const start = self.cache.len;
-            if (self.armedLane()) |l| {
+            // DIAG (diag/beam-dflash-tf): with lane_tf's plan, an installed lane's matching prompt pass captures and runs it.
+            const tf = if (self.lane) |ln| (if (lane_tf.plan()) |pl| (if (lane_tf.applies(pl, ids.len, start, end - at, ln.dr.c.window)) pl else null) else null) else null;
+            if (self.armedLane() orelse (if (tf != null) self.lane else null)) |l| {
                 var caps = l.promptCaptures();
                 errdefer caps.release();
                 logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids[at..end], start, &self.cache, self.src, head, force, &caps);
+                if (tf) |pl| lane_tf.run(self, l, pl, ids[at..end], &caps) catch |e| log.warn("beam lane tf: {s}\n", .{@errorName(e)});
                 try l.appendCaptures(&self.g, &caps, start + (end - at), true);
             } else logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids[at..end], start, &self.cache, self.src, head, force, {});
             at = end;
