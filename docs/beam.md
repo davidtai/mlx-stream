@@ -635,7 +635,5 @@ token change from run to run. At seed 4321 the two fills read about the same byt
 - The fused texts run each routed layer's hit wave. A miss part (the gated route: its gathers wait on its read's
   event) still runs MLX's gathers per bank.
 - The combine is a step of its own after the down text. glm5_next's down text does not fold it either.
-- The draft lane on a sampled request drafts its greedy path. SGLang and TokenSpeed draw the selector's path at the
-  request's temperature and keep a draft with min(1, p / q) (rejection sampling).
 - The drafter drafts d + 1 rows a round. It is trained at 16 rows; its card serves 8.
 - The prompt pass evaluates each capture's copy at its target layer: 5 waits a prompt call.
