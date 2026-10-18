@@ -14,7 +14,8 @@
 //!   2. Each kernel the prompt pass builds at first use runs once on zeros at the prompt pass's shapes: layer 0's
 //!      attention over two tiles (its window mask), the first full layer's attention over two tiles (its causal SDPA and
 //!      query scale), layer 0's dense MLP over one tile, the first routed layer's predictor (the router and the expert
-//!      counts) over one call of `experts.call_rows` rows, the installed prompt combine over one token.
+//!      counts) over one call of `experts.call_rows` rows, the installed prompt combine over one token. The layers are
+//!      read through the prompt pass's view (`graph.promptView`: the q8 tier's projections dequantized to BF16).
 //!   3. The stream synchronized, the cache restarted (the rings rewound; a slab's rows past a request's length are never
 //!      read), MLX's cache cleared.
 //! No expert source state is touched (no route, read or slot): token-identical. Its memory is the prompt pass's (two
@@ -100,7 +101,10 @@ pub fn run(g: *G, a: std.mem.Allocator, io: std.Io, c: *const beam.Config, w: *c
         try g.evalAll(&.{tile});
         // The attention tiles as a prompt call runs them: each committed as built, the one before it waited.
         for ([_]u32{ p.sliding_layer, p.full_layer }) |l| {
-            const lw = &w.layers[l];
+            // The prompt pass's view of the layer (the q8 tier's projections as BF16, dequantized once; a BF16 layer
+            // is its own view): the same dequantize, GEMM and attention kernels as a prompt call's.
+            const view = try graph.promptView(g, &w.layers[l]);
+            const lw = &view;
             var prev: ?T = null;
             defer if (prev) |x| g.release(x);
             for (0..p.tiles) |i| {
@@ -121,7 +125,8 @@ pub fn run(g: *G, a: std.mem.Allocator, io: std.Io, c: *const beam.Config, w: *c
                 g.release(x);
             }
         }
-        const d = w.layers[p.dense_layer].dense orelse return error.BeamWarmLayout;
+        const dense_view = try graph.promptView(g, &w.layers[p.dense_layer]);
+        const d = dense_view.dense orelse return error.BeamWarmLayout;
         const dense_tile = try g.zeros(&.{ @intCast(@min(graph.dense_tile_rows, p.predict_rows)), hidden }, .bfloat16);
         try g.evalAll(&.{try graph.mlp(g, d, dense_tile)});
         // The predictor over one call's rows (its router GEMM and the per-expert counts at the call's M).
