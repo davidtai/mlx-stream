@@ -18,7 +18,10 @@
 //! The rule is a construction value (`settings.mtp_acceptance`, `mtp_typical_delta`; `acceptGeneral`'s): `exact`, the
 //! default (a greedy request's tokens are each verify row's argmax; a sampled one's are the target's position-keyed
 //! draws, a draft kept when it is the draw: distributed as the target), or `typical` (Medusa's typical acceptance on every
-//! request: lossy, an opt-in). The drafter always proposes its greedy path (a point-mass drafter: `acceptance` needs no q).
+//! request: lossy, an opt-in). The drafter proposes its greedy path (a point mass). On a sampled request with
+//! `draft_path: sampled` it draws each draft from its q (drafter.zig `sampledPathOf`) and the verify is speculative
+//! sampling (`acceptance.speculativeRows`: a draft kept with min(1, p / q), the residual (p - q)+ drawn on a rejection):
+//! each emitted token is distributed as the target, and a draft is kept with probability sum min(p, q).
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -132,6 +135,15 @@ pub const Lane = struct {
     /// Drafts a round at most (`settings.draft_depth`); the block is depth + 1 rows.
     depth: u32,
     gate: f32,
+    /// The drafter's path on a sampled request (`settings.draft_path`).
+    path: settings.DraftPath = .greedy,
+    /// `draft_path: sampled`: the round's drafts' rows of q over the vocabulary (depth x `vocab` f32, 0 off each row's
+    /// candidates: the speculative verify's residual; host memory, allocated at the first sampled round), the ids each
+    /// row wrote (cleared at the next round) and the rows written.
+    qd: []f32 = &.{},
+    qd_ids: []u32 = &.{},
+    qd_rows: u32 = 0,
+    vocab: u32 = 0,
     /// The decision graphs' and the draft's backend (its own scope, reset every round).
     g: G,
     stats: Stats = .{},
@@ -153,26 +165,68 @@ pub const Lane = struct {
         var g = try G.init(a, s);
         errdefer g.deinit();
         const self = try a.create(Lane);
-        self.* = .{ .a = a, .dr = dr, .rule = cfg.draftRule(), .depth = cfg.draft_depth, .gate = cfg.draft_gate, .g = g };
-        self.name_len = (nameOf(&self.name_buf, self.rule, self.depth, self.gate) catch unreachable).len;
+        self.* = .{ .a = a, .dr = dr, .rule = cfg.draftRule(), .depth = cfg.draft_depth, .gate = cfg.draft_gate, .path = cfg.draft_path, .g = g, .vocab = cfg.model.vocab_size };
+        self.name_len = (nameOf(&self.name_buf, self.rule, self.depth, self.gate, self.path) catch unreachable).len;
         return self;
     }
 
     pub fn deinit(self: *Lane) void {
+        self.a.free(self.qd);
+        self.a.free(self.qd_ids);
         self.dr.deinit();
         self.g.deinit();
         self.a.destroy(self);
     }
 
-    /// The lane's label: `dflash2 exact depth 7`, `dflash2 typical 0.4 depth 3`, a gate named (`gate 0.5`).
-    pub fn nameOf(buf: []u8, rule: acc.Rule, depth: u32, gate: f32) ![]const u8 {
-        const tier = switch (rule) {
+    /// The round's rows of q for the speculative verify: last round's entries cleared, then each of the `k` drafts' q over
+    /// its position's candidates written at their ids (`qd`), and each draft's own q (`qx`).
+    fn fillQ(self: *Lane, cand: []const u32, qv: []const f32, pick: []const u32, k: u32, qx: []f32) !void {
+        const kk: usize = self.dr.c.top_k;
+        const v: usize = self.vocab;
+        if (self.qd.len == 0) {
+            const qd = try self.a.alloc(f32, @as(usize, self.depth) * v);
+            errdefer self.a.free(qd);
+            self.qd_ids = try self.a.alloc(u32, @as(usize, self.depth) * kk);
+            @memset(qd, 0);
+            self.qd = qd;
+            self.qd_rows = 0;
+        }
+        for (0..self.qd_rows) |t| for (self.qd_ids[t * kk ..][0..kk]) |id| {
+            self.qd[t * v + id] = 0;
+        };
+        for (0..k) |t| {
+            for (cand[t * kk ..][0..kk], qv[t * kk ..][0..kk], self.qd_ids[t * kk ..][0..kk]) |id, q, *o| {
+                self.qd[t * v + id] = q;
+                o.* = id;
+            }
+            qx[t] = qv[t * kk + pick[t]];
+        }
+        self.qd_rows = k;
+    }
+
+    /// A chunk's speculative decision (`acceptance.speculativeRows`, the drafts drawn from q): the chunk's drafts' q
+    /// (`qx` from row `start`) and rows of q (`qd`). A chunk that holds only the bonus row takes the sampled rows.
+    fn specDecision(self: *const Lane, g: *G, logits: T, cd: []const u32, sm: acc.Params, base: u64, start: u32, qx: []const f32) !mimo_draft.Decision(T) {
+        if (cd.len == 0) return mimo_draft.decisionGraph(g, logits, cd, .exact, sm, base);
+        std.debug.assert(g.shapeOf(logits).dim(1) == self.vocab);
+        const n: c_int = @intCast(cd.len);
+        const v: usize = self.vocab;
+        const qxa = try g.hostArray(std.mem.sliceAsBytes(qx[start..][0..cd.len]), &.{n}, .float32);
+        const qda = try g.hostArray(std.mem.sliceAsBytes(self.qd[start * v ..][0 .. cd.len * v]), &.{ n, @intCast(v) }, .float32);
+        const sr = try acc.speculativeRows(g, logits, sm, base, cd, qxa, qda);
+        return .{ .targets = sr.tok, .flags = sr.accept };
+    }
+
+    /// The lane's label: `dflash2 exact depth 7`, `dflash2 typical 0.4 depth 3`, a gate named (`gate 0.5`), the sampled
+    /// path named (`path sampled`).
+    pub fn nameOf(buf: []u8, rule: acc.Rule, depth: u32, gate: f32, path: settings.DraftPath) ![]const u8 {
+        var n = (switch (rule) {
             .exact => try std.fmt.bufPrint(buf, "dflash2 exact depth {d}", .{depth}),
             .typical => |t| try std.fmt.bufPrint(buf, "dflash2 typical {d} depth {d}", .{ t.delta, depth }),
-        };
-        if (gate == 0) return tier;
-        const tail = try std.fmt.bufPrint(buf[tier.len..], " gate {d}", .{gate});
-        return buf[0 .. tier.len + tail.len];
+        }).len;
+        if (gate != 0) n += (try std.fmt.bufPrint(buf[n..], " gate {d}", .{gate})).len;
+        if (path == .sampled) n += (try std.fmt.bufPrint(buf[n..], " path sampled", .{})).len;
+        return buf[0..n];
     }
 
     pub fn name(self: *const Lane) []const u8 {
@@ -226,8 +280,12 @@ pub fn roundWith(m: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, s
     const t0 = m.nowNs();
     m.openRound(t0);
     var k = mimo_draft.draftCount(dr.ready(p), self.depth, accepted_cap, m.reserve, p);
+    const params = acc.Params.of(sampling);
     var ids: [drafter.max_block]u32 = undefined;
     ids[0] = t1;
+    // `draft_path: sampled` on a sampled request: the request's sampling, and each draft's own q (`fillQ`).
+    var spec: ?acc.Params = null;
+    var qx: [drafter.max_block]f32 = undefined;
     if (k > 0) {
         if (comptime @TypeOf(oracle) == void) {
             // The draft's arrays (its rings' views among them) go once the host holds the path: before the verify and
@@ -244,7 +302,14 @@ pub fn roundWith(m: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, s
             const cand = try g.hostU32(d.cand, cb[0 .. @as(usize, self.depth) * c.top_k]);
             var path: [drafter.max_block]u32 = undefined;
             var pick: [drafter.max_block]u32 = undefined;
-            drafter.pathOf(scores, cand, self.depth, c.top_k, path[0..self.depth], pick[0..self.depth]);
+            // A sampled request under `draft_path: sampled` draws its drafts from q (the verify then samples
+            // speculatively); else the greedy walk.
+            spec = if (self.path == .sampled) acc.Params.active(params) else null;
+            if (spec) |sm| {
+                var qv: [(drafter.max_block - 1) * drafter.max_top_k]f32 = undefined;
+                drafter.sampledPathOf(scores, cand, self.depth, c.top_k, sm.temperature, sm.seed, p, path[0..self.depth], pick[0..self.depth], qv[0 .. @as(usize, self.depth) * c.top_k]);
+                try self.fillQ(cand, qv[0 .. @as(usize, self.depth) * c.top_k], pick[0..self.depth], self.depth, &qx);
+            } else drafter.pathOf(scores, cand, self.depth, c.top_k, path[0..self.depth], pick[0..self.depth]);
             @memcpy(ids[1 .. k + 1], path[0..k]);
             if (d.probs) |pr| {
                 var pb: [(drafter.max_block - 1) * drafter.max_top_k]f32 = undefined;
@@ -268,7 +333,6 @@ pub fn roundWith(m: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, s
     var caps: [max_chunks]drafter.Captures = undefined;
     var n_chunks: u32 = 0;
     defer for (caps[0..n_chunks]) |*cp| cp.release();
-    const params = acc.Params.of(sampling);
     var walk: Walk = .{};
     var deviated: u32 = 0;
     var start: u32 = 0;
@@ -279,7 +343,7 @@ pub fn roundWith(m: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, s
         const logits = try m.verifyChunk(ids[start..end], &caps[n_chunks - 1]);
         defer _ = mlx.mlx_array_free(logits);
         const cd = chunkDrafts(drafts, start, end);
-        const dec = try mimo_draft.decisionGraph(g, logits, cd, self.rule, params, p + start);
+        const dec = if (spec) |sm| try self.specDecision(g, logits, cd, sm, p + start, start, &qx) else try mimo_draft.decisionGraph(g, logits, cd, self.rule, params, p + start);
         try g.evalAll(&.{ dec.targets, dec.flags orelse dec.targets });
         try m.flushVerify();
         const pre = try mimo_draft.readDecisionRows(g, dec, cd, end - start);
@@ -369,11 +433,13 @@ test "beam lane: the acceptance by draft position counts each round's verified a
     try testing.expectEqualStrings("", none.positions(&buf));
 }
 
-test "beam lane: the label names the rule, the delta, the depth and a gate" {
+test "beam lane: the label names the rule, the delta, the depth, a gate and the sampled path" {
     var buf: [64]u8 = undefined;
-    try testing.expectEqualStrings("dflash2 exact depth 7", try Lane.nameOf(&buf, .exact, 7, 0));
-    try testing.expectEqualStrings("dflash2 typical 0.4 depth 3", try Lane.nameOf(&buf, .{ .typical = .{ .delta = 0.4 } }, 3, 0));
-    try testing.expectEqualStrings("dflash2 exact depth 15 gate 0.5", try Lane.nameOf(&buf, .exact, 15, 0.5));
+    try testing.expectEqualStrings("dflash2 exact depth 7", try Lane.nameOf(&buf, .exact, 7, 0, .greedy));
+    try testing.expectEqualStrings("dflash2 typical 0.4 depth 3", try Lane.nameOf(&buf, .{ .typical = .{ .delta = 0.4 } }, 3, 0, .greedy));
+    try testing.expectEqualStrings("dflash2 exact depth 15 gate 0.5", try Lane.nameOf(&buf, .exact, 15, 0.5, .greedy));
+    try testing.expectEqualStrings("dflash2 exact depth 3 path sampled", try Lane.nameOf(&buf, .exact, 3, 0, .sampled));
+    try testing.expectEqualStrings("dflash2 exact depth 3 gate 0.5 path sampled", try Lane.nameOf(&buf, .exact, 3, 0.5, .sampled));
 }
 
 test "beam lane: the receipt adds the chunks, the gate, the deviations and the phases' time to MiMo's line" {

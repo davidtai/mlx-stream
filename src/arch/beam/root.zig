@@ -268,9 +268,10 @@ test "beam arch table: the registry builds it (the draft lane surface; no prefix
     var l: lane.Lane = undefined;
     l.rule = .exact;
     l.depth = 7;
+    l.path = .greedy;
     l.stats = .{};
     l.pending = false;
-    l.name_len = (try lane.Lane.nameOf(&l.name_buf, l.rule, l.depth, 0)).len;
+    l.name_len = (try lane.Lane.nameOf(&l.name_buf, l.rule, l.depth, 0, l.path)).len;
     m.lane = &l;
     try testing.expectEqual(@as(u32, 8), draft_lane.blockSize(&m));
     try testing.expectEqualStrings("dflash2 exact depth 7", draft_lane.laneName(&m));

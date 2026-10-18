@@ -73,12 +73,14 @@ pub const Inputs = struct {
     lane: ?Lane = null,
 };
 
-/// The draft lane's bill inputs: the drafter's geometry, its residents as MLX allocates them, the installed depth.
+/// The draft lane's bill inputs: the drafter's geometry, its residents as MLX allocates them, the installed depth and
+/// whether a sampled request's drafts are drawn from q (`draft_path: sampled`: the speculative verify's arrays).
 pub const Lane = struct {
     drafter: drafter.Config,
     resident_bytes: u64,
     resident_arrays: u64,
     depth: u32,
+    sampled: bool = false,
 };
 
 /// The fused decode route's kernel set, its pipelines and prepared launches, declared (`decode_kernels` term): measured on
@@ -205,14 +207,16 @@ pub fn decodeWaveRows(c: *const beam.Config, keys: u64, rows: u64) u64 {
 /// The draft lane's terms (`in.lane`): the drafter's residents and context rings (construction), the prompt pass's
 /// captures and one append tile (prompt), and a round's arrays (decode): the drafter's block at depth + 1 rows over the
 /// window, the committed rows' append, the verify's decision graph over a chunk (MiMo's nine f32 rows of the vocabulary a
-/// row), the chunk's kept logits and every chunk's captures. Zero without the lane.
+/// row; under `draft_path: sampled` four more: the drafts' rows of q, the difference, the residual and its cumulative
+/// sum), the chunk's kept logits and every chunk's captures. Zero without the lane.
 pub fn laneTerms(in: *const Inputs) struct { residents: u64, context: u64, prompt: u64, round: u64 } {
     const l = in.lane orelse return .{ .residents = 0, .context = 0, .prompt = 0, .round = 0 };
     const c = &in.model;
     const d = &l.drafter;
     const block: u64 = l.depth + 1;
     const t: u64 = @min(in.reserve, experts.call_rows);
-    const decision = 9 * @as(u64, draft_lane.chunk_rows) * c.vocab_size * f32b + @as(u64, draft_lane.chunk_rows) * c.vocab_size * f32b;
+    const decision_rows: u64 = if (l.sampled) 9 + 4 else 9;
+    const decision = decision_rows * @as(u64, draft_lane.chunk_rows) * c.vocab_size * f32b + @as(u64, draft_lane.chunk_rows) * c.vocab_size * f32b;
     const captures = @as(u64, d.n_targets) * draft_lane.max_chunks * draft_lane.chunk_rows * c.hidden_size * bf16;
     return .{
         .residents = l.resident_bytes,
@@ -370,7 +374,7 @@ fn laneOf(a: std.mem.Allocator, io: std.Io, dir: []const u8, cfg: *const setting
     var m = try drafter.readManifest(a, io, dir, &cfg.model);
     defer m.deinit();
     const r = drafter.residentBytes(&m, page);
-    return .{ .drafter = m.config, .resident_bytes = r.bytes, .resident_arrays = r.arrays, .depth = cfg.draft_depth };
+    return .{ .drafter = m.config, .resident_bytes = r.bytes, .resident_arrays = r.arrays, .depth = cfg.draft_depth, .sampled = cfg.draft_path == .sampled };
 }
 
 pub fn completeBill(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, reserve: u64) !sdk.MemoryBill {
@@ -600,6 +604,12 @@ test "beam bill: the draft lane adds the drafter's residents and rings from cons
     try testing.expect(rows_on.decode < rows_off.decode and rows_on.prompt <= rows_off.prompt);
     try testing.expect(on.total(.decode, baseline, rows_on.decode) <= target);
     std.debug.print("\nBEAM BILL lane depth 7: decode +{d} B, prompt +{d} B (context {d}, round {d}, prompt captures {d}); rows {d}/{d} -> {d}/{d}\n", .{ on.fixed(.decode) - off.fixed(.decode), on.fixed(.prompt) - off.fixed(.prompt), termOf(on, "drafter_context")[1], termOf(on, "draft_round")[1], termOf(on, "draft_round")[0], rows_off.prompt, rows_off.decode, rows_on.prompt, rows_on.decode });
+    // `draft_path: sampled`: the speculative verify's four more f32 rows of the vocabulary a chunk row, in decode only.
+    in.lane.?.sampled = true;
+    const spec = try billOf(a, &in);
+    defer spec.free(a);
+    try testing.expectEqual(termOf(on, "draft_round")[0], termOf(spec, "draft_round")[0]);
+    try testing.expectEqual(4 * @as(u64, draft_lane.chunk_rows) * in.model.vocab_size * 4, termOf(spec, "draft_round")[1] - termOf(on, "draft_round")[1]);
 }
 
 test "beam bill: the keep-warm route bills MiMo's declared engine from construction; the control, none" {

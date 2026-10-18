@@ -36,6 +36,7 @@ const sdk = @import("sdk");
 const mlx = sdk.mlx;
 const log = sdk.log;
 const sidecar = @import("../../sdk_ext/sidecar.zig");
+const acc = @import("../../sdk_ext/acceptance.zig");
 const kv = @import("../mimo_v2/kv.zig");
 const beam = @import("config.zig");
 const graph = @import("graph.zig");
@@ -698,6 +699,42 @@ pub fn pathOf(scores: []const f32, cand: []const u32, d: u32, k: u32, path: []u3
     }
 }
 
+/// The sampled path (`draft_path: sampled`, a sampled request): from the anchor's row, each position's candidate drawn
+/// from q = softmax(row / `temperature`) over its `k` candidates (SGLang's `sample_path` distribution) at the drafter's
+/// own uniform for that token, `acceptance.drawQ(seed, p + 1 + t)` (draft t is the token at absolute position p + 1 +
+/// t), by the inverse CDF over the candidates in their order; then that candidate's row. `qv` gets each position's q over
+/// its candidates (d x k, normalized): the verify's speculative sampling reads it (lane.zig). `path` gets the d draft
+/// ids, `pick` each chosen candidate's index.
+pub fn sampledPathOf(scores: []const f32, cand: []const u32, d: u32, k: u32, temperature: f32, seed: u64, p: u64, path: []u32, pick: []u32, qv: []f32) void {
+    std.debug.assert(k >= 1 and k <= max_top_k and temperature > 0 and qv.len >= @as(usize, d) * k);
+    var j: usize = 0;
+    for (0..d) |t| {
+        const row = scores[(t * k + j) * k ..][0..k];
+        var mx: f32 = row[0];
+        for (row[1..]) |v| mx = @max(mx, v);
+        var q: [max_top_k]f64 = undefined;
+        var z: f64 = 0;
+        for (row, q[0..k]) |v, *x| {
+            x.* = @exp(@as(f64, v - mx) / @as(f64, temperature));
+            z += x.*;
+        }
+        const u: f64 = acc.drawQ(seed, p + 1 + t);
+        var best: usize = k - 1;
+        var cum: f64 = 0;
+        for (q[0..k], 0..) |x, i| {
+            cum += x;
+            if (cum >= u * z and x > 0) {
+                best = i;
+                break;
+            }
+        }
+        for (qv[t * k ..][0..k], q[0..k]) |*o, x| o.* = @floatCast(x / z);
+        path[t] = cand[t * k + best];
+        pick[t] = @intCast(best);
+        j = best;
+    }
+}
+
 /// [n, heads * dim] (or [n, heads, dim]) -> [1, heads, n, dim].
 fn headsOf(g: *G, x: T, n: u32, heads: u32, dim: u32) !T {
     return g.transposeAxes(try g.reshape(x, &.{ 1, @intCast(n), @intCast(heads), @intCast(dim) }), &.{ 0, 2, 1, 3 });
@@ -915,6 +952,50 @@ test "beam drafter: a manifest off the trunk or the served form refuses by name"
     const one = try std.mem.replaceOwned(u8, a, base, "[\"sliding_attention\",", "[\"full_attention\",");
     defer a.free(one);
     try testing.expectError(error.BeamDrafterUnsupported, Manifest.parse(a, one, &trunk));
+}
+
+test "beam drafter: the sampled path draws each position's candidate from softmax(row / T) at the drafter's own uniform; a cold temperature walks the greedy path" {
+    // The greedy test's lattice: at T = 1e-3 every q is one-hot at the row's first largest score (ties aside), so the
+    // sampled walk is the greedy one whatever the uniforms.
+    const scores = [_]f32{
+        1, 2, 1, 2, // t0: row 0 -> candidate 1
+        5, 4, 0, 3, // t1: row 1 -> candidate 1
+        7, 6, 2, 2, // t2: row 1 is a tie
+    };
+    const cand = [_]u32{ 10, 11, 20, 21, 30, 31 };
+    var greedy: [3]u32 = undefined;
+    pathOf(&scores, &cand, 3, 2, &greedy, null);
+    for ([_]u64{ 1, 2, 1234, 4321 }) |seed| {
+        var path: [3]u32 = undefined;
+        var pick: [3]u32 = undefined;
+        var qv: [6]f32 = undefined;
+        sampledPathOf(&scores, &cand, 3, 2, 1e-3, seed, 100, &path, &pick, &qv);
+        // t2's row 1 is a tie [2, 2]: at a cold T its q is (1/2, 1/2), so t2 draws either; t0 and t1 are the greedy ones.
+        try testing.expectEqualSlices(u32, greedy[0..2], path[0..2]);
+        try testing.expectEqual(@as(f32, 1), qv[1]);
+        try testing.expectApproxEqAbs(@as(f32, 0.5), qv[4], 1e-6);
+    }
+    // One position, k = 3, q = (1/2, 1/4, 1/4) over ids {30, 10, 20} in the candidates' order: the drafter's uniform u =
+    // drawQ(seed, p + 1): u < 1/2 -> 30, u < 3/4 -> 10, else 20.
+    const row = [_]f32{ 0.6931472, 0, 0 }; // ln 2
+    const ids3 = [_]u32{ 30, 10, 20 };
+    var seen = [3]u32{ 0, 0, 0 };
+    var seed: u64 = 0;
+    while (seed < 4000) : (seed += 1) {
+        var path: [1]u32 = undefined;
+        var pick: [1]u32 = undefined;
+        var qv: [3]f32 = undefined;
+        sampledPathOf(&row, &ids3, 1, 3, 1.0, seed, 7, &path, &pick, &qv);
+        const u = acc.drawQ(seed, 8);
+        const want: u32 = if (u < 0.5) 30 else if (u < 0.75) 10 else 20;
+        try testing.expectEqual(want, path[0]);
+        try testing.expectEqual(ids3[pick[0]], path[0]);
+        try testing.expectApproxEqAbs(@as(f32, 0.5), qv[0], 1e-6);
+        try testing.expectApproxEqAbs(@as(f32, 0.25), qv[1], 1e-6);
+        seen[pick[0]] += 1;
+    }
+    // About 2,000 / 1,000 / 1,000 over the 4,000 seeds: the draw follows q.
+    try testing.expect(seen[0] > 1800 and seen[0] < 2200 and seen[1] > 850 and seen[1] < 1150 and seen[2] > 850 and seen[2] < 1150);
 }
 
 test "beam drafter: the greedy path walks each position's first largest score from the previous choice's row; the mask cuts only the oldest context keys" {
