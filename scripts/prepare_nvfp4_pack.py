@@ -11,7 +11,9 @@ config.json `residents_format: affine8_g64`) and every other resident as release
 Families (`--family`):
   beam       reflection/Beam-1.0-501B-A23B-NVFP4 at 3bd1dccf13c8f7aa3d6732c5aaa48ba107a2c086 (model_type beam). The
              revision and every input file's sha256 and size are pinned in beam_nvfp4_3bd1dccf.sha256.json (next to
-             this script). 49 routed layers (3..51) x 256 experts, hidden 5,120, moe_intermediate 2,560.
+             this script). 49 routed layers (3..51) x 256 experts, hidden 5,120, moe_intermediate 2,560. Its DFlash2
+             drafter (the drafter step): reflection/Beam-1.0-501B-A23B-DFlash2 at
+             163b276be744c8ce2b8385ea85de54edb3088211, pinned in beam_dflash2_163b276b.sha256.json.
   glm5_next  nvidia/GLM-5.3-Flash-FP4-Local at 76348ddb2be2e35e39ecfc00e75dc07703f4f3d5 (model_type glm5_next). A stub:
              its geometry is in the family table (42 routed layers 3..44 x 288, hidden 4,096, moe_intermediate 2,048),
              but its routed experts' block scales are csf32-compressed and its residents MXFP8; every step refuses it.
@@ -19,13 +21,16 @@ Families (`--family`):
 The pack is exactly these 9 files, plus pack-sha256.txt:
   config.json, model.safetensors, model.safetensors.index.json, experts.bin, expert-manifest.json, tokenizer.json,
   tokenizer_config.json, generation_config.json, chat_template.jinja
-With --usage FILE it holds a tenth file, expert-usage-v1.json: the resident seed's profile
-(src/sdk_ext/expert/usage.zig), which the server reads at the load to fill its prompt rows before the first request.
-The build's journal and state live in a work directory (default OUT/.prepare); delete it once the pack verifies.
+With --usage FILE it also holds expert-usage-v1.json: the resident seed's profile (src/sdk_ext/expert/usage.zig),
+which the server reads at the load to fill its prompt rows before the first request. Once the drafter step has run,
+it also holds the drafter sidecar: drafter.safetensors and drafter-manifest.json (both or neither). The build's
+journal and state live in a work directory (default OUT/.prepare); delete it once the pack verifies.
 
 Run:
   python3 -I scripts/prepare_nvfp4_pack.py all --family beam --src SRC --out OUT [--delete-verified] \\
       [--fetch-with hf]
+  python3 -I scripts/prepare_nvfp4_pack.py drafter --family beam --drafter-src DSRC --out OUT \\
+      [--drafter-pins PINS] [--work DIR]
 
 `all` runs, in order: fetch (the 7 metadata files), the shard pass (residents and bank, one shard at a time, each
 shard fetched when it is needed), residents (rename and index), bank (manifest), config, verify. Each step is also a
@@ -50,7 +55,15 @@ build.
              against the source shards (bytes and manifest sha256), a dequant spot check of a few rows per projection,
              every resident tensor's sha256 (and each q8 site quantized again from its source to the same bytes, each
              value within half a scale of the release's), with --usage the pack's usage file against the given one,
-             then pack-sha256.txt
+             the drafter sidecar when the pack holds it (as the drafter step's read back), then pack-sha256.txt
+
+`drafter` is not part of `all`: it adds the DFlash2 drafter to a built pack (format mlx-stream-dflash2-drafter-v1,
+scripts/packlib/drafter.py). DSRC holds the drafter release's config.json and model.safetensors (README.md optional);
+nothing is downloaded. Each file in DSRC is checked against its pin; the drafter's config (as z-lab dflash reads it)
+against the pack's config.json; its safetensors header against the drafter's tensor set. drafter.safetensors is then
+the release's model.safetensors byte for byte (a hard link on one filesystem, else an uncached copy) and
+drafter-manifest.json carries every tensor's sha256 from one uncached read of it; both are read back. Run verify again
+to list the pair in pack-sha256.txt.
 
 --layers 0-N builds a slice: the first N + 1 layers (from 0, with a full_attention layer), config.json cut to them,
 the embedding, final norm and head kept, the manifest's source pin with "layers": [0, N] (docs/nvfp4-pack.md).
@@ -64,9 +77,11 @@ seeded) stays until `verify --delete-verified`.
 
 Refusals: every mismatch refuses by name with exit status 1: a source file's size or sha256 (the pin), the index's
 tensor set (a missing or an extra tensor), a tensor's dtype or shape, a NaN E4M3 block scale, the quantization config
-(NVFP4, group 16, every resident excluded, every expert quantized), a geometry bank.zig refuses. A global scale with
-no exact f32 g (one f32 ulp, about 9 % of ModelOpt's amax / 6 / 448) is not refused: the nearest g is taken, counted
-in the manifest (`global_scale_inexact`, with its tensors) and checked by verify within 1 ulp.
+(NVFP4, group 16, every resident excluded, every expert quantized), a geometry bank.zig refuses; for the drafter, its
+config's values and its fit to the pack, its tensor set, dtypes, shapes and offsets, and a drafter file without its
+manifest (or the reverse) in verify. A global scale with no exact f32 g (one f32 ulp, about 9 % of ModelOpt's
+amax / 6 / 448) is not refused: the nearest g is taken, counted in the manifest (`global_scale_inexact`, with its
+tensors) and checked by verify within 1 ulp.
 
 Requirements: Python 3.8+ and numpy (no torch, no mlx). Nothing runs on the GPU. Large files are read and written with
 F_NOCACHE on macOS. Set HF_TOKEN to send a Hugging Face token (to huggingface.co only).
@@ -81,6 +96,11 @@ Expected cost:
              3.112 GB tail). Disk peak with --delete-verified: 305.4 GB (bank, residents, one 5.878 GB shard in flight,
              the 5.878 GB keep set) plus --disk-margin-gb; without it the 293.6 GB of shards are added. The download
              dominates the time
+  drafter    fixture: scripts/beam_fixture.py --drafter --seed 0, model.safetensors 2,587,744 B (36 tensors, header
+             3,680 B, payload 2,584,064 B), sha256 8452b030b568245314b3bed9931934b4cf46ecc473174bd05687b95e28643995;
+             `drafter` in 0.08 s (laptop, 2026-10-17). beam: 3,854,978,296 B (81 BF16 tensors, header 8,952 B,
+             payload 3,854,969,344 B); the step reads it 3 times past the page cache (the pin, the manifest, the
+             read-back), plus a copy when DSRC and OUT are on two filesystems
 """
 from __future__ import annotations
 
@@ -100,11 +120,11 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))  # packlib, beside this script (python3 -I keeps the script's directory off sys.path)
 
-from packlib import PrepError, ShaMismatch  # noqa: E402
-from packlib import affine, bank, fetch, journal, manifest, usage, verify  # noqa: E402
+from packlib import PrepError, ShaMismatch, count  # noqa: E402
+from packlib import affine, bank, drafter, fetch, journal, manifest, usage, verify  # noqa: E402
 from packlib.manifest import GROUP, PROJ, Geometry  # noqa: E402
-from packlib.nocache import (copy_verified, open_nocache, pwrite_all, read_exact, sha256_file, stamp,  # noqa: E402
-                             write_text_atomic)
+from packlib.nocache import (copy_verified, link_or_copy, open_nocache, pwrite_all, read_exact,  # noqa: E402
+                             sha256_file, stamp, write_text_atomic)
 from packlib.st import StFile, header_bytes, nbytes  # noqa: E402
 
 TOOL = "prepare_nvfp4_pack.py"
@@ -130,13 +150,6 @@ STATE = "shards-state.json"
 
 # ---- the families --------------------------------------------------------------------------------------------------
 
-def _count(cfg, key):
-    v = cfg.get(key)
-    if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
-        raise PrepError(f"config.json: {key} is {v!r}, not a positive count")
-    return v
-
-
 class Beam:
     """reflection/Beam-1.0 (transformers models/beam): sandwich norms, a gated GQA attention, dense SwiGLU on a prefix
     of layers, then DeepSeek-V3 routed layers of `num_experts` SwiGLU experts (no shared expert); untied head."""
@@ -145,6 +158,9 @@ class Beam:
     repo = "reflection/Beam-1.0-501B-A23B-NVFP4"
     revision = "3bd1dccf13c8f7aa3d6732c5aaa48ba107a2c086"
     pins = "beam_nvfp4_3bd1dccf.sha256.json"
+    drafter_repo = "reflection/Beam-1.0-501B-A23B-DFlash2"  # the DFlash2 drafter (the drafter step)
+    drafter_revision = "163b276be744c8ce2b8385ea85de54edb3088211"
+    drafter_pins = "beam_dflash2_163b276b.sha256.json"
     layer_prefix = "model.layers."
     refusal = None
 
@@ -156,9 +172,9 @@ class Beam:
         if cfg.get("model_type") != self.model_type:
             raise PrepError(f"config.json: model_type {cfg.get('model_type')!r}, the {self.name} family is "
                             f"{self.model_type!r}")
-        d = {k: _count(t, k) for k in ("hidden_size", "vocab_size", "num_attention_heads", "num_key_value_heads",
-                                       "head_dim", "intermediate_size", "moe_intermediate_size", "num_experts",
-                                       "num_hidden_layers", "num_experts_per_tok")}
+        d = {k: count(t, k) for k in ("hidden_size", "vocab_size", "num_attention_heads", "num_key_value_heads",
+                                      "head_dim", "intermediate_size", "moe_intermediate_size", "num_experts",
+                                      "num_hidden_layers", "num_experts_per_tok")}
         if t.get("tie_word_embeddings") is not False:
             raise PrepError(f"config.json: tie_word_embeddings is {t.get('tie_word_embeddings')!r} (an untied lm_head "
                             f"is the family's)")
@@ -212,7 +228,7 @@ class Beam:
         mlp_layer_types cut to the slice, every other key as released (the embedding, the final norm and the head stay).
         Refused unless the slice starts at layer 0, ends inside the model and holds a full_attention layer."""
         lo, hi = layers
-        n = _count(cfg, "num_hidden_layers")
+        n = count(cfg, "num_hidden_layers")
         lt, mlp = cfg.get("layer_types"), cfg.get("mlp_layer_types")
         if not isinstance(lt, list) or len(lt) != n or not isinstance(mlp, list) or len(mlp) != n:
             raise PrepError("config.json: layer_types / mlp_layer_types do not name every layer")
@@ -264,6 +280,7 @@ class Glm5NextStub(Beam):
     repo = "nvidia/GLM-5.3-Flash-FP4-Local"
     revision = "76348ddb2be2e35e39ecfc00e75dc07703f4f3d5"
     pins = None
+    drafter_repo = drafter_revision = drafter_pins = None
     layer_prefix = "model.language_model.layers."
     refusal = ("--family glm5_next is a stub: nvidia/GLM-5.3-Flash-FP4-Local stores its routed experts' E4M3 block "
                "scales csf32-compressed (weight_scale.csf32_*) and its residents MXFP8; the csf32 decode and the "
@@ -275,9 +292,9 @@ class Glm5NextStub(Beam):
 
     def geometry(self, cfg):
         t = self.text(cfg)
-        first = _count(t, "first_k_dense_replace") if t.get("first_k_dense_replace") else 0
-        return Geometry(_count(t, "hidden_size"), _count(t, "moe_intermediate_size"), _count(t, "n_routed_experts"),
-                        first, _count(t, "num_hidden_layers") - first)
+        first = count(t, "first_k_dense_replace") if t.get("first_k_dense_replace") else 0
+        return Geometry(count(t, "hidden_size"), count(t, "moe_intermediate_size"), count(t, "n_routed_experts"),
+                        first, count(t, "num_hidden_layers") - first)
 
 
 FAMILIES = {f.name: f for f in (Beam(), Glm5NextStub())}
@@ -290,7 +307,7 @@ class Plan:
     tensor spec, the residents' header and offsets, and each shard's residents and records."""
 
     def __init__(self, fam, cfg, hfq, index, layers=None, tier="bf16"):
-        full_layers = _count(fam.text(cfg), "num_hidden_layers")
+        full_layers = count(fam.text(cfg), "num_hidden_layers")
         self.layers = layers
         if layers is not None:
             cfg = fam.slice(cfg, layers)
@@ -432,6 +449,22 @@ class Ctx(fetch.Fetcher, journal.Journal):
                 raise PrepError(f"the pin table's shards differ from the index's: "
                                 f"{sorted(shards ^ self._plan.index_shards)[:5]}")
         return self._plan
+
+
+class DrafterCtx(journal.Journal):
+    """The drafter step's run: the drafter release in --drafter-src, pinned by the family's drafter table (or
+    --drafter-pins) and never downloaded; the pack in --out; the pack's journal in --work, with its own record of the
+    drafter files hashed."""
+
+    def __init__(self, a):
+        self.fam = FAMILIES[a.family]
+        if self.fam.refusal:
+            raise PrepError(self.fam.refusal)
+        path = Path(a.drafter_pins).expanduser().resolve() if a.drafter_pins else HERE / self.fam.drafter_pins
+        self.repo, self.revision, table = fetch.load_pins(path, None if a.drafter_pins else self.fam.drafter_repo,
+                                                          self.fam.drafter_revision, drafter.SOURCE_FILES)
+        journal.Journal.__init__(self, tool=TOOL, table=table, src=a.drafter_src, out=a.out, work=a.work,
+                                 disk_margin_gb=a.disk_margin_gb, verified="drafter-sources-verified.json")
 
 
 def keep_set(a, plan):
@@ -915,22 +948,33 @@ def verify_residents(ctx, plan):
             q8_past_range_scales_max=max((e[2] for e in errors), default=0.0))
 
 
+def verify_drafter(ctx):
+    """The drafter pair (when the pack holds it) against each other and the pack's config.json; returns the data
+    file's sha256."""
+    t0 = time.time()
+    m = drafter.check(ctx.out, *pack_dims(ctx.fam, ctx.out))
+    ctx.log("verify", "drafter", tensors=len(m["tensors"]), data_size=m["data_size"], data_sha256=m["data_sha256"],
+            wall_s=round(time.time() - t0, 2))
+    return m["data_sha256"]
+
+
 def step_verify(a, ctx):
     plan = ctx.plan()
-    files = pack_files(a)
-    verify.check_pack_files(ctx.out, ctx.work, files)
+    files = verify.check_pack_files(ctx.out, ctx.work, pack_files(a), optional=[drafter.FILES])
     verify_config(ctx, plan)
-    bank_sha = verify_bank(a, ctx, plan)
+    known = {"experts.bin": verify_bank(a, ctx, plan)}
     verify_residents(ctx, plan)
     if a.usage:
         _, want, _ = usage_input(a, plan)
         got = sha256_file(ctx.out / usage.FILE)
         if got != want:
             raise ShaMismatch(usage.FILE, want, got)
+    if drafter.DATA_FILE in files:
+        known[drafter.DATA_FILE] = verify_drafter(ctx)
     shas, hashes = {}, {}
     for n in files:
         key = f"out/{n}"
-        sha = bank_sha if n == "experts.bin" else (ctx.cached_sha(key) or sha256_file(ctx.out / n))
+        sha = known.get(n) or ctx.cached_sha(key) or sha256_file(ctx.out / n)
         shas[n] = sha
         hashes[key] = {"stamp": stamp(ctx.out / n), "sha256": sha}
     write_text_atomic(ctx.out / "pack-sha256.txt", "".join(f"{shas[n]}  {n}\n" for n in sorted(files)))
@@ -941,6 +985,46 @@ def step_verify(a, ctx):
                 ctx.forget_verified(s)
                 ctx.log("verify", "shard_deleted", shard=s)
     ctx.log("verify", "done", files=len(files), hashes=hashes, outputs=ctx.outputs("out/pack-sha256.txt"))
+
+
+# ---- the drafter sidecar -------------------------------------------------------------------------------------------
+
+def pack_dims(fam, out):
+    """(hidden_size, vocab_size, num_hidden_layers) of the pack's config.json, read by the family."""
+    p = out / "config.json"
+    if not p.exists():
+        raise PrepError(f"{p} is missing: the drafter sidecar goes into a pack (run the config step first)")
+    d = fam.dims(json.loads(p.read_text()))
+    return d["hidden_size"], d["vocab_size"], d["num_hidden_layers"]
+
+
+def step_drafter(a, ctx):
+    """The DFlash2 drafter sidecar: the release checked against its pins and the pack, drafter.safetensors placed (a
+    hard link, else an uncached copy), drafter-manifest.json from one uncached read of it, then the pair read back."""
+    hidden, vocab, layers = pack_dims(ctx.fam, ctx.out)
+    for n in sorted(ctx.table):
+        if n in drafter.SOURCE_FILES or (ctx.src / n).exists():
+            ctx.ensure_source(n)
+    c = drafter.config_of(json.loads((ctx.src / "config.json").read_text()))
+    drafter.check_trunk(c, hidden, vocab, layers, "drafter config.json")
+    src, dst = ctx.src / drafter.SOURCE_FILE, ctx.out / drafter.DATA_FILE
+    drafter.layout(src, c, f"drafter {drafter.SOURCE_FILE}")
+    pin = ctx.table[drafter.SOURCE_FILE]
+    ctx.require_space({ctx.out: 0 if os.stat(src).st_dev == os.stat(ctx.out).st_dev else pin["size"]}, "drafter")
+    t0 = time.time()
+    how = link_or_copy(src, dst, pin["sha256"])
+    ctx.log("drafter", "placed", how=how, size=pin["size"], wall_s=round(time.time() - t0, 2))
+    t0 = time.time()
+    m = drafter.build(c, {"repo": ctx.repo, "revision": ctx.revision, "file": drafter.SOURCE_FILE, **pin}, dst)
+    write_text_atomic(ctx.out / drafter.MANIFEST_FILE, json.dumps(m, indent=1, sort_keys=True) + "\n")
+    ctx.log("drafter", "manifest", tensors=len(m["tensors"]), header_bytes=m["header_bytes"],
+            payload_bytes=m["payload_bytes"], data_size=m["data_size"], data_sha256=m["data_sha256"],
+            wall_s=round(time.time() - t0, 2))
+    t0 = time.time()
+    drafter.check(ctx.out, hidden, vocab, layers)
+    ctx.log("drafter", "done", tensors=len(m["tensors"]), data_sha256=m["data_sha256"],
+            readback_s=round(time.time() - t0, 2),
+            outputs=ctx.outputs(f"out/{drafter.DATA_FILE}", f"out/{drafter.MANIFEST_FILE}"))
 
 
 # ---- all ---------------------------------------------------------------------------------------------------------
@@ -962,16 +1046,29 @@ STEPS = {
     "config": (step_config, "config.json by rule from the release; tokenizer files and template copied"),
     "verify": (step_verify, "file set, manifest, bank parity sample, dequant spot check, residents, pack-sha256.txt"),
     "all": (step_all, "fetch (metadata), the shard pass, residents, bank, config, verify"),
+    "drafter": (step_drafter, "drafter.safetensors + drafter-manifest.json: the DFlash2 drafter as a verified "
+                              "sidecar of a built pack (not in all)"),
 }
 
 
 def parse_args(argv):
-    common = argparse.ArgumentParser(add_help=False)
-    g = common.add_argument_group("options (every step takes them; each uses those it needs)")
+    pack = argparse.ArgumentParser(add_help=False)
+    g = pack.add_argument_group("the pack (every step)")
     g.add_argument("--family", required=True, choices=sorted(FAMILIES), help="the checkpoint's family")
-    g.add_argument("--src", required=True, help="directory of the release files (downloaded into, read from)")
     g.add_argument("--out", required=True, help="the pack directory to build")
     g.add_argument("--work", help="journal, state and staging directory, on --out's filesystem (default OUT/.prepare)")
+    g.add_argument("--disk-margin-gb", type=float, default=10.0,
+                   help="free space kept beyond each step's need (default 10 GB)")
+    side = argparse.ArgumentParser(add_help=False)
+    g = side.add_argument_group("the drafter release (the drafter step)")
+    g.add_argument("--drafter-src", required=True, metavar="SRC",
+                   help="directory of the drafter release's config.json and model.safetensors (README.md optional); "
+                        "never downloaded into")
+    g.add_argument("--drafter-pins", metavar="JSON", help="a pin table other than the family's drafter table (a "
+                                                          "synthetic drafter)")
+    common = argparse.ArgumentParser(add_help=False)
+    g = common.add_argument_group("the checkpoint (every other step; each uses those it needs)")
+    g.add_argument("--src", required=True, help="directory of the release files (downloaded into, read from)")
     g.add_argument("--pins", metavar="JSON", help="a pin table other than the family's (a synthetic checkpoint: its "
                                                   "files are never downloaded)")
     g.add_argument("--layers", metavar="0-N", help="a slice: the first N + 1 layers only (from 0, with a "
@@ -1001,14 +1098,14 @@ def parse_args(argv):
     g.add_argument("--hub-endpoint", default=os.environ.get("HF_ENDPOINT", "https://huggingface.co"),
                    help="Hugging Face endpoint (default: $HF_ENDPOINT or https://huggingface.co)")
     g.add_argument("--retries", type=int, default=8, help="download retries per file, resuming each time (default 8)")
-    g.add_argument("--disk-margin-gb", type=float, default=10.0,
-                   help="free space kept beyond each step's need (default 10 GB)")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog="Run `<step> --help` for the options.")
     sp = ap.add_subparsers(dest="step", required=True, metavar="step")
     for name, (_, text) in STEPS.items():
-        sp.add_parser(name, parents=[common], help=text, description=text)
+        sp.add_parser(name, parents=[pack, side if name == "drafter" else common], help=text, description=text)
     a = ap.parse_args(argv)
+    if a.step == "drafter":
+        return a
     if a.keep_for_parity < 0:
         ap.error("--keep-for-parity must be 0 or more")
     if a.samples < 1:
@@ -1032,7 +1129,7 @@ def parse_args(argv):
 def main(argv=None):
     a = parse_args(argv)
     try:
-        ctx = Ctx(a)
+        ctx = (DrafterCtx if a.step == "drafter" else Ctx)(a)
     except PrepError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

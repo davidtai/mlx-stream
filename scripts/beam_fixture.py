@@ -14,8 +14,23 @@ builds a mini pack (docs/nvfp4-pack.md). The geometry:
 
 The experts are quantized as ModelOpt does: per tensor weight_scale_2 = f32(amax / 2688), per 16 inputs an E4M3 block
 scale (nearest to block amax / 6 / weight_scale_2), each weight the nearest E2M1 code of w / (scale x weight_scale_2),
-two codes per byte with element 2k in the low nibble. input_scale is a positive f32 (the converter drops it). Numpy
-only; the same seed gives the same bytes.
+two codes per byte with element 2k in the low nibble. input_scale is a positive f32 (the converter drops it).
+
+`--drafter OUT` writes instead a tiny DFlash2 drafter for that trunk in the layout of
+reflection/Beam-1.0-501B-A23B-DFlash2 (config.json with the release's keys, model.safetensors with the release's
+header layout and name order, README.md, and a pin table), so that
+
+  python3 -I scripts/beam_fixture.py --drafter DRAFT
+  python3 -I scripts/prepare_nvfp4_pack.py drafter --family beam --drafter-src DRAFT --out PACK \\
+      --drafter-pins DRAFT/fixture.sha256.json
+
+adds the drafter sidecar to the mini pack. Its geometry: 2 layers (both sliding_attention, window 16, is_causal
+false), 4 query heads / 2 KV heads of 64, intermediate 384, target layers [1, 3, 5] of 7, block 16, mask id 508,
+conv kernel 2 in groups of 16, selector rank 32, top-8, logits soft-capped at 30. Values, drawn in name order and
+rounded to BF16 (nearest even): norms 1 + 0.1 N(0, 1); projections N(0, 1) / sqrt(fan_in); base kernels 0.3 N(0, 1);
+kernel projections 0.1 N(0, 1) / sqrt(fan_in); codebooks 0.5 N(0, 1).
+
+Numpy only; the same seed gives the same bytes.
 """
 from __future__ import annotations
 
@@ -32,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # packlib (python3 -I 
 from packlib.st import E4M3, RawWriter, bf16_rne  # noqa: E402
 
 REPOSITORY = "synthetic/beam-nvfp4-fixture"
+DRAFTER_REPOSITORY = "synthetic/beam-dflash2-fixture"
 PINS = "fixture.sha256.json"
 L, DENSE = 7, 3
 LAYER_TYPES = ["sliding_attention"] * 5 + ["full_attention", "sliding_attention"]
@@ -40,6 +56,11 @@ PROJ = ("gate_proj", "up_proj", "down_proj")
 E2M1_MAG = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], np.float32)
 E4M3_POS = E4M3[:0x7F]  # 0x00..0x7E, increasing, 0 .. 448
 K = np.float32(2688.0)
+# the drafter (--drafter): layers, query heads, KV heads, head_dim, intermediate, window, target layers, conv kernel and
+# group, selector rank and top-k
+DL, DNH, DKV, DD, DI, DWIN = 2, 4, 2, 64, 384, 16
+TARGET_LAYERS = [1, 3, 5]
+CONV_K, CONV_G, RANK, SEL_TOPK = 2, 16, 32, 8
 
 
 def config():
@@ -149,13 +170,96 @@ def tokenizer_files():
             "generation_config.json": json.dumps(gen, indent=2), "chat_template.jinja": template}
 
 
-def build(out, seed=0, tweak=None):
-    """Writes the fixture into `out` (created; must be empty); `tweak(cfg, hfq, shards)` may edit it before it is
-    written (the converter's refusal tests). Returns the pin table's path."""
+def drafter_config():
+    """The drafter release's config.json keys and order (reflection/Beam-1.0-501B-A23B-DFlash2), the dims tiny."""
+    return {
+        "architectures": ["DFlash2BeamDraftModel"], "attention_bias": False, "attention_dropout": 0.0,
+        "dflash_config": {"block_size": 16, "conv_group_size": CONV_G, "conv_kernel_size": CONV_K,
+                          "final_logit_softcapping": 30, "mask_token_id": 508, "selector_rank": RANK,
+                          "selector_top_k": SEL_TOPK, "target_layer_ids": list(TARGET_LAYERS)},
+        "draft_vocab_size": V, "dtype": "bfloat16", "eos_token_id": 510, "head_dim": DD, "hidden_act": "silu",
+        "hidden_size": H, "initializer_range": 0.02, "intermediate_size": DI, "is_causal": False,
+        "layer_types": ["sliding_attention"] * DL, "max_position_embeddings": 1048576, "max_window_layers": DL,
+        "model_type": "qwen3", "num_attention_heads": DNH, "num_hidden_layers": DL, "num_key_value_heads": DKV,
+        "num_target_layers": L, "pad_token_id": 509, "rms_norm_eps": 1e-06,
+        "rope_parameters": {"rope_theta": 10000, "rope_type": "default"}, "rope_scaling": None, "rope_theta": 10000.0,
+        "sliding_window": DWIN, "tie_word_embeddings": False, "use_cache": True, "use_sliding_window": True,
+        "vocab_size": V,
+    }
+
+
+def drafter_tensors(seed):
+    """{name: (shape, BF16 bits)} of the drafter, in the release's order (by name), each drawn in that order."""
+    kinds = {"fc.weight": ("proj", [H, len(TARGET_LAYERS) * H]), "hidden_norm.weight": ("norm", [H]),
+             "norm.weight": ("norm", [H]), "candidate_selector.hidden_projection.weight": ("proj", [RANK, H]),
+             "candidate_selector.predecessor_codebook": ("codebook", [V, RANK]),
+             "candidate_selector.successor_codebook": ("codebook", [V, RANK])}
+    for li in range(DL):
+        p = f"layers.{li}."
+        for conv in ("attention_conv", "mlp_conv"):
+            kinds[p + conv + ".base_kernel"] = ("base_kernel", [2, CONV_K, H])
+            kinds[p + conv + ".kernel_projection.weight"] = ("kernel_projection", [2 * CONV_K * (H // CONV_G), H])
+        for n, shape in (("input_layernorm", [H]), ("post_attention_layernorm", [H]), ("self_attn.q_norm", [DD]),
+                         ("self_attn.k_norm", [DD])):
+            kinds[p + n + ".weight"] = ("norm", shape)
+        for n, shape in (("self_attn.q_proj", [DNH * DD, H]), ("self_attn.k_proj", [DKV * DD, H]),
+                         ("self_attn.v_proj", [DKV * DD, H]), ("self_attn.o_proj", [H, DNH * DD]),
+                         ("mlp.gate_proj", [DI, H]), ("mlp.up_proj", [DI, H]), ("mlp.down_proj", [H, DI])):
+            kinds[p + n + ".weight"] = ("proj", shape)
+    rng = np.random.default_rng(seed)
+    out = {}
+    for name in sorted(kinds):
+        kind, shape = kinds[name]
+        fan_in = shape[-1]
+        scale, offset = {"norm": (0.1, 1.0), "proj": (fan_in ** -0.5, 0.0), "base_kernel": (0.3, 0.0),
+                         "kernel_projection": (0.1 * fan_in ** -0.5, 0.0), "codebook": (0.5, 0.0)}[kind]
+        out[name] = (shape, bf16(rng, shape, scale, offset))
+    return out
+
+
+def pin_table(out, repository, seed):
+    """The pin table of every file in `out` (its revision derived from the pins), written to out/PINS."""
+    pins = {}
+    for p in sorted(out.iterdir()):
+        if p.name != PINS:
+            pins[p.name] = {"sha256": hashlib.sha256(p.read_bytes()).hexdigest(), "size": p.stat().st_size}
+    revision = hashlib.sha256(json.dumps(pins, sort_keys=True).encode()).hexdigest()[:40]
+    table = {"files": pins, "repository": repository, "revision": revision,
+             "source": f"scripts/beam_fixture.py --seed {seed}: sha256 and size of each file as written"}
+    (out / PINS).write_text(json.dumps(table, indent=2, sort_keys=True) + "\n")
+    return out / PINS
+
+
+def empty_dir(out):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     if any(out.iterdir()):
         raise SystemExit(f"{out} is not empty")
+    return out
+
+
+def build_drafter(out, seed=0, tweak=None):
+    """Writes the drafter release into `out` (created; must be empty); `tweak(cfg, tensors)` may edit it before it is
+    written (the converter's refusal tests). Returns the pin table's path."""
+    out = empty_dir(out)
+    cfg, ts = drafter_config(), drafter_tensors(seed)
+    if tweak:
+        tweak(cfg, ts)
+    w = RawWriter({"format": "pt"})
+    for name in sorted(ts):  # the safetensors writer's order for tensors of one dtype
+        shape, bits = ts[name]
+        w.put(name, "BF16", shape, np.ascontiguousarray(bits).tobytes())
+    w.write(out / "model.safetensors")
+    (out / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
+    (out / "README.md").write_text("# beam-dflash2-fixture\n\nA synthetic DFlash2 drafter for the Beam fixture: seeded "
+                                   "random weights, not a model.\n")
+    return pin_table(out, DRAFTER_REPOSITORY, seed)
+
+
+def build(out, seed=0, tweak=None):
+    """Writes the fixture into `out` (created; must be empty); `tweak(cfg, hfq, shards)` may edit it before it is
+    written (the converter's refusal tests). Returns the pin table's path."""
+    out = empty_dir(out)
     cfg, hfq = config()
     shards = tensors(seed)
     if tweak:
@@ -174,27 +278,23 @@ def build(out, seed=0, tweak=None):
              **tokenizer_files()}
     for n, text in files.items():
         (out / n).write_text(text)
-    pins = {}
-    for p in sorted(out.iterdir()):
-        if p.name != PINS:
-            pins[p.name] = {"sha256": hashlib.sha256(p.read_bytes()).hexdigest(), "size": p.stat().st_size}
-    revision = hashlib.sha256(json.dumps(pins, sort_keys=True).encode()).hexdigest()[:40]
-    table = {"files": pins, "repository": REPOSITORY, "revision": revision,
-             "source": f"scripts/beam_fixture.py --seed {seed}: sha256 and size of each file as written"}
-    (out / PINS).write_text(json.dumps(table, indent=2, sort_keys=True) + "\n")
-    return out / PINS
+    return pin_table(out, REPOSITORY, seed)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", required=True, help="the fixture directory to write (created; must be empty)")
+    to = ap.add_mutually_exclusive_group(required=True)
+    to.add_argument("--out", help="the fixture directory to write (created; must be empty)")
+    to.add_argument("--drafter", metavar="OUT", help="write the tiny DFlash2 drafter release here instead (created; "
+                                                     "must be empty)")
     ap.add_argument("--seed", type=int, default=0, help="the weights' seed (default 0)")
     a = ap.parse_args(argv)
-    pins = build(a.out, a.seed)
+    out = a.out or a.drafter
+    pins = (build(out, a.seed) if a.out else build_drafter(out, a.seed))
     table = json.loads(pins.read_text())
     size = sum(v["size"] for v in table["files"].values())
-    print(f"fixture {a.out}: {len(table['files'])} files, {size:,} B, {table['repository']}@{table['revision']}; "
-          f"pins {pins}")
+    print(f"{'fixture' if a.out else 'drafter'} {out}: {len(table['files'])} files, {size:,} B, "
+          f"{table['repository']}@{table['revision']}; pins {pins}")
     return 0
 
 

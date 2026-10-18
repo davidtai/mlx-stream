@@ -16,9 +16,17 @@ from .st import E2M1, E4M3
 GLOBAL_K = np.float32(448.0 * 6.0)  # MLX's nvfp4 global scale g is ModelOpt's weight_scale_2 x 2688
 
 
-def check_pack_files(out, work, files):
-    """The pack directory holds exactly `files` (regular files, no symlinks) and pack-sha256.txt."""
+def check_pack_files(out, work, files, optional=()):
+    """The pack directory holds exactly `files`, each group of `optional` whole or not at all (regular files, no
+    symlinks), and pack-sha256.txt. Returns the files it holds."""
     names = {e.name for e in os.scandir(out) if Path(e.path) != work}
+    files = list(files)
+    for group in optional:
+        have = [n for n in group if n in names]
+        if have and len(have) < len(group):
+            raise PrepError(f"the pack holds {have} without {[n for n in group if n not in names]} (these files are "
+                            f"in a pack together or not at all)")
+        files += list(group) if have else []
     missing, extra = sorted(set(files) - names), sorted(names - set(files) - {"pack-sha256.txt"})
     if missing:
         raise PrepError(f"the pack lacks {missing}")
@@ -28,6 +36,7 @@ def check_pack_files(out, work, files):
     for n in files:
         if not stat.S_ISREG(os.lstat(out / n).st_mode):
             raise PrepError(f"{n} is not a regular file (symlinks are refused)")
+    return files
 
 
 def sample(seed, items, n):

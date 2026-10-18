@@ -1,20 +1,27 @@
 """Tests of prepare_nvfp4_pack.py and scripts/packlib on the synthetic Beam checkpoint of beam_fixture.py: every step
 end to end, each record against a straight numpy repack of the fixture's tensors, the manifest against bank.zig (its
 Manifest fields, its fixture manifest and its refusals), resume, the q8 residents tier against a scalar re-derivation
-of its rule, --bank-from, and the refusals by name. Numpy only, no network, no GPU, a few MB of disk.
+of its rule, --bank-from, --usage (the copy, its checks as usage.zig reads the file, verify with and without it), and
+the refusals by name; the drafter step with the tiny DFlash2 drafter of beam_fixture.py --drafter (the manifest
+against the file, verify with and without the pair, the refusals), and the drafter layout against the release's
+header. Numpy only, no network, no GPU, a few MB of disk.
 
   python3 -I scripts/test_prepare_nvfp4_pack.py        (or: python3 -I -m pytest scripts/test_prepare_nvfp4_pack.py)
 """
 import contextlib
+import errno
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -24,11 +31,31 @@ sys.dont_write_bytecode = True
 
 import beam_fixture as fx  # noqa: E402
 import prepare_nvfp4_pack as conv  # noqa: E402
-from packlib import PrepError, affine, manifest, usage  # noqa: E402
-from packlib.st import E2M1, E4M3, StFile  # noqa: E402
+from packlib import PrepError, affine, drafter, manifest, nocache, usage  # noqa: E402
+from packlib.st import E2M1, E4M3, StFile, header_bytes, nbytes  # noqa: E402
 
 BANK_ZIG = HERE.parent / "src" / "arch" / "glm5_next" / "bank.zig"
 SEED = 7
+# beam_fixture.py --drafter --seed 0: model.safetensors (docs/nvfp4-pack.md)
+TINY_DRAFTER = (2_587_744, "8452b030b568245314b3bed9931934b4cf46ecc473174bd05687b95e28643995")
+# the sha256 of the first 8,952 B (the header) of reflection/Beam-1.0-501B-A23B-DFlash2@163b276b model.safetensors
+RELEASE_HEADER_SHA256 = "f97f6de9c4bb216474b602f911faf194d2295e92118c28d5a05faa9a3b56f9c7"
+# the manifest's config of that release
+REAL_DRAFTER = {"hidden_size": 5120, "num_hidden_layers": 5, "num_attention_heads": 40, "num_key_value_heads": 8,
+                "head_dim": 128, "intermediate_size": 17408, "vocab_size": 151936, "rms_norm_eps": 1e-06,
+                "rope_theta": 10000.0, "sliding_window": 4096, "layer_types": ["sliding_attention"] * 5,
+                "is_causal": False, "num_target_layers": 52, "block_size": 16, "mask_token_id": 151669,
+                "target_layer_ids": [4, 16, 28, 40, 46], "conv_kernel_size": 2, "conv_group_size": 16,
+                "selector_rank": 256, "selector_top_k": 16, "final_logit_softcapping": 30.0,
+                "input_embedding_scale": 1.0, "output_multiplier": 1.0}
+# the manifest's config of the tiny drafter
+TINY_CONFIG = {"hidden_size": 256, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+               "head_dim": 64, "intermediate_size": 384, "vocab_size": 512, "rms_norm_eps": 1e-06,
+               "rope_theta": 10000.0, "sliding_window": 16, "layer_types": ["sliding_attention"] * 2,
+               "is_causal": False, "num_target_layers": 7, "block_size": 16, "mask_token_id": 508,
+               "target_layer_ids": [1, 3, 5], "conv_kernel_size": 2, "conv_group_size": 16, "selector_rank": 32,
+               "selector_top_k": 8, "final_logit_softcapping": 30.0, "input_embedding_scale": 1.0,
+               "output_multiplier": 1.0}
 
 
 def run(*argv):
@@ -41,6 +68,11 @@ def run(*argv):
 
 def build_args(fix, pack, *extra):
     return ["--family", "beam", "--src", str(fix), "--out", str(pack), "--pins", str(fix / fx.PINS),
+            "--disk-margin-gb", "0", *extra]
+
+
+def drafter_args(dsrc, pack, *extra):
+    return ["--family", "beam", "--drafter-src", str(dsrc), "--out", str(pack), "--drafter-pins", str(dsrc / fx.PINS),
             "--disk-margin-gb", "0", *extra]
 
 
@@ -281,12 +313,83 @@ class Spec(unittest.TestCase):
     def test_glm5_next_is_a_refusing_stub(self):
         tmp = Path(tempfile.mkdtemp())
         try:
-            rc, log = run("all", "--family", "glm5_next", "--src", str(tmp / "s"), "--out", str(tmp / "o"))
-            self.assertEqual(rc, 1)
-            self.assertIn("csf32", log)
-            self.assertFalse((tmp / "o").exists())
+            for step, src in (("all", "--src"), ("drafter", "--drafter-src")):
+                rc, log = run(step, "--family", "glm5_next", src, str(tmp / "s"), "--out", str(tmp / "o"))
+                self.assertEqual(rc, 1, step)
+                self.assertIn("csf32", log)
+                self.assertFalse((tmp / "o").exists())
         finally:
             shutil.rmtree(tmp)
+
+    def test_sha256_spans_across_chunk_boundaries(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            data = np.random.default_rng(5).integers(0, 256, 1000, dtype=np.uint8).tobytes()
+            (tmp / "f").write_bytes(data)
+            spans = [("a", 0, 7), ("b", 7, 7), ("c", 7, 300), ("d", 333, 1000), ("e", 1000, 1000)]
+            with mock.patch.object(nocache, "CHUNK", 13):
+                whole, sums = nocache.sha256_spans(tmp / "f", spans)
+            self.assertEqual(whole, hashlib.sha256(data).hexdigest())
+            self.assertEqual(sums, {k: hashlib.sha256(data[a:b]).hexdigest() for k, a, b in spans})
+            self.assertEqual(nocache.sha256_file(tmp / "f"), whole)
+            with self.assertRaisesRegex(PrepError, "past the end of the file"):
+                nocache.sha256_spans(tmp / "f", [("x", 990, 1001)])
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_dflash2_pins(self):
+        repo, rev, files = conv.fetch.load_pins(HERE / conv.Beam.drafter_pins, conv.Beam.drafter_repo,
+                                                conv.Beam.drafter_revision, drafter.SOURCE_FILES)
+        self.assertEqual((repo, rev),
+                         ("reflection/Beam-1.0-501B-A23B-DFlash2", "163b276be744c8ce2b8385ea85de54edb3088211"))
+        self.assertEqual({n: (v["size"], v["sha256"]) for n, v in files.items()}, {
+            "README.md": (20325, "30a8b17949dbe90e2939cf4a0bbb55610b1aa609e71727d123c30a2cdceef241"),
+            "config.json": (1296, "baf609fba9dd9c8c42b5dd49deff50ee52d515ff8a25758ba166607b1385648b"),
+            "model.safetensors": (3_854_978_296, "34b99ca539b1d595d0db0edf072158173d89411eca0e6b1dd2c2601437352bf4")})
+
+    def test_real_drafter_layout_is_the_release_header(self):
+        """The drafter's tensor set for the release's config, laid out as the safetensors writer does (by name, one
+        dtype), is the release's header byte for byte, and with its payload the pinned file size."""
+        drafter.check_config(REAL_DRAFTER, "release")
+        drafter.check_trunk(REAL_DRAFTER, 5120, 151936, 52, "release")
+        ts = drafter.tensors(REAL_DRAFTER)
+        pre, payload = header_bytes({n: ("BF16", s, nbytes("BF16", s)) for n, s in ts.items()}, {"format": "pt"})
+        self.assertEqual((len(ts), len(pre), payload), (81, 8952, 3_854_969_344))
+        self.assertEqual(hashlib.sha256(pre).hexdigest(), RELEASE_HEADER_SHA256)
+        self.assertEqual(sum(int(np.prod(s)) for s in ts.values()), 1_927_484_672)  # the Hub's BF16 parameter count
+        _, _, files = conv.fetch.load_pins(HERE / conv.Beam.drafter_pins)
+        self.assertEqual(files["model.safetensors"]["size"], len(pre) + payload)
+
+    def test_drafter_config_refusals(self):
+        def dfc(**kw):
+            return lambda c: c["dflash_config"].update(kw)
+
+        self.assertEqual(drafter.config_of(fx.drafter_config()), TINY_CONFIG)
+        cases = [
+            (lambda c: c.pop("dflash_config"), "no dflash_config object"),
+            (dfc(block_size=1), "block_size is 1, want 2 or more"),
+            (dfc(mask_token_id=512), "mask_token_id is 512, want a token id below vocab_size 512"),
+            (dfc(conv_group_size=48), "conv_group_size is 48, want a divisor of hidden_size 256"),
+            (dfc(selector_top_k=513), "selector_top_k is 513, want at most vocab_size 512"),
+            (dfc(selector_rank=0), "selector_rank is 0, not a positive count"),
+            (dfc(target_layer_ids=[3, 1]), "target_layer_ids is [3, 1], want a non-empty increasing list"),
+            (dfc(final_logit_softcapping=None), "final_logit_softcapping is missing or null"),
+            (dfc(input_embedding_scale=2.0), "input_embedding_scale is 2.0, want 1.0 or absent"),
+            (lambda c: c.update(output_multiplier=0.5), "output_multiplier is 0.5, want 1.0 or absent"),
+            (lambda c: c.update(layer_types=["sliding_attention", "chunked_attention"]), "layer_types is"),
+            (lambda c: c.update(sliding_window=None), "sliding_window is missing or null, want a window in tokens (positive when a layer"),
+            (lambda c: c.update(rope_scaling={"rope_type": "yarn", "factor": 4.0}), "rope_scaling is {"),
+            (lambda c: c["rope_parameters"].update(rope_type="linear"), "not rope_type default"),
+            (lambda c: c.update(rope_theta=500000.0), "two rope_theta values"),
+            (lambda c: c.pop("is_causal"), "is_causal is missing or null, want true or false"),
+            (lambda c: c.update(num_hidden_layers=3), "layer_types is ['sliding_attention', 'sliding_attention'], "
+                                                      "want 3 entries"),
+        ]
+        for tweak, want in cases:
+            cfg = fx.drafter_config()
+            tweak(cfg)
+            with self.subTest(want), self.assertRaisesRegex(PrepError, re.escape(want)):
+                drafter.config_of(cfg)
 
 
 class Resume(unittest.TestCase):
@@ -741,6 +844,204 @@ class Refusals(unittest.TestCase):
             self.assertIn("a --pins table's files are not downloaded", log)
         finally:
             shutil.rmtree(tmp)
+
+
+def _renamed(cfg, ts):
+    ts["layers.1.mlp.upproj.weight"] = ts.pop("layers.1.mlp.up_proj.weight")
+
+
+def _shape(cfg, ts):
+    shape, bits = ts["layers.0.self_attn.k_proj.weight"]
+    ts["layers.0.self_attn.k_proj.weight"] = ([64, 256], bits[:64])
+
+
+def _hidden(cfg, ts):
+    cfg["hidden_size"] = 128
+
+
+def _target(cfg, ts):
+    cfg["dflash_config"]["target_layer_ids"] = [1, 3, 7]
+
+
+class Drafter(unittest.TestCase):
+    """The tiny DFlash2 drafter (beam_fixture.py --drafter) through the drafter step into a fixture pack (`all`, the
+    shards kept for verify): the manifest against the file, verify with the pair and without it, the copy, the rerun,
+    and the refusals by name."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="nvfp4-drafter-test-"))
+        cls.fix, cls.base, cls.dsrc = cls.tmp / "fix", cls.tmp / "base", cls.tmp / "dsrc"
+        fx.build(cls.fix, SEED)
+        rc, log = run("all", *build_args(cls.fix, cls.base))
+        assert rc == 0, log
+        fx.build_drafter(cls.dsrc, SEED)
+        cls.pack = cls.copy("pack")
+        cls.rc, cls.log = run("drafter", *drafter_args(cls.dsrc, cls.pack))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp)
+
+    @classmethod
+    def copy(cls, name, of=None):
+        """A copy of the 9-file pack (or of `of`; a hard link becomes a plain copy)."""
+        shutil.copytree(of or cls.base, cls.tmp / name)
+        return cls.tmp / name
+
+    def test_drafter_is_the_release_file_hard_linked(self):
+        self.assertEqual(self.rc, 0, self.log)
+        for event in ('[drafter] placed {"how": "link"', "[drafter] manifest", "[drafter] done"):
+            self.assertIn(event, self.log)
+        src, dst = self.dsrc / "model.safetensors", self.pack / "drafter.safetensors"
+        self.assertTrue(os.path.samefile(src, dst))
+        self.assertEqual({p.name for p in self.pack.iterdir() if p.name != ".prepare"},
+                         set(conv.PACK_FILES) | set(drafter.FILES) | {"pack-sha256.txt"})
+
+    def test_manifest_fields_against_the_file(self):
+        """Each field against the file as parsed here (struct, json, hashlib) and the generator's tensors."""
+        m = json.loads((self.pack / "drafter-manifest.json").read_text())
+        data = (self.pack / "drafter.safetensors").read_bytes()
+        n = struct.unpack("<Q", data[:8])[0]
+        header = json.loads(data[8:8 + n])
+        self.assertEqual(header.pop("__metadata__"), {"format": "pt"})
+        pins = json.loads((self.dsrc / fx.PINS).read_text())
+        self.assertEqual(sorted(m), sorted(["family", "format", "data_file", "data_size", "data_sha256", "header_bytes",
+                                            "payload_bytes", "source", "config", "tensors"]))
+        self.assertEqual((m["family"], m["format"], m["data_file"]),
+                         ("mlx-stream", "mlx-stream-dflash2-drafter-v1", "drafter.safetensors"))
+        self.assertEqual((m["data_size"], m["data_sha256"]), (len(data), hashlib.sha256(data).hexdigest()))
+        self.assertEqual((m["header_bytes"], m["payload_bytes"]), (8 + n, len(data) - 8 - n))
+        self.assertEqual(m["source"], {"repo": pins["repository"], "revision": pins["revision"],
+                                       "file": "model.safetensors", **pins["files"]["model.safetensors"]})
+        self.assertEqual(m["config"], TINY_CONFIG)
+        for k in drafter.NUMBERS:
+            self.assertIs(type(m["config"][k]), float, k)
+        gen = fx.drafter_tensors(SEED)
+        self.assertEqual(list(header), sorted(gen))  # the release's name order
+        self.assertEqual(set(m["tensors"]), set(header))
+        base, end = 8 + n, 0
+        for name, h in header.items():
+            a, b = h["data_offsets"]
+            self.assertEqual(a, end, name)  # contiguous in name order
+            end = b
+            self.assertEqual(data[base + a:base + b], gen[name][1].tobytes(), name)
+            self.assertEqual(m["tensors"][name], {"dtype": "BF16", "shape": h["shape"], "offset": a, "length": b - a,
+                                                  "sha256": hashlib.sha256(data[base + a:base + b]).hexdigest()}, name)
+        self.assertEqual((len(header), end), (36, m["payload_bytes"]))
+
+    def test_verify_lists_the_pair(self):
+        pack = self.copy("verified", self.pack)
+        rc, log = run("verify", *build_args(self.fix, pack))
+        self.assertEqual(rc, 0, log)
+        self.assertIn('[verify] drafter {"tensors": 36', log)
+        sums = dict(reversed(ln.split("  ")) for ln in (pack / "pack-sha256.txt").read_text().splitlines())
+        self.assertEqual(sorted(sums), sorted(conv.PACK_FILES + list(drafter.FILES)))
+        for name in drafter.FILES:
+            self.assertEqual(sums[name], hashlib.sha256((pack / name).read_bytes()).hexdigest(), name)
+
+    def test_a_pack_without_the_pair_verifies_as_before(self):
+        pack = self.copy("plain")
+        before = (pack / "pack-sha256.txt").read_text()
+        rc, log = run("verify", *build_args(self.fix, pack))
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("[verify] drafter", log)
+        self.assertEqual(((pack / "pack-sha256.txt").read_text(), len(before.splitlines())), (before, 9))
+
+    def test_a_copy_when_there_is_no_hard_link(self):
+        pack = self.copy("copied")
+        with mock.patch("os.link", side_effect=OSError(errno.EXDEV, "cross-device link")):
+            rc, log = run("drafter", *drafter_args(self.dsrc, pack))
+        self.assertEqual(rc, 0, log)
+        self.assertIn('[drafter] placed {"how": "copy"', log)
+        src, dst = self.dsrc / "model.safetensors", pack / "drafter.safetensors"
+        self.assertFalse(os.path.samefile(src, dst))
+        self.assertEqual(dst.read_bytes(), src.read_bytes())
+        self.assertEqual((pack / "drafter-manifest.json").read_text(),
+                         (self.pack / "drafter-manifest.json").read_text())
+
+    def test_a_rerun_replaces_a_copy_by_the_link(self):
+        pack = self.copy("rerun", self.pack)
+        src, dst = self.dsrc / "model.safetensors", pack / "drafter.safetensors"
+        self.assertFalse(os.path.samefile(src, dst))
+        for _ in range(2):
+            rc, log = run("drafter", *drafter_args(self.dsrc, pack))
+            self.assertEqual(rc, 0, log)
+            self.assertTrue(os.path.samefile(src, dst))
+        self.assertEqual([p.name for p in pack.iterdir() if p.name.startswith(".") and p.name != ".prepare"], [])
+
+    def test_each_mismatch_refuses_by_name(self):
+        def flip(d):
+            p = d / "model.safetensors"
+            data = bytearray(p.read_bytes())
+            data[-100] ^= 1
+            p.write_bytes(bytes(data))
+
+        cases = [(None, flip, "sha256 mismatch: model.safetensors"),
+                 (_renamed, None, "the tensor set is not the drafter's: missing ['layers.1.mlp.up_proj.weight'], "
+                                  "extra ['layers.1.mlp.upproj.weight']"),
+                 (_shape, None, "layers.0.self_attn.k_proj.weight: BF16 [64, 256] at"),
+                 (_hidden, None, "drafter config.json: hidden_size 128 is not the pack's 256"),
+                 (_target, None,
+                  "drafter config.json: target layer 7 is not a layer of the pack (num_hidden_layers 7)")]
+        for i, (tweak, after, want) in enumerate(cases):
+            with self.subTest(want):
+                d = self.tmp / f"bad-{i}"
+                fx.build_drafter(d, SEED, tweak)
+                if after:
+                    after(d)
+                pack = self.copy(f"refused-{i}")
+                rc, log = run("drafter", *drafter_args(d, pack))
+                self.assertEqual(rc, 1, log)
+                self.assertIn(want, log)
+                self.assertEqual([n for n in drafter.FILES if (pack / n).exists()], [])
+
+    def test_a_lone_manifest_refuses_in_verify(self):
+        pack = self.copy("lone", self.pack)
+        (pack / "drafter.safetensors").unlink()
+        rc, log = run("verify", *build_args(self.fix, pack))
+        self.assertEqual(rc, 1, log)
+        self.assertIn("the pack holds ['drafter-manifest.json'] without ['drafter.safetensors']", log)
+
+    def test_verify_hashes_every_tensor_again(self):
+        pack = self.copy("changed", self.pack)
+        m = json.loads((pack / "drafter-manifest.json").read_text())
+        p = pack / "drafter.safetensors"
+        data = bytearray(p.read_bytes())
+        data[m["header_bytes"] + m["tensors"]["layers.1.mlp.down_proj.weight"]["offset"] + 5] ^= 1
+        p.write_bytes(bytes(data))
+        rc, log = run("verify", *build_args(self.fix, pack))
+        self.assertEqual(rc, 1, log)
+        self.assertIn("sha256 mismatch: drafter.safetensors layers.1.mlp.down_proj.weight", log)
+
+    def test_readme_is_optional_and_checked_when_present(self):
+        d = self.tmp / "readme"
+        fx.build_drafter(d, SEED)
+        (d / "README.md").write_text("changed\n")
+        pack = self.copy("readme-pack")
+        rc, log = run("drafter", *drafter_args(d, pack))
+        self.assertEqual(rc, 1, log)
+        self.assertIn("mismatch: README.md", log)
+        (d / "README.md").unlink()
+        rc, log = run("drafter", *drafter_args(d, pack))
+        self.assertEqual(rc, 0, log)
+
+    def test_it_needs_the_release_files_and_a_pack(self):
+        d = self.tmp / "partial"
+        fx.build_drafter(d, SEED)
+        rc, log = run("drafter", *drafter_args(d, self.tmp / "no-pack"))
+        self.assertEqual(rc, 1, log)
+        self.assertIn("config.json is missing: the drafter sidecar goes into a pack", log)
+        (d / "model.safetensors").unlink()
+        rc, log = run("drafter", *drafter_args(d, self.copy("partial-pack")))
+        self.assertEqual(rc, 1, log)
+        self.assertIn(f"model.safetensors is not in {d.resolve()}", log)
+
+    def test_the_tiny_drafter_is_the_documented_file(self):
+        d = self.tmp / "seed0"
+        fx.build_drafter(d, 0)
+        data = (d / "model.safetensors").read_bytes()
+        self.assertEqual((len(data), hashlib.sha256(data).hexdigest()), TINY_DRAFTER)
 
 
 if __name__ == "__main__":
