@@ -178,13 +178,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
 
             pub fn row(self: *const HostSlotRows, c: Component, r: u32) []u8 {
-                const n = self.row_bytes[@intFromEnum(c)];
-                return self.banks[@intFromEnum(c)][r * n ..][0..n];
+                const n = self.row_bytes[@backingInt(c)];
+                return self.banks[@backingInt(c)][r * n ..][0..n];
             }
 
             pub fn rowDest(self: *const HostSlotRows, r: u32) [n_components]u64 {
                 var d: [n_components]u64 = undefined;
-                for (&d, 0..) |*a, c| a.* = @intFromPtr(self.row(@enumFromInt(c), r).ptr);
+                for (&d, 0..) |*a, c| a.* = @intFromPtr(self.row(@fromBackingInt(@intCast(c)), r).ptr);
                 return d;
             }
         };
@@ -253,8 +253,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
 
             pub fn row(self: *const LayerSlotBank, c: Component, r: u32) []u8 {
-                const n = self.row_bytes[@intFromEnum(c)];
-                const p: [*]u8 = @ptrFromInt(self.base[@intFromEnum(c)] + r * n);
+                const n = self.row_bytes[@backingInt(c)];
+                const p: [*]u8 = @ptrFromInt(self.base[@backingInt(c)] + r * n);
                 return p[0..n];
             }
 
@@ -379,8 +379,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
 
             pub fn row(self: *const Rows, c: Component, r: u32) []u8 {
-                const n = self.row_bytes[@intFromEnum(c)];
-                const p: [*]u8 = @ptrFromInt(self.base[@intFromEnum(c)] + r * n);
+                const n = self.row_bytes[@backingInt(c)];
+                const p: [*]u8 = @ptrFromInt(self.base[@backingInt(c)] + r * n);
                 return p[0..n];
             }
 
@@ -947,6 +947,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 var direct_block: u64 = 0;
                 if (pool_opt.direct) {
                     if (opt.lookahead) |la| if (la.preread) return error.InvalidOptions;
+                    // P6's staging rows are not checked against the block: staged reads stage, so the route needs the
+                    // stage off. Refused here, before the bank's checks, as the pre-read is.
+                    if (opt.prompt_stage_rows > 0) return error.InvalidOptions;
                     direct_block = expert_io.fileBlockSize(bank.sidecar) catch return error.DirectReadsBlock;
                     try expert_io.checkDirectBlock(direct_block, std.heap.pageSize());
                     try checkDirectReads(bank, direct_block);
@@ -1023,8 +1026,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
                 // P6's staged rows copy into any layer's rows: one geometry; the copies run at the overlap schedule's posts.
                 if (opt.prompt_stage_rows > 0) {
-                    // Direct reads land in block-aligned rows only (the staging rows are not checked): staged reads stage.
-                    if (opt.prompt_reads != .overlap or alt_layer != null or opt.prompt_stage_rows >= Stage.no_row or opt.pool.direct) return error.InvalidOptions;
+                    // Direct reads with the stage refuse above, before the bank's checks.
+                    if (opt.prompt_reads != .overlap or alt_layer != null or opt.prompt_stage_rows >= Stage.no_row) return error.InvalidOptions;
                     for (bank.layers) |*l| if (!sameGeometry(l, &bank.layers[widest])) return error.InvalidOptions;
                 }
                 var stage: Stage = .{};
@@ -1180,7 +1183,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (ids, r.plan.slotsOf()) |e, slot| {
                     const off = self.bank.recordOffset(r.layer, e);
                     for (l.segments, 0..) |seg, c| {
-                        const row = self.slotRow(r.layer, slot, @enumFromInt(c));
+                        const row = self.slotRow(r.layer, slot, @fromBackingInt(@intCast(c)));
                         try std.testing.expectEqual(rowBytes(l, c), row.len);
                         for (0..minisOf(l)) |mi| try std.testing.expectEqualSlices(u8, image[off + mi * miniStride(l) + seg.offset ..][0..seg.length], row[mi * seg.length ..][0..seg.length]);
                     }
@@ -1265,14 +1268,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     // A transient row of another geometry than the layer's rows (one scratch at the widest layer) is not
                     // copied.
                     const same = for (0..n_components) |c| {
-                        if (self.slotRow(layer, it.from, @enumFromInt(c)).len != ls.base.row_bytes[c]) break false;
+                        if (self.slotRow(layer, it.from, @fromBackingInt(@intCast(c))).len != ls.base.row_bytes[c]) break false;
                     } else true;
                     if (!same) break;
                     copies.ensureUnusedCapacity(self.allocator, n_components) catch break;
                     const to = p.admitSeed(it.e, pinned.items) orelse break;
                     for (0..n_components) |c| {
-                        const dst = self.slotRow(layer, to, @enumFromInt(c));
-                        copies.appendAssumeCapacity(.{ .dst = dst, .src = self.slotRow(layer, it.from, @enumFromInt(c)) });
+                        const dst = self.slotRow(layer, to, @fromBackingInt(@intCast(c)));
+                        copies.appendAssumeCapacity(.{ .dst = dst, .src = self.slotRow(layer, it.from, @fromBackingInt(@intCast(c))) });
                         bytes += dst.len;
                     }
                     // Not read before its copy lands: no later route of this call routes `it.e` again, and the call's end
@@ -2099,8 +2102,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                             try self.landStageJob(self.stage.job_of[srow]);
                             const loc = self.locate(layer, l.slot);
                             for (0..n_components) |c| {
-                                const dst = loc.rows.row(@enumFromInt(c), loc.row);
-                                copies[n_copies] = .{ .dst = dst, .src = self.stage.rows.row(@enumFromInt(c), srow) };
+                                const dst = loc.rows.row(@fromBackingInt(@intCast(c)), loc.row);
+                                copies[n_copies] = .{ .dst = dst, .src = self.stage.rows.row(@fromBackingInt(@intCast(c)), srow) };
                                 n_copies += 1;
                                 copy_bytes += dst.len;
                             }
@@ -2507,8 +2510,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     std.debug.assert(src.state == .ready and src.layer == layer and src.expert == l.expert);
                     // Capacity reserved at construction: every persistent row's components.
                     for (0..n_components) |c| {
-                        const dst = self.slotRow(layer, to, @enumFromInt(c));
-                        copies.appendAssumeCapacity(.{ .dst = dst, .src = self.slotRow(layer, l.slot, @enumFromInt(c)) });
+                        const dst = self.slotRow(layer, to, @fromBackingInt(@intCast(c)));
+                        copies.appendAssumeCapacity(.{ .dst = dst, .src = self.slotRow(layer, l.slot, @fromBackingInt(@intCast(c))) });
                         bytes += dst.len;
                     }
                     self.locate(layer, to).meta.* = .{ .state = .ready, .layer = @intCast(layer), .expert = l.expert };
@@ -2662,8 +2665,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         // staged record stays unused (the host never stalls the call's posts on the stage).
                         try self.landStageJob(self.stage.job_of[srow]);
                         for (0..n_components) |c| {
-                            const dst = loc.rows.row(@enumFromInt(c), loc.row);
-                            copies[n_copies] = .{ .dst = dst, .src = self.stage.rows.row(@enumFromInt(c), srow) };
+                            const dst = loc.rows.row(@fromBackingInt(@intCast(c)), loc.row);
+                            copies[n_copies] = .{ .dst = dst, .src = self.stage.rows.row(@fromBackingInt(@intCast(c)), srow) };
                             n_copies += 1;
                             copy_bytes += dst.len;
                         }
@@ -2833,7 +2836,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const slot = ls.policy.slotOf(e).?;
                     sum.* = self.recordDigest(layer, slot);
                     const mn = minisOf(&self.bank.layers[layer]);
-                    for (ls.lens, 0..) |len, c| @memset(self.slotRow(layer, slot, @enumFromInt(c))[0 .. len * mn], 0);
+                    for (ls.lens, 0..) |len, c| @memset(self.slotRow(layer, slot, @fromBackingInt(@intCast(c)))[0 .. len * mn], 0);
                     self.locate(layer, slot).meta.state = .empty;
                     ls.policy.invalidate(e);
                 }
@@ -2866,7 +2869,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             fn recordDigest(self: *Stream, layer: u32, slot: u32) [32]u8 {
                 var h = std.crypto.hash.sha2.Sha256.init(.{});
                 const mn = minisOf(&self.bank.layers[layer]);
-                for (self.layers[layer].lens, 0..) |len, c| h.update(self.slotRow(layer, slot, @enumFromInt(c))[0 .. len * mn]);
+                for (self.layers[layer].lens, 0..) |len, c| h.update(self.slotRow(layer, slot, @fromBackingInt(@intCast(c)))[0 .. len * mn]);
                 var d: [32]u8 = undefined;
                 h.final(&d);
                 return d;
@@ -3217,13 +3220,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 s.read_wall_ns = @intCast(@max(self.pool.readGauge()[4], 0));
                 const p = self.pool;
                 const pairs = .{
-                    .{ "claimed", .claimed },           .{ "spec_bytes", .spec_bytes },   .{ "spec_issued", .submitted },
-                    .{ "spec_landed", .landed },        .{ "adopt_ranges", .adopt_ranges }, .{ "adopt_bytes", .adopt_bytes },
-                    .{ "pre_issued", .pre_issued },     .{ "pre_served", .pre_served },   .{ "pre_expired", .pre_expired },
-                    .{ "gates", .ev_gates },            .{ "gates_forced", .ev_wd_forced },
-                    .{ "spec_expired", .expired },      .{ "spec_abandoned", .abandoned }, .{ "spec_discarded", .discarded },
-                    .{ "spec_cancelled", .cancelled_by_demand }, .{ "direct_ranges", .direct_ranges },
-                    .{ "spec_claimed_inflight", .claimed_inflight }, .{ "spec_abandoned_bytes", .abandoned_bytes },
+                    .{ "claimed", .claimed },             .{ "spec_bytes", .spec_bytes },                  .{ "spec_issued", .submitted },
+                    .{ "spec_landed", .landed },          .{ "adopt_ranges", .adopt_ranges },              .{ "adopt_bytes", .adopt_bytes },
+                    .{ "pre_issued", .pre_issued },       .{ "pre_served", .pre_served },                  .{ "pre_expired", .pre_expired },
+                    .{ "gates", .ev_gates },              .{ "gates_forced", .ev_wd_forced },              .{ "spec_expired", .expired },
+                    .{ "spec_abandoned", .abandoned },    .{ "spec_discarded", .discarded },               .{ "spec_cancelled", .cancelled_by_demand },
+                    .{ "direct_ranges", .direct_ranges }, .{ "spec_claimed_inflight", .claimed_inflight }, .{ "spec_abandoned_bytes", .abandoned_bytes },
                 };
                 inline for (pairs) |pr| @field(s, pr[0]) = @intCast(@max(p.counter(pr[1]), 0));
                 return s;
@@ -3234,7 +3236,5 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return self.locate(layer, slot).meta.pins;
             }
         };
-
-
     };
 }
