@@ -502,6 +502,15 @@ fn p7RunCall(f: *HitFixture, ss: *StreamSource, layer: u32, ids: []const u16, pr
 
 /// `p7RunCall` with `probe` run mid-call: with the read-ahead in flight, and with the call planned (its first route).
 fn p7RunCallProbed(f: *HitFixture, ss: *StreamSource, layer: u32, ids: []const u16, predicted: []const u16, out: *P7Call, probe: ?*const fn (*HitFixture, *StreamSource) anyerror!void) !void {
+    return p7RunCallStaged(f, ss, layer, ids, predicted, out, probe, null);
+}
+
+/// P1 (Beam's route): the next call's layer and its early ranking, staged past its empty rows once this call has posted
+/// its last read (`Stream.stageAfterCall` before the call's plans, as Beam's `Source.forward` does).
+const P7Next = struct { rel: u32, pred: []const u16 };
+
+/// `p7RunCallProbed` with P1's stage of the next call's layer (`next`).
+fn p7RunCallStaged(f: *HitFixture, ss: *StreamSource, layer: u32, ids: []const u16, predicted: []const u16, out: *P7Call, probe: ?*const fn (*HitFixture, *StreamSource) anyerror!void, next: ?P7Next) !void {
     const rel = layer - 1;
     try ss.readAheadSeed(layer, predicted);
     if (probe) |pr| try pr(f, ss);
@@ -519,6 +528,7 @@ fn p7RunCallProbed(f: *HitFixture, ss: *StreamSource, layer: u32, ids: []const u
     }
     const distinct = distinct_buf[0..nd];
     ss.hotOrder(layer, distinct, &count);
+    if (next) |nx| try ss.stream.stageAfterCall(nx.rel, nx.pred, true);
     const n_groups: u32 = @intCast((nd + P7Width - 1) / P7Width);
     out.n_groups = n_groups;
     const group = struct {
@@ -558,6 +568,20 @@ fn p7RunCallProbed(f: *HitFixture, ss: *StreamSource, layer: u32, ids: []const u
         }
     }
     try ss.flush();
+    // P1: the call posted every read, so the next layer's stage ran (a cold next layer) and none waits.
+    if (next != null) try std.testing.expect(!ss.stream.stage_next.live);
+}
+
+/// P1's early ranking in the script: the read-ahead's own, its 3 hottest moved last (an early prediction's errors: the
+/// stage past the empty rows then takes records the read-ahead admits, whose staged rows its admissions copy).
+fn p7Early(pred: []const u16, out: *[64]u16) []const u16 {
+    if (pred.len <= 3) {
+        @memcpy(out[0..pred.len], pred);
+        return out[0..pred.len];
+    }
+    @memcpy(out[0 .. pred.len - 3], pred[3..]);
+    @memcpy(out[pred.len - 3 .. pred.len], pred[0..3]);
+    return out[0..pred.len];
 }
 
 /// A call's routed ids: `rows` tokens x 8 distinct experts from a skewed draw over `span` experts (seeded).
@@ -583,7 +607,11 @@ fn p7Ids(rng: std.Random, rows: usize, span: u16, out: []u16) []u16 {
 /// The reader a P7 script runs on: its workers, and (X21) what keeps it behind the call's plans: a sleep injected on each
 /// call's first read-ahead read (`hold_ns`) or a random delay before every range read (`delay_ns`, at most); `relocate`:
 /// the stream built with the overlap schedule's relocation (`Options.prompt_relocate`, glm5_next's route; MiMo's off).
-const P7Pool = struct { workers: u32 = io_workers, hold_ns: i64 = 0, delay_ns: i64 = 0, relocate: bool = false };
+/// `stage_rows`: P6's staging rows (`Options.prompt_stage_rows`, Beam's route; MiMo's 0). `stage_ahead`: P1's cold
+/// schedule (Beam's route): a prompt's first call stages its own layer at its start (the hottest of its early ranking,
+/// `p7Early`), and each call stages the next call's layer of the prompt once it has posted its last read (`P7Next`);
+/// `stage_wait`: the start's stage landed before the read-ahead (its admissions copy it).
+const P7Pool = struct { workers: u32 = io_workers, hold_ns: i64 = 0, delay_ns: i64 = 0, relocate: bool = false, stage_rows: u32 = 0, stage_ahead: bool = false, stage_wait: bool = false };
 
 fn p7Fixture(f: *HitFixture, a: std.mem.Allocator, rows: []const u32, schedule: ReadSchedule) !StreamSource {
     return p7FixtureOn(f, a, rows, schedule, .{});
@@ -596,6 +624,7 @@ fn p7FixtureOn(f: *HitFixture, a: std.mem.Allocator, rows: []const u32, schedule
     opts.pool.workers = pool.workers;
     try applyReadSchedule(&opts, schedule);
     opts.prompt_relocate = pool.relocate;
+    opts.prompt_stage_rows = pool.stage_rows;
     try f.initOpts(a, opts);
     errdefer f.deinit(a);
     var ss = StreamSource.init(f.stream);
@@ -683,7 +712,17 @@ fn p7RunScriptOn(a: std.mem.Allocator, schedule: ReadSchedule, rows: []const u32
         const layer: u32 = @intCast(1 + i % 2);
         if (pool.hold_ns > 0) p7HoldFirstRead(&f, layer - 1, pred, pool.hold_ns);
         out.calls[i] = .{};
-        try p7RunCall(&f, &ss, layer, ids, pred, &out.calls[i]);
+        var early: [64]u16 = undefined;
+        if (pool.stage_ahead and i % script.per_prompt == 0 and f.stream.stagesAhead(layer - 1)) {
+            try f.stream.stageAhead(layer - 1, p7Early(pred, &early), false);
+            if (pool.stage_wait) try f.stream.awaitStage();
+        }
+        var next_early: [64]u16 = undefined;
+        const next: ?P7Next = if (pool.stage_ahead and (i + 1) % script.per_prompt != 0 and i + 1 < script.ids.len)
+            .{ .rel = @intCast((i + 1) % 2), .pred = p7Early(script.pred[i + 1], &next_early) }
+        else
+            null;
+        try p7RunCallStaged(&f, &ss, layer, ids, pred, &out.calls[i], null, next);
         // X20: every call of a request runs the post its start chose (an overlap stream; a stock stream has no post).
         if (f.stream.prompt_reads == .overlap) try std.testing.expectEqual(aheadPost(out.chosen[out.n_requests - 1]), f.stream.prompt_ahead);
         if ((i + 1) % script.per_prompt == 0) {
@@ -1090,6 +1129,176 @@ test "mimo p7 read schedule CPU relocate: under any reader timing every call pla
         if (arm.schedule == .early_whole) try testing.expect(relocated > 0 and run.stats.ahead_dropped == 0);
         std.debug.print("MIMO_P7_RELOCATE script calls={d} schedule={s} workers={d} delay_ns={d} hold_ns={d} bytes early_whole={d} run={d} relocated={d} dropped={d}\n", .{ n_calls, @tagName(arm.schedule), arm.pool.workers, arm.pool.delay_ns, arm.pool.hold_ns, whole.stats.expert_bytes_read, run.stats.expert_bytes_read, relocated, run.stats.ahead_dropped });
     }
+}
+
+// ── P6: the seeded prompt's read-ahead into the staging rows (Beam's route). A layer's second call of a prompt routes
+// against the full rows its first call left: P1 admits nothing, and the stage reads the predicted misses. ──
+
+test "mimo p6 staged reads CPU (beam's route): a call over full rows stages its predicted misses and copies them into the planned rows: current's plans, hits, misses and rows; every routed row holds its record; each staged record is read once" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const rows = [_]u32{ 28, 28 };
+    const record = try p7RecordBytes();
+    const n_calls = P7Calls40.n_calls;
+    var c40: P7Calls40 = .{};
+    c40.fill(rows[0]);
+    // A prompt per 4 calls: calls 2 and 3 of a prompt route against the residents calls 0 and 1 left (full rows).
+    const script: P7Script = .{ .ids = &c40.ids, .pred = &c40.pred, .per_prompt = 4 };
+    var calls_c: [n_calls]P7Call = undefined;
+    var cur: P7Run = .{ .calls = &calls_c, .stats = .{}, .residents = undefined };
+    try p7RunScript(a, .current, &rows, script, &cur);
+    // The same schedule without and with the stage: early_whole + relocation (no reader timing moves its reads), then
+    // Beam's route (early_whole_trim + relocation) under three reader timings.
+    const Arm = struct { schedule: ReadSchedule, pool: P7Pool };
+    const arms = [_]Arm{
+        .{ .schedule = .early_whole, .pool = .{ .relocate = true, .stage_rows = 16 } },
+        .{ .schedule = .early_whole_trim, .pool = .{ .relocate = true, .stage_rows = 16 } },
+        .{ .schedule = .early_whole_trim, .pool = .{ .workers = 1, .delay_ns = 2 * std.time.ns_per_ms, .relocate = true, .stage_rows = 16 } },
+        .{ .schedule = .early_whole_trim, .pool = .{ .workers = 1, .hold_ns = 50 * std.time.ns_per_ms, .relocate = true, .stage_rows = 64 } },
+    };
+    var plain_calls: [n_calls]P7Call = undefined;
+    var plain: P7Run = .{ .calls = &plain_calls, .stats = .{}, .residents = undefined };
+    try p7RunScriptOn(a, .early_whole, &rows, script, &plain, .{ .relocate = true });
+    for (arms) |arm| {
+        var calls_s: [n_calls]P7Call = undefined;
+        var run: P7Run = .{ .calls = &calls_s, .stats = .{}, .residents = undefined };
+        try p7RunScriptOn(a, arm.schedule, &rows, script, &run, arm.pool);
+        for (&calls_c, &calls_s) |*want, *got| try p7ExpectSamePlans(want, got);
+        for (cur.residents, run.residents) |rc, rs| try testing.expectEqualSlices(u16, &rc, &rs);
+        try testing.expectEqual(cur.stats.expert_cache_hits, run.stats.expert_cache_hits);
+        try testing.expectEqual(cur.stats.expert_cache_misses, run.stats.expert_cache_misses);
+        // Every staged record is copied by one load or counted unused; its bytes are read once, into its staged row.
+        const s = run.stats;
+        try testing.expect(s.staged > 0 and s.stage_copies > 0);
+        try testing.expectEqual(s.staged, s.stage_copies + s.stage_unused);
+        try testing.expectEqual(s.staged * record, s.staged_bytes);
+        // A copy replaces its load's read: the reads are the schedule's own and the unused staged records.
+        if (arm.schedule == .early_whole) {
+            try testing.expectEqual(plain.stats.loads_skipped, s.loads_skipped);
+            try testing.expectEqual(plain.stats.expert_bytes_read + s.stage_unused * record, s.expert_bytes_read);
+        }
+        std.debug.print("MIMO_P6_STAGE script calls={d} schedule={s} workers={d} delay_ns={d} hold_ns={d} stage_rows={d} staged={d} copies={d} unused={d} bytes plain={d} run={d}\n", .{ n_calls, @tagName(arm.schedule), arm.pool.workers, arm.pool.delay_ns, arm.pool.hold_ns, arm.pool.stage_rows, s.staged, s.stage_copies, s.stage_unused, plain.stats.expert_bytes_read, s.expert_bytes_read });
+    }
+}
+
+// ── P1: the cold prompt's read schedule across layers (Beam's route). A prompt's first calls route against empty rows:
+// the stage takes the layer's early-predicted records before its read-ahead. ──
+
+test "mimo p1 cold stage CPU (beam's route): the next layer staged before its read-ahead, at a prompt's start and behind a call's last read; the read-ahead's admissions and the call's loads copy the staged records: current's plans, hits, misses and rows; every routed row holds its record; each staged record is read once" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const rows = [_]u32{ 28, 28 };
+    const record = try p7RecordBytes();
+    const n_calls = P7Calls40.n_calls;
+    var c40: P7Calls40 = .{};
+    c40.fill(rows[0]);
+    const script: P7Script = .{ .ids = &c40.ids, .pred = &c40.pred, .per_prompt = 4 };
+    var calls_c: [n_calls]P7Call = undefined;
+    var cur: P7Run = .{ .calls = &calls_c, .stats = .{}, .residents = undefined };
+    try p7RunScript(a, .current, &rows, script, &cur);
+    var plain_calls: [n_calls]P7Call = undefined;
+    var plain: P7Run = .{ .calls = &plain_calls, .stats = .{}, .residents = undefined };
+    try p7RunScriptOn(a, .early_whole, &rows, script, &plain, .{ .relocate = true });
+    const Arm = struct { schedule: ReadSchedule, pool: P7Pool };
+    const arms = [_]Arm{
+        .{ .schedule = .early_whole, .pool = .{ .relocate = true, .stage_rows = 16, .stage_ahead = true, .stage_wait = true } },
+        .{ .schedule = .early_whole, .pool = .{ .relocate = true, .stage_rows = 16, .stage_ahead = true } },
+        .{ .schedule = .early_whole_trim, .pool = .{ .relocate = true, .stage_rows = 16, .stage_ahead = true, .stage_wait = true } },
+        .{ .schedule = .early_whole_trim, .pool = .{ .workers = 1, .delay_ns = 2 * std.time.ns_per_ms, .relocate = true, .stage_rows = 16, .stage_ahead = true } },
+        .{ .schedule = .early_whole_trim, .pool = .{ .workers = 1, .hold_ns = 50 * std.time.ns_per_ms, .relocate = true, .stage_rows = 64, .stage_ahead = true } },
+    };
+    for (arms) |arm| {
+        var calls_s: [n_calls]P7Call = undefined;
+        var run: P7Run = .{ .calls = &calls_s, .stats = .{}, .residents = undefined };
+        try p7RunScriptOn(a, arm.schedule, &rows, script, &run, arm.pool);
+        for (&calls_c, &calls_s) |*want, *got| try p7ExpectSamePlans(want, got);
+        for (cur.residents, run.residents) |rc, rs| try testing.expectEqualSlices(u16, &rc, &rs);
+        try testing.expectEqual(cur.stats.expert_cache_hits, run.stats.expert_cache_hits);
+        try testing.expectEqual(cur.stats.expert_cache_misses, run.stats.expert_cache_misses);
+        const s = run.stats;
+        try testing.expect(s.staged_ahead > 0 and s.staged >= s.staged_ahead);
+        // Every staged record is copied once (by an admission or a load) or counted unused; read once, into its row.
+        try testing.expectEqual(s.staged, s.stage_copies + s.stage_admits + s.stage_unused);
+        try testing.expectEqual(s.staged * record, s.staged_bytes);
+        // The start's stage landed before the read-ahead: its admissions copy it.
+        if (arm.pool.stage_wait) try testing.expect(s.stage_admits > 0);
+        // A copy replaces one read: the reads are the schedule's own and the unused staged records.
+        if (arm.schedule == .early_whole) {
+            try testing.expectEqual(plain.stats.loads_skipped, s.loads_skipped);
+            try testing.expectEqual(plain.stats.expert_bytes_read + s.stage_unused * record, s.expert_bytes_read);
+        }
+        std.debug.print("MIMO_P1_STAGE script calls={d} schedule={s} workers={d} delay_ns={d} hold_ns={d} stage_rows={d} wait={} staged={d} ahead={d} copies={d} admits={d} unused={d} bytes plain={d} run={d}\n", .{ n_calls, @tagName(arm.schedule), arm.pool.workers, arm.pool.delay_ns, arm.pool.hold_ns, arm.pool.stage_rows, arm.pool.stage_wait, s.staged, s.staged_ahead, s.stage_copies, s.stage_admits, s.stage_unused, plain.stats.expert_bytes_read, s.expert_bytes_read });
+    }
+}
+
+test "mimo p1 cold stage (beam's route): a stream stages ahead only a cold prompt layer, the hottest or past its empty rows, and never after the layer's read-ahead" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const rows = [_]u32{ 28, 28 };
+    var f: HitFixture = undefined;
+    var ss = try p7FixtureOn(&f, a, &rows, .early_whole_trim, .{ .relocate = true, .stage_rows = 8 });
+    defer f.deinit(a);
+    const st = f.stream;
+    var ranked: [40]u16 = undefined;
+    for (&ranked, 0..) |*e, i| e.* = @intCast(i);
+    // Cold (every row empty): the stage takes the hottest, or the records past the 28 empty rows.
+    try testing.expect(st.stagesAhead(0) and st.stagesAhead(1) and !st.stagesAhead(2));
+    try st.stageAhead(0, &ranked, false);
+    try testing.expectEqual(@as(u32, 8), st.stage.n);
+    try testing.expectEqualSlices(u16, ranked[0..8], st.stage.expert[0..8]);
+    try st.stageAhead(1, &ranked, true);
+    try testing.expectEqual(@as(u32, 1), st.stage.layer);
+    try testing.expectEqualSlices(u16, ranked[28..36], st.stage.expert[0..8]);
+    // A stage behind the next call: copied, waiting for the call's posts; the layer's read-ahead drops it if no call
+    // posted (here none: the layer stages at its read-ahead instead).
+    try st.stageAfterCall(0, ranked[0..12], true);
+    try testing.expect(st.stage_next.live and st.stage_next.layer == 0 and st.stage_next.n == 12 and st.stage_next.past_rows);
+    try ss.readAheadSeed(1, ranked[0..12]);
+    try testing.expect(!st.stage_next.live);
+    // Its read-ahead ran (20 of its 28 rows admitted, the stage full: P6 appends nothing): it stages there, never ahead.
+    try ss.readAheadSeed(2, ranked[0..20]);
+    try testing.expectEqual(@as(u32, 20), st.layers[1].policy.occupancy);
+    try testing.expectEqual(@as(u32, 8), st.stage.n);
+    try testing.expect(st.stagesAhead(1));
+    try testing.expectError(error.RoutesLive, st.stageAhead(1, &ranked, true));
+    try testing.expect(st.failed);
+}
+
+test "mimo p6 staged reads (beam's route): a stream refuses the stage without the overlap schedule or with direct reads; the phase change frees its rows and the regrow brings them back" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const rows = [_]u32{ 28, 28 };
+    var stock = options(&rows, .host);
+    stock.prompt_stage_rows = 8;
+    var f: HitFixture = undefined;
+    try testing.expectError(error.InvalidOptions, f.initOpts(a, stock));
+    var direct = options(&rows, .host);
+    try applyReadSchedule(&direct, .early_whole_trim);
+    direct.prompt_stage_rows = 8;
+    direct.pool.direct = true;
+    try testing.expectError(error.InvalidOptions, f.initOpts(a, direct));
+    // MiMo's schedules leave it off.
+    for ([_]ReadSchedule{ .current, .early, .early_whole, .early_whole_trim, .auto }) |schedule| {
+        var opts = options(&rows, .host);
+        try applyReadSchedule(&opts, schedule);
+        try testing.expectEqual(@as(u32, 0), opts.prompt_stage_rows);
+    }
+    var opts = options(&rows, .host);
+    opts.max_route_ids = P7Width;
+    opts.transient_rows = wide_depth * P7Width;
+    opts.transient_release = true;
+    try applyReadSchedule(&opts, .early_whole_trim);
+    opts.prompt_stage_rows = 8;
+    try f.initOpts(a, opts);
+    defer f.deinit(a);
+    try testing.expectEqual(@as(u32, 8), f.stream.stage.rows.rows);
+    _ = try f.stream.releaseTransient();
+    try testing.expectEqual(@as(u32, 0), f.stream.stage.rows.rows);
+    const decode_rows = [_]u32{ 30, 30 };
+    try f.stream.grow(&decode_rows);
+    _ = try f.stream.shrink(&rows, .forget);
+    _ = try f.stream.regrowTransient();
+    try testing.expectEqual(@as(u32, 8), f.stream.stage.rows.rows);
 }
 
 test "mimo p7 read schedule relocate: a stream refuses relocation without the overlap schedule; MiMo's schedules leave it off" {

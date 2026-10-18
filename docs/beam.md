@@ -69,15 +69,78 @@ At construction the module does these steps one time:
 4. It opens the rate tally, the usage record and the usage seed, as glm5_next does.
 5. It allocates the KV lanes at the billed context: a ring of the window (MiMo's `SlidingRing`) for each sliding
    layer, a slab of the context for each full layer.
-6. It writes the receipt lines (`beam routes`, `mlx-stream beam installed`, `beam memory`) and compares the
+6. It warms the prompt pass (P8, `warm.zig`). Under the host's default wired policy (`MLX_SERVE_WIRED` unset or `max`)
+   it sets MLX's wired limit to the device's recommended working set, the value that the host sets after the load. Then
+   it runs each kernel that the prompt pass builds at first use one time on zeros: layer 0's attention and layer 5's
+   attention over two 512-row tiles, layer 0's dense MLP over one tile, layer 3's predictor over one call and the prompt
+   combine over one token. It reads the layers through the prompt pass's view (the q8 tier's projections dequantized to
+   BF16), as a prompt call does. The GPU makes the load's buffers resident before this first work runs, so the wait is
+   in the load, not in the first request. No expert state changes: the result is token-identical. Line:
+   `beam prompt warm (P8): ...`.
+7. It writes the receipt lines (`beam routes`, `mlx-stream beam installed`, `beam memory`) and compares the
    footprint with the bill's construction terms.
 
 ## Requests
 
-The prompt pass runs in calls of at most 16,384 rows. A call runs layer by layer. The attention runs in tiles of 512
+The prompt pass runs in calls of at most 17,408 rows (34 attention tiles: a 16,445-token prompt is one call). A call
+runs layer by layer. The attention runs in tiles of 512
 rows, at most 2 tiles in flight. The dense MLP runs in tiles of 2,048 rows. Before each routed layer's attention, P1's
 predictor posts the layer's predicted experts to the stream (MiMo's read-ahead). The routed MLP runs over the call's
 rows on the wide lane.
+
+### The staged reads (P6)
+
+The read-ahead reads only into empty prompt rows. With the usage seed, every prompt row holds a resident at the load.
+Thus the read-ahead reads nothing, and a 16K call reads its 84 misses a layer only after its plans: the drive is idle
+through each layer's attention, and the GPU waits for the reads in the MoE stage.
+
+The stream has 64 staging rows (`experts.zig` `prompt_stage_rows`; host pages, 1.42 GB). When a layer has no empty
+prompt row, its read-ahead reads its predicted experts that are not resident into the staging rows, hottest first,
+while the attention runs. At the call's posts, a load of a staged expert copies the staged row into its planned row on
+the copier thread and reads nothing; the load's waits and its gate hold until the copy is done. The plans, the slots
+and the kernels do not change, and each planned row holds its record's bytes before a kernel reads it: the change is
+exact. The staging rows go at the phase change with the prompt's transient rows and come back with them.
+
+### The cold read schedule (P1)
+
+Without the usage seed, the first call of a prompt reads every record of every routed layer once (277.5 GB for the
+16,445-token coding prompt), and the drive is its bound. In the cold profile the drive stops at each layer boundary:
+from the last read of layer l to the read-ahead of layer l + 1, the host and the GPU run the last groups of layer l,
+its tail and the predictor of layer l + 1 (about 27 ms a boundary, 1.37 s in 49 boundaries). The drive also stops
+while the dense layers 0 to 2 run (1.64 s), because they read no record.
+
+When a routed layer has an empty prompt row, the staging rows also do this work:
+
+- At the start of a prompt call, the predictor of the first routed layer runs on the call's embeddings. The hottest
+  predicted records go into the staging rows while the dense layers run.
+- At the router stage of routed layer l, the predictor of layer l + 1 runs on the residual of layer l after its
+  attention. When the call of layer l has posted all its reads, the predicted records of layer l + 1 past its empty
+  rows go into the staging rows. The drive reads them after the reads of layer l, while the host and the GPU finish
+  layer l.
+
+The read-ahead of layer l + 1 and its plans do not change. When the read-ahead admits a staged record whose read is
+complete, the copier copies the staged row into the record's slot and the read-ahead reads nothing for it. When the
+call loads a staged record, the copier copies it (as in P6). The change is exact. The early predictor of layer l + 1
+runs beside the MoE stage of layer l: the bill's prompt wave adds it. A layer with no empty prompt row (the usage
+seed's residents, a later call) stages at its read-ahead (P6).
+
+### The host work off the critical path (P7)
+
+Three host steps of each prompt layer ran while the GPU had no work. The shared route (`mimo_v2/route.zig`) now holds
+glm5_next's levers for them, and Beam uses them:
+
+- The predictor of the next routed layer is built on the layer's output and evaluated with the layer's tail
+  (`PromptAhead`). The next layer reads the counts back; it does not run the predictor in its own round trip.
+- The tail's purge of MLX's cache runs after the next layer's first attention tile is committed (`DeferredPurge`). The
+  GPU runs the tile while the host purges. The cache stays under its limit.
+- The wide call's rows are put into buckets by group once (the shared scheduler's `route_cut`). Each group's bank passes
+  read only the rows of the group, not every row of the call. The plans and the waves do not change.
+
+The values and the reads do not change: the change is exact.
+
+The prompt pass's end writes one line: `beam prompt: tokens= wall_s= ssd_bytes= ahead_posted= ahead_dropped= staged=
+staged_ahead= stage_copies= stage_admits= stage_unused= loads= skipped=`. The staged records are the copies, the
+admissions and the unused records.
 
 Decode is serial: one row a step. The routed call takes MiMo's decode lane. Its routing barrier is the only host-GPU
 synchronization before the logits: the host reads the layer's expert ids and plans the hits and the misses. Under
@@ -172,7 +235,8 @@ and its NVFP4 projection format are shared with glm5_next (`src/expert/nvfp4_ban
   routes give the same bits. The default resolves to `stock` where the texts are not registered (a routed geometry
   other than 5,120 / 2,560 / top-8: the fixture) and on a CPU stream, with one log line.
 - The prompt combine uses MiMo's in-place text when the hidden size is a multiple of 1,024 and the model routes 8
-  experts a token. Otherwise it uses MiMo's stock reduction (a test pack).
+  experts a token. Otherwise it uses MiMo's stock reduction (a test pack). The stock reduction holds MiMo's widest
+  call (16,384 rows): a wider call refuses (`MimoCombineTokens`).
 
 ### The decode experts, measured
 
@@ -258,11 +322,12 @@ at 173 / 183 rows, temperature 0.7, top_p 0.99, seeds 1234 and 4321. Each seed g
 | `mlx_cache`, `mlx_cache_overshoot` | MLX's cache limit of the phase. The phase's largest single buffer. |
 | `compiler_runtime`, `host_runtime` | MiMo's declared host runtime and compiled kernels (no Beam reading yet). |
 | `resident_wiring`, `buffer_allowance` | The wiring of the wired bytes. DeepSeek's measured cost for each live buffer. |
-| `request`, `request_wiring` | The prompt wave at the widest call, the decode wave, and their wiring. |
+| `request`, `request_wiring` | The prompt wave at the widest call (with P1's early predictor beside the MoE stage), the decode wave, and their wiring. |
 | `prompt_view` | The q8 tier only, prompt phase: the BF16 weights of the widest layer's projections (a dense layer: 838,860,800 B) and their wiring. |
 | `sampler`, `gpu_warm` | The plugin's sampler. MiMo's keep-warm engine when it is on. |
 | `decode_kernels` | The fused texts' set, its pipelines and prepared launches under `decode_moe: hitpass` and `fused`: 20 MiB declared. At the pack's load the fused route's construction footprint is 18.6 MB more than the stock route's (host side 416.1 MB against 397.5 MB; MLX active the same). |
 | `hitpass_luts` | Under `decode_moe: hitpass`: a LUT pair for each model layer, each LUT a page (52 x 2 x 16 KiB). |
+| `slot_stage` | The staging rows (P6): 64 slot rows and a page a component, in the prompt phase only. |
 
 The fill gives the most decode rows and prompt rows that fit the host's ceiling less its wired margin. The floor is 8
 rows. The fill bills the rows beside the host's non-file baseline (wired + anonymous - purgeable + compressor, the
@@ -411,6 +476,19 @@ MLX_SERVE_GPU_CEILING_MB=245760 mlx-serve --model <pack> --serve --port 11391 --
 5. To seed the residents, run one request with `expert_usage_record` set to an absolute path. Then put that
    `expert-usage-v1.json` beside the pack (or in a copy of the pack with hard links). The next load reads it
    (`resident_seed: usage`, the default when the file is there).
+
+### The usage file (`usage`)
+
+The seeded start is the pack's default state. The pack directory holds `expert-usage-v1.json`: the usage record of
+one run of the coding workload on a cold start (the control's A run, seed 1234). At the load, the empty prompt rows of
+each layer get the layer's most used experts of the file. The first request keeps them. The file holds no prompt
+text: only the counts per layer and expert, and the label of the prompt set (`expert_usage_label`).
+
+- The converter (`scripts/prepare_nvfp4_pack.py`) does not write the file. A served run writes it
+  (`expert_usage_record`), and the pack directory gets it after that run.
+- A load without the file, or with `resident_seed: none`, starts cold: the first prompt reads every record once.
+- To measure a cold start and a seeded start on one pack, make a copy of the pack with hard links (no bytes copied) and
+  put the file in one copy only.
 
 The server lines of the first load:
 

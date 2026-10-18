@@ -539,25 +539,8 @@ pub fn SourceOf(comptime fam: Family) type {
         /// Prompt lever 3 (warm.zig): the installed prompt combine's text built by its first dispatch (MLX compiles a custom
         /// kernel's library then) over one token of zero rows, evaluated and dropped. No route, read or slot is touched.
         pub fn warmCombine(self: *Self) !void {
-            const g = &self.g;
-            const m = g.mark();
-            defer g.resetTo(m);
-            const h: c_int = @intCast(self.bank.geometry.hidden_size);
-            const rows = try g.zeros(&.{ @intCast(top_k), h }, .bfloat16);
-            try g.evalAll(&.{rows});
-            // Token 0's routed position k reads row k of the one source.
-            var pairs: [2 * top_k]i32 = undefined;
-            for (0..top_k) |k| {
-                pairs[2 * k] = 0;
-                pairs[2 * k + 1] = @intCast(k);
-            }
-            const loc = try g.hostArray(std.mem.sliceAsBytes(&pairs), &.{ 1, @intCast(top_k), 2 }, .int32);
-            const weights = try g.zeros(&.{ 1, @intCast(top_k) }, .float32);
-            const out = switch (self.combine_route) {
-                .inplace => try self.combine_kernel.callInplace(g, &.{rows}, loc, weights, 1),
-                else => try self.combine_kernel.call(g, &.{rows}, loc, weights, 1),
-            };
-            try g.evalAll(&.{out});
+            // The shared warm (prefill_combine.zig `Kernel.warmOne`): one token over one zero source, the installed text.
+            return self.combine_kernel.warmOne(&self.g, self.combine_route);
         }
 
         /// The pipeline pre-build of the expert texts (prebuild.zig's caller, construction): the exl3 family's prompt waves

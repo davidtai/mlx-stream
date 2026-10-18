@@ -33,6 +33,7 @@ const fusion = @import("fusion.zig");
 /// Profile builds: the prompt pass's stage marks (MiMo's timeline, armed by `GLM5_NEXT_PREFILL_TIMELINE`); every mark
 /// compiles to nothing in a served build.
 const ptl = @import("../mimo_v2/prefill_timeline.zig");
+const mimo_route = @import("../mimo_v2/route.zig");
 
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
@@ -676,22 +677,9 @@ pub const Routing = struct { indices: T, weights: T };
 /// GPU runs the shared expert behind the router, ahead of the first group's tiles. The same graphs and values, only the
 /// commit order moved: exact. `Ops`: the module's MLX backend (the CPU tests trace it).
 /// Prefill host idle (g21c profile: the tail -> next layer's attention gap, 5.2 ms a layer, GPU idle while the host purged
-/// MLX's cache after the tail's evaluation): a prompt layer's purge (`Source.promptLayerEnd`: MLX's cache cleared once
-/// half full) runs after the next layer's first attention span is committed, so the GPU starts that span first. The
-/// cache stays under its limit (MLX frees on allocation past it), so no bill term moves; no value changes: exact.
-pub const DeferredPurge = struct {
-    pending: bool = false,
-
-    pub fn layerEnd(p: *DeferredPurge) void {
-        p.pending = true;
-    }
-
-    pub fn afterFirstCommit(p: *DeferredPurge, src: anytype) void {
-        if (!p.pending) return;
-        p.pending = false;
-        src.promptLayerEnd();
-    }
-};
+/// MLX's cache after the tail's evaluation): a prompt layer's purge runs after the next layer's first attention span is
+/// committed (the shared route's `DeferredPurge`).
+pub const DeferredPurge = mimo_route.DeferredPurge;
 
 /// Prefill host idle (g21c profile: the dense stage's GPU idle, ~5-7 ms a routed layer while the host built the 16 spans'
 /// collapse and norm graphs with nothing committed): a prompt call's span collapse and norm committed as built. The same
@@ -753,16 +741,9 @@ const max_spans = prompt_call_rows / span_rows + 1;
 /// P1's predictor of one routed layer for a prompt call (prompt lever 5): the call's predicted top-k counted per expert
 /// on the GPU (u32 [experts]: one small read back in place of every row's ids and the host's tally). Built on the layer's
 /// input spans at the previous layer's end, committed behind that layer's tail and evaluated with it (`forward`: no host
-/// gap at the boundary), or at the layer's own start for a call's first routed layer that no layer of the call precedes.
-pub const Ahead = struct {
-    layer: ?u32 = null,
-    counts: ?T = null,
-
-    pub fn release(a: *Ahead, g: *G) void {
-        if (a.counts) |x| g.release(x);
-        a.* = .{};
-    }
-};
+/// gap at the boundary), or at the layer's own start for a call's first routed layer that no layer of the call precedes
+/// (the shared route's `PromptAhead`).
+pub const Ahead = mimo_route.PromptAhead;
 
 /// Routed layer `l`'s predictor over the call's input `spans` (`Ahead`), unevaluated: the router on each span's collapsed
 /// attention input (its post-attention norm), every row's top-k compared with each expert id and summed (exact integer
@@ -787,12 +768,8 @@ pub fn predictor(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, spans: [
     ahead.layer = l;
 }
 
-/// Each expert's routed rows in `ids` (u32 [rows, k]): the ids compared with every expert id (`all_ids`, u32 [1, n]) and
-/// summed per expert, int32 [n] (integer sums: exactly the host's tally of the same ids). `Ops`: the module's MLX backend
-/// (the CPU tests trace it).
-pub fn expertCounts(comptime Ops: type, g: *Ops, ids: Ops.T, rows: c_int, k: c_int, all_ids: Ops.T) !Ops.T {
-    return g.sum(try g.equal(try g.reshape(ids, &.{ rows * k, 1 }), all_ids), 0, false);
-}
+/// Each expert's routed rows in `ids` (u32 [rows, k]) per expert, int32 [n] (the shared route's `expertCounts`).
+pub const expertCounts = mimo_route.expertCounts;
 
 /// The spans P1's predictor routes (`Routes.predict_sampled`, the construction's `prompt_static_order`): every span of the
 /// call (the control), or at most `prompt_levers.sampled_spans` evenly spaced ones (`prompt_levers.sampledSpanIndices`)
@@ -1194,28 +1171,6 @@ test "glm5_next graph: decode host idle commits a layer's attention output alone
     try testing.expectEqualSlices(Trace.T, &.{out}, g.committed.items[g.commit_spans.items[0][0]..g.commit_spans.items[0][1]]);
     try testing.expectEqual(nodes + 1, g.nodes.items.len);
     try testing.expectEqual(@as(usize, 0), g.evals.items.len);
-}
-
-test "glm5_next graph: prefill host idle's deferred purge runs once, after the next layer's first commit, and at the pass's end" {
-    const Fake = struct {
-        purges: u32 = 0,
-        pub fn promptLayerEnd(f: *@This()) void {
-            f.purges += 1;
-        }
-    };
-    var src: Fake = .{};
-    var p: DeferredPurge = .{};
-    p.afterFirstCommit(&src); // layer 0's first span: nothing pending
-    try testing.expectEqual(@as(u32, 0), src.purges);
-    p.layerEnd(); // layer 0's end: deferred
-    try testing.expectEqual(@as(u32, 0), src.purges);
-    p.afterFirstCommit(&src); // layer 1's first span committed: layer 0's purge
-    try testing.expectEqual(@as(u32, 1), src.purges);
-    p.afterFirstCommit(&src); // no second purge
-    try testing.expectEqual(@as(u32, 1), src.purges);
-    p.layerEnd();
-    p.afterFirstCommit(&src); // the pass's end
-    try testing.expectEqual(@as(u32, 2), src.purges);
 }
 
 test "glm5_next graph: prefill host idle commits a span's collapse and norm alone, as built (one commit; nothing evaluated)" {

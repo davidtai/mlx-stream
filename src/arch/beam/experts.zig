@@ -42,8 +42,10 @@ const T = mlx.mlx_array;
 pub const top_k: u32 = 8;
 /// The most experts a routed layer of a served pack holds (config.zig refuses more): the read-ahead's host scratch.
 pub const max_experts: u32 = 256;
-/// The prompt pass's calls: at most this many rows each (MiMo's: the expert math's row scratch holds one call).
-pub const call_rows: u32 = 16_384;
+/// The prompt pass's calls: at most this many rows each (the expert math's row scratch holds one call). P5: 17,408 rows
+/// (34 attention tiles), so the 16,445-token coding prompt is one call: at 16,384 its 61-row tail was a second call
+/// that re-read 28.3 GB of misses in 2.17 s. The bill prices the widest call's prompt wave.
+pub const call_rows: u32 = 17_408;
 /// The NVFP4 format with the fused qmv decode texts (installed under `decode_moe: hitpass` and `fused`), prompt calls of
 /// at most `call_rows` rows.
 pub const Format = nvfp4_format.FormatOf(.{ .Fused = decode_kernels.FusedDecode, .max_call_tokens = call_rows });
@@ -56,6 +58,24 @@ pub const Experts = shared_experts.ExpertsWith(ops.MlxOps, StreamSource, Math, .
 pub const Gate = Experts.Gate;
 /// The decode lane's widest call (the scheduler's bound; Beam decodes one row a step).
 pub const decode_lane_rows: u32 = Math.decode_forward_rows;
+/// P6 (the seeded prompt's read-ahead): the stream's staging rows (`Options.prompt_stage_rows`, host pages, 1.42 GB at
+/// Beam's record). With the usage seed's residents every prompt row is full, so P1's read-ahead admits nothing and the
+/// call reads its 84 misses a layer only after its plans. A prompt layer then reads up to 64 of its predicted misses into
+/// these rows while its attention runs (about 88 to 110 ms of the drive at 1.51 ms a record), and the call copies them
+/// into their planned rows. Exact by construction.
+pub const prompt_stage_rows: u32 = 64;
+
+/// The shared scheduler's wide prompt route: the seed, the hot-first groups at MiMo's depth, P1's read-ahead, and P7's
+/// route-plan cut (glm5_next's prompt lever: the call's rows bucketed by group once, each group's bank passes over its
+/// own rows: the same plans and waves, host planning only; exact).
+pub const wide_route: shared_experts.Wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true, .route_cut = true };
+
+/// The stream's construction options: the shared route's (route.zig `streamOptionsOf`) and P6's staging rows.
+pub fn streamOptions(rows: []const u32, memory: B.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings) !B.Options {
+    var opts = try route.streamOptionsOf(B, rows, memory, event, tally, false);
+    opts.prompt_stage_rows = prompt_stage_rows;
+    return opts;
+}
 
 comptime {
     if (Math.prefill_min_tokens != decode_lane_rows + 1) @compileError("beam: the scheduler's wide threshold is not the decode lane's bound");
@@ -99,7 +119,8 @@ pub const Source = struct {
     /// MiMo's X12 (`gpu_keep_warm: waits`): the warm engine (the gated waits and every decode routing barrier); null on the
     /// control.
     warm: ?*gpu_warm.Warm = null,
-    /// P1's host scratch (reused): the call's predicted counts (read back from the GPU), the ranking.
+    /// P1's host scratch (reused): the call's predicted counts (read back from the GPU), the ranking; the read-ahead's
+    /// and the stage's (`stageCounts`) in turn.
     ahead_counts: [max_experts]u32 = undefined,
     ahead_ranked: [max_experts]u16 = undefined,
 
@@ -140,7 +161,7 @@ pub const Source = struct {
         // The reader's staging holds the bank's widest span plus its page alignment and a page: refused here, once.
         if (B.S.stagingBytes(&self.sdk_bank) > settings.reader_staging_bytes) return error.BeamReaderStaging;
         const event = try expert_event.createMetal();
-        self.sdk_stream = try Stream.init(a, &self.sdk_bank, try route.streamOptionsOf(B, self.rows, .{ .mlx = stream }, event, tally, false));
+        self.sdk_stream = try Stream.init(a, &self.sdk_bank, try streamOptions(self.rows, .{ .mlx = stream }, event, tally));
         errdefer self.sdk_stream.deinit();
         self.stream_source = StreamSource.init(self.sdk_stream);
         try self.stream_source.installReadSchedule(route.read_schedule, mimo_stream.default_read_schedule_threshold);
@@ -192,7 +213,7 @@ pub const Source = struct {
             .n_routed_experts = geo.num_experts,
             .n_experts_per_tok = k,
         };
-        self.ex = try Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true }, .banked = decode_moe != .stock, .devroute = decode_moe == .hitpass });
+        self.ex = try Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = gates, .event = event, .wide = wide_route, .banked = decode_moe != .stock, .devroute = decode_moe == .hitpass });
         errdefer self.ex.deinit();
         if (self.combine_route == .inplace) self.ex.setJoinlessBound(prefill_combine.inplace_sources);
         log.info("beam experts: NVFP4 g16 bank {d} x {d} records of {d} B (scale lines isolated, {d}-byte lines); decode_moe={s} ({s}); prompt_combine={s}; {s}\n", .{ geo.num_moe_layers, geo.num_experts, geo.record_bytes, bank.scale_line_bytes, @tagName(decode_moe), switch (decode_moe) {
@@ -316,10 +337,20 @@ pub const Source = struct {
         return route.decodeLane(nt, self.decoding(), decode_lane_rows);
     }
 
+    /// P1 (the cold prompt's read schedule): the next routed layer's early prediction (`graph.predictedCounts` over
+    /// this layer's residual, u32 [experts]) that a wide call stages once it has posted every read (`stageCounts`).
+    pub const Ahead = struct { layer: u32, counts: T };
+
+    /// P1: when `stageCounts` stages. `start`: now, the hottest (the first routed layer at a call's start). `behind`:
+    /// once the next prompt call has posted its last read, past the layer's empty rows (`Stream.stageAfterCall`).
+    pub const StageWhen = enum { start, behind };
+
     /// One routed call of absolute layer `layer`: x [nt, H] bf16, ids u32 [nt, 8] (the router's, read by the scheduler
     /// as they are), f32 weights [nt, 8] -> the weighted sum [nt, H] bf16, a KEPT handle the caller adopts. The decode
-    /// lane's output is lazy (the next routing barrier or the logits evaluate it); a wide call's is evaluated.
-    pub fn forward(self: *Self, layer: u32, x: T, expert_ids: T, route_weights: T) !T {
+    /// lane's output is lazy (the next routing barrier or the logits evaluate it); a wide call's is evaluated. `ahead`
+    /// (a wide call only): P1's next layer, read back before the call's plans and staged by the stream once the call
+    /// has posted its last read (before the call's last groups, its tail and the next predictor).
+    pub fn forward(self: *Self, layer: u32, x: T, expert_ids: T, route_weights: T, ahead: ?Ahead) !T {
         const g = &self.g;
         defer g.reset();
         const nt: u32 = @intCast(g.shapeOf(x).d[0]);
@@ -330,6 +361,7 @@ pub const Source = struct {
         // Decode's window 0 holds one decode-lane route: no decode-phase call is wide (the module resumes the prompt
         // phase for any wider forward). An invariant of the callers.
         std.debug.assert(!self.decoding());
+        if (ahead) |nx| try self.stageCounts(nx.layer, nx.counts, .behind);
         const hook = self.ex.at(layer);
         const parts = try hook.routedParts(g, x, expert_ids);
         defer hook.releaseParts(g);
@@ -360,6 +392,25 @@ pub const Source = struct {
         try self.ex.at(layer).readAheadSeed(ranked);
     }
 
+    /// P1 (the cold prompt's read schedule): whether routed layer `layer` is staged before its read-ahead
+    /// (`Stream.stagesAhead`: the staging rows, the layer with an empty prompt row).
+    pub fn stagesAhead(self: *const Self, layer: u32) bool {
+        return self.sdk_stream.stagesAhead(self.stream_source.relativeLayer(layer));
+    }
+
+    /// P1: routed layer `layer`'s early prediction (`counts`, u32 [experts]) read back, ranked hottest first and staged
+    /// `when` (`Stream.stageAhead`, `Stream.stageAfterCall`).
+    pub fn stageCounts(self: *Self, layer: u32, counts: T, when: StageWhen) !void {
+        try self.g.evalAll(&.{counts});
+        const host = try self.g.readU32(counts, self.ahead_counts[0..self.bank.geometry.num_experts]);
+        const ranked = sdk_ext.expert.policy.rankHottest(host, &self.ahead_ranked);
+        const rel = self.stream_source.relativeLayer(layer);
+        switch (when) {
+            .start => try self.sdk_stream.stageAhead(rel, ranked, false),
+            .behind => try self.sdk_stream.stageAfterCall(rel, ranked, true),
+        }
+    }
+
     pub fn stats(self: *Self) sdk_ext.expert.Stats {
         return self.stream_source.stats();
     }
@@ -378,14 +429,18 @@ pub const Source = struct {
     }
 };
 
-test "beam experts: the stream's options are the shared route's: overlap schedule, relocation, the phase rows' release, decode's window, staged reads" {
+test "beam experts: the stream's options are the shared route's: overlap schedule, relocation, the phase rows' release, decode's window, staged reads; P6's staging rows" {
     const testing = std.testing;
     const rows = [_]u32{ 96, 96 };
-    const opts = try route.streamOptionsOf(B, &rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, false);
+    const opts = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 });
+    try testing.expectEqual(prompt_stage_rows, opts.prompt_stage_rows);
+    try testing.expectEqual(@as(u32, 0), (try route.streamOptionsOf(B, &rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, false)).prompt_stage_rows);
     try testing.expect(opts.tally == null);
     try testing.expectEqual(B.S.PromptReads.overlap, opts.prompt_reads);
     try testing.expectEqual(B.S.AheadPost.whole_trim, opts.prompt_ahead);
     try testing.expect(opts.prompt_relocate and opts.transient_release and !opts.pool.direct);
+    // P7: the wide route cuts its plans by group (host planning only).
+    try testing.expect(wide_route.route_cut and wide_route.read_ahead and wide_route.seed and wide_route.hot_first);
     try testing.expectEqual(mimo_stream.decodeRouteIds(route.decode_window), opts.decode_route_ids);
     // The prompt combine: the text at Beam's 5,120 (whole threadgroups), MiMo's stock reduction at a fixture's 256.
     try testing.expect(combineRouteOf(5120, 8) != .stock);

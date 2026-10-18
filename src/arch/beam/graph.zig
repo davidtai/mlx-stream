@@ -17,7 +17,7 @@
 //! times `routed_scaling_factor`. Every SwiGLU in f32 (`swiglu_f32`). The head: the final norm, the untied lm_head, the
 //! soft cap 30 tanh(x / 30) in f32.
 //!
-//! A prompt call (at most `experts.call_rows` rows) runs layer by layer: P1's predicted seed posted before a routed
+//! A prompt call (at most `experts.call_rows` rows: 17,408) runs layer by layer: P1's predicted seed posted before a routed
 //! layer's attention (its router on the layer's input under its pre-feedforward norm), the attention in tiles of
 //! `tile_rows` rows with at most `tiles_in_flight` committed (each sliding ring's append is at most one tile: the ring's
 //! headroom), the dense MLP in tiles, the MoE over every row at once (the wide lane), the layer's output evaluated at
@@ -44,6 +44,7 @@ const kv = @import("../mimo_v2/kv.zig");
 const beam = @import("config.zig");
 const experts = @import("experts.zig");
 const glue = @import("glue.zig");
+const mimo_route = @import("../mimo_v2/route.zig");
 
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
@@ -929,25 +930,57 @@ fn forcedRoute(g: *G, c: *const beam.Config, routes: Routes, r: Router, x: T, f:
     return .{ .indices = inds, .weights = try weightsAt(g, c, s.scores, inds) };
 }
 
-/// Each expert's routed rows in `ids` (u32 [rows, k]) against every expert id (`all_ids`, u32 [1, n]): int32 [n].
-fn expertCounts(g: *G, ids: T, rows: c_int, k: c_int, all_ids: T) !T {
-    return g.sum(try g.equal(try g.reshape(ids, &.{ rows * k, 1 }), all_ids), 0, false);
-}
-
-/// P1: routed layer `l`'s predicted experts (its router on the layer's input under its pre-feedforward norm, counted
-/// per expert on the GPU, one small read back), ranked hottest first and posted to the stream, which reads the seed
-/// into the layer's free persistent rows while the attention runs. The prediction only picks reads: token-exact.
-fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, src: anytype) !void {
-    const m = g.mark();
-    defer g.resetTo(m);
+/// P1's predictor of routed layer `lw` over `x` (the layer's input rows): its router on `x` under the layer's
+/// pre-feedforward norm, the chosen experts counted per expert on the GPU, u32 [experts], unevaluated.
+pub fn predictedCounts(g: *G, c: *const beam.Config, lw: *const Layer, x: T) !T {
     const n = g.shapeOf(x).dim(0);
     const ne: c_int = @intCast(c.n_routed_experts);
     const r = try route(g, c, lw.router.?, try rmsNorm(g, x, lw.pre_ff_norm, c.rms_norm_eps));
     const all_ids = try g.reshape(try g.arange(0, @floatFromInt(c.n_routed_experts), 1, .uint32), &.{ 1, ne });
-    const counts = try g.astype(try expertCounts(g, r.indices, n, @intCast(c.n_experts_per_tok), all_ids), .uint32);
-    try g.evalAll(&.{counts});
+    return g.astype(try mimo_route.expertCounts(G, g, r.indices, n, @intCast(c.n_experts_per_tok), all_ids), .uint32);
+}
+
+/// P1: routed layer `l`'s predicted experts (`predictedCounts`, one small read back), ranked hottest first and posted
+/// to the stream, which reads the seed into the layer's free persistent rows while the attention runs. P7: the counts
+/// were evaluated with the previous layer's tail (`ahead`, the shared route's prompt lever 5); a call's first routed
+/// layer with no layer before it in the call builds its own. The prediction only picks reads: token-exact.
+fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, src: anytype, ahead: *mimo_route.PromptAhead) !void {
+    const m = g.mark();
+    defer g.resetTo(m);
+    defer ahead.release(g);
+    const counts = if (ahead.layer) |al| blk: {
+        std.debug.assert(al == l);
+        break :blk ahead.counts.?;
+    } else blk: {
+        const own = try predictedCounts(g, c, lw, x);
+        try g.evalAll(&.{own});
+        break :blk own;
+    };
     const host = try g.readU32(counts, src.ahead_counts[0..c.n_routed_experts]);
     try src.readAheadSeed(l, expert_policy.rankHottest(host, &src.ahead_ranked));
+}
+
+/// P1 (the cold prompt's read schedule across layers): the first routed layer's predicted records staged at a prompt
+/// call's start, from the call's embeddings (its router under its pre-feedforward norm, `predictedCounts`): the drive
+/// reads them while the dense layers run, and the layer's read-ahead copies the ones it admits. Only for a cold layer
+/// (`stagesAhead`). The prediction only picks reads: token-exact.
+fn stageFirstRouted(g: *G, c: *const beam.Config, w: *const Weights, x: T, src: anytype) !void {
+    const l: u32 = for (w.layers, 0..) |*lw, li| {
+        if (lw.router != null) break @intCast(li);
+    } else return;
+    if (!src.stagesAhead(l)) return;
+    const m = g.mark();
+    defer g.resetTo(m);
+    try src.stageCounts(l, try predictedCounts(g, c, &w.layers[l], x), .start);
+}
+
+/// P1: routed layer `l + 1`'s early prediction over layer `l`'s residual after its attention (`x1`), unevaluated, for
+/// the call of layer `l` to stage once it has posted its reads (`Source.forward`'s `ahead`). Null: the last layer, a
+/// dense next layer, or a next layer that is not cold (`stagesAhead`).
+fn nextAhead(g: *G, c: *const beam.Config, w: *const Weights, l: u32, x1: T, src: anytype) !?experts.Source.Ahead {
+    const next = l + 1;
+    if (next >= w.layers.len or w.layers[next].router == null or !src.stagesAhead(next)) return null;
+    return .{ .layer = next, .counts = try predictedCounts(g, c, &w.layers[next], x1) };
 }
 
 /// The head's rows: the last row's logits (served), or every row's (the parity test's).
@@ -980,6 +1013,13 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
     const boundary_glue: ?*const glue.Kernels = if (rows == 1) routes.glue else null;
     var xn_next: ?T = null;
     defer if (xn_next) |v| g.release(v);
+    if (prompt) try stageFirstRouted(g, c, w, x, src);
+    // P7 (the shared route's prompt levers): the next routed layer's predicted counts, built on each layer's output at
+    // its tail and evaluated with it (`PromptAhead`: no predictor round trip at the boundary), and a layer's purge after
+    // the next layer's first commit (`DeferredPurge`: the GPU starts that tile first).
+    var ahead: mimo_route.PromptAhead = .{};
+    defer ahead.release(g);
+    var purge: mimo_route.DeferredPurge = .{};
     for (w.layers, 0..) |*stored, li| {
         const l: u32 = @intCast(li);
         const m = g.mark();
@@ -988,7 +1028,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         // reads them as stored.
         const view = if (prompt) try promptView(g, stored) else stored.*;
         const lw = &view;
-        if (prompt and lw.router != null) try postReadAhead(g, c, lw, l, x, src);
+        if (prompt and lw.router != null) try postReadAhead(g, c, lw, l, x, src, &ahead);
         // The attention, tile by tile (the rings and slabs carry from one tile to the next); in a prompt call each tile
         // is committed as built and the tile before it waited, so at most `tiles_in_flight` run at once.
         const xn = if (xn_next) |v| v else try rmsNorm(g, x, lw.input_norm, c.rms_norm_eps);
@@ -1004,6 +1044,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             g.resetTo(ms);
             if (!prompt) continue;
             try g.asyncEval(&.{outs[i]});
+            if (i == 0) purge.afterFirstCommit(src);
             if (i > 0) try g.evalAll(&.{outs[i - 1]});
         }
         const attn = if (n_tiles == 1) outs[0] else try g.concat(outs[0..n_tiles], 0);
@@ -1013,7 +1054,12 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, h, rows) else try mlp(g, d, h)) else blk: {
             const r = if (comptime @TypeOf(force) == void) try routeOf(g, c, routes, lw.router.?, h, !prompt) else try forcedRoute(g, c, routes, lw.router.?, h, force, l, start, !prompt);
             if (prompt) try g.asyncEval(&.{ r.indices, r.weights });
-            const routed = try g.adopt(try src.forward(l, h, r.indices, r.weights));
+            // P1: the next routed layer's early prediction, committed behind the router (the call's barrier waits for
+            // the router alone); the call stages it once its reads are posted, so the drive reads on through this
+            // layer's last groups, its tail and the next predictor.
+            const early = if (prompt) try nextAhead(g, c, w, l, x1, src) else null;
+            if (early) |nx| try g.asyncEval(&.{nx.counts});
+            const routed = try g.adopt(try src.forward(l, h, r.indices, r.weights, early));
             break :blk try scaled(g, c, routed, try g.scalar(c.routed_scaling, .float32));
         };
         const x2 = if (boundary_glue) |k| blk: {
@@ -1027,15 +1073,23 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         g.release(x);
         x = next;
         // MiMo's tail: a prompt layer's output evaluated before the next layer starts (bounding its graph), then the
-        // pooled scratch's purge. A decode step's stays lazy: the next routing barrier evaluates it.
+        // pooled scratch's purge. A decode step's stays lazy: the next routing barrier evaluates it. P7: the next routed
+        // layer's predictor built on the output and evaluated with it (the layer's own arrays released first: the
+        // boundary holds the stream and the predictor's arrays, bill.zig `promptWaveBytes`); the purge waits for the
+        // next layer's first commit.
         if (prompt) {
             g.resetTo(m);
             for (outs[0..n_kept]) |o| g.release(o);
             n_kept = 0;
-            try g.evalAll(&.{x});
-            src.promptLayerEnd();
+            if (li + 1 < w.layers.len and w.layers[li + 1].router != null) {
+                ahead.counts = g.keep(try predictedCounts(g, c, &w.layers[li + 1], x));
+                ahead.layer = l + 1;
+                try g.evalAll(&.{ x, ahead.counts.? });
+            } else try g.evalAll(&.{x});
+            purge.layerEnd();
         }
     }
+    purge.afterFirstCommit(src);
     cache.len = start + rows;
     // The decode glue's last boundary normed the one row by the final norm already: the head's lm_head and soft cap.
     if (xn_next) |xn| return g.keep(try softcap(g, c, try project(g, w.head, xn)));
@@ -1079,14 +1133,14 @@ const testing = std.testing;
 test "beam graph: the kept residents are the trunk's (no routed expert, no quantizer scale)" {
     const c: beam.Config = .{};
     for ([_][]const u8{
-        "lm_head.weight",                                  "model.embed_tokens.weight",                     "model.norm.weight",
-        "model.layers.0.mlp.gate_proj.weight",             "model.layers.3.mlp.gate.weight",                "model.layers.51.mlp.gate.e_score_correction_bias",
-        "model.layers.5.self_attn.gate_bias",              "model.layers.5.post_feedforward_layernorm.weight",
+        "lm_head.weight",                      "model.embed_tokens.weight",                        "model.norm.weight",
+        "model.layers.0.mlp.gate_proj.weight", "model.layers.3.mlp.gate.weight",                   "model.layers.51.mlp.gate.e_score_correction_bias",
+        "model.layers.5.self_attn.gate_bias",  "model.layers.5.post_feedforward_layernorm.weight",
     }) |n| try testing.expect(keptResident(&c, n));
     for ([_][]const u8{
-        "model.layers.3.mlp.experts.0.gate_proj.weight",       "model.layers.3.mlp.experts.0.gate_proj.weight_scale",
-        "model.layers.3.mlp.gate_proj.weight",                 "model.layers.0.mlp.gate.weight",
-        "model.layers.52.input_layernorm.weight",              "model.layers.x.input_layernorm.weight",
+        "model.layers.3.mlp.experts.0.gate_proj.weight",      "model.layers.3.mlp.experts.0.gate_proj.weight_scale",
+        "model.layers.3.mlp.gate_proj.weight",                "model.layers.0.mlp.gate.weight",
+        "model.layers.52.input_layernorm.weight",             "model.layers.x.input_layernorm.weight",
         "model.layers.3.mlp.experts.0.down_proj.input_scale",
     }) |n| try testing.expect(!keptResident(&c, n));
     // 3 + 52 x 12 + 3 x 3 + 49 x 2 tensors.
@@ -1097,11 +1151,11 @@ test "beam graph: the kept residents are the trunk's (no routed expert, no quant
 test "beam graph: the q8 tier keeps each projection's scales and biases, and nothing else's; 270 projections of three tensors" {
     const c: beam.Config = .{ .residents_format = .affine8_g64 };
     for ([_][]const u8{
-        "lm_head.scales",                         "lm_head.biases",                            "model.layers.0.mlp.down_proj.scales",
+        "lm_head.scales",                             "lm_head.biases",                         "model.layers.0.mlp.down_proj.scales",
         "model.layers.51.self_attn.gate_proj.biases", "model.layers.7.self_attn.k_proj.scales", "model.layers.7.self_attn.o_proj.weight",
     }) |n| try testing.expect(keptResident(&c, n));
     for ([_][]const u8{
-        "model.embed_tokens.scales",             "model.layers.3.mlp.gate.scales",     "model.layers.3.mlp.gate_proj.scales",
+        "model.embed_tokens.scales",              "model.layers.3.mlp.gate.scales",          "model.layers.3.mlp.gate_proj.scales",
         "model.layers.5.self_attn.q_norm.scales", "model.layers.52.self_attn.q_proj.biases", "model.layers.3.mlp.experts.0.gate_proj.scales",
     }) |n| try testing.expect(!keptResident(&c, n));
     try testing.expect(!keptResident(&beam.Config{}, "lm_head.scales"));
@@ -1112,6 +1166,9 @@ test "beam graph: the q8 tier keeps each projection's scales and biases, and not
 test "beam graph: the call geometry and the full layers' query scale" {
     try testing.expectEqual(@as(u32, 512), tile_rows);
     try testing.expect(experts.call_rows % tile_rows == 0);
+    // P5: the 16,445-token coding prompt is one call (34 tiles of 512 rows).
+    try testing.expectEqual(@as(u32, 17_408), experts.call_rows);
+    try testing.expect(16_445 <= experts.call_rows);
     // (1 + (p + 1) / 2048) ^ 0.1 at p = 0 and p = 2047: 1.0000488 and 2^0.1.
     const p0 = @exp(beam.ssmax_power * std.math.log1p(@as(f32, 1) / beam.ssmax_base));
     try testing.expectApproxEqRel(@as(f32, 1.0000488), p0, 1e-6);

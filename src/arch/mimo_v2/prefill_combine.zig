@@ -162,6 +162,27 @@ pub const Kernel = struct {
         self.* = .{};
     }
 
+    /// The installed text's first dispatch, at the load (glm5_next's and Beam's prompt warm: its library and pipeline
+    /// are built then, not in the first request): one token's routed positions over one zero source [8, H], the output
+    /// evaluated. `route` is the construction's; the stock reduction has no text and warms nothing.
+    pub fn warmOne(self: *const Kernel, g: *ops.MlxOps, route: Route) !void {
+        if (route != .inplace and route != .fused) return;
+        const m = g.mark();
+        defer g.resetTo(m);
+        const rows = try g.zeros(&.{ @intCast(top_k), @intCast(self.h) }, .bfloat16);
+        try g.evalAll(&.{rows});
+        // Token 0's routed position k reads row k of the one source.
+        var pairs: [2 * top_k]i32 = undefined;
+        for (0..top_k) |k| {
+            pairs[2 * k] = 0;
+            pairs[2 * k + 1] = @intCast(k);
+        }
+        const loc = try g.hostArray(std.mem.sliceAsBytes(&pairs), &.{ 1, @intCast(top_k), 2 }, .int32);
+        const weights = try g.zeros(&.{ 1, @intCast(top_k) }, .float32);
+        const out = if (route == .inplace) try self.callInplace(g, &.{rows}, loc, weights, 1) else try self.call(g, &.{rows}, loc, weights, 1);
+        try g.evalAll(&.{out});
+    }
+
     /// P7 `inplace`: `outs` the wide call's evaluated bf16 sources [r_i, H] (any number up to `inplace_sources`, none
     /// merged), `loc` int32 [nt, 8, 2] each routed position's (source, row), `weights` f32 [nt, 8] -> bf16 [nt, H],
     /// unevaluated. The sources are read through `tbl` (their GPU addresses): the caller keeps them alive until the

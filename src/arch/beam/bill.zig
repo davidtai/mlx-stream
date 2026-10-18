@@ -160,15 +160,21 @@ pub fn moeRowBytes(c: *const beam.Config) u64 {
 /// The prompt pass's wave at its widest call (`t` rows over `keys` keys): the call's stream (the layer's input, its
 /// normed rows, the attention's joined output, the residual's two products and sum, the pre-feedforward rows, the MLP's
 /// output and its norm: 9 rows of hidden), plus the widest stage: P1's predictor over every row, the attention's tiles
-/// in flight, the dense MLP's tiles in flight, or the MoE stage.
+/// in flight, the dense MLP's tiles in flight, or the MoE stage (with the staging rows, P1's early predictor of the
+/// next layer beside it: `graph.nextAhead`).
 pub fn promptWaveBytes(c: *const beam.Config, t: u64, keys: u64) u64 {
     const h: u64 = c.hidden_size;
     const stream = 9 * t * h * bf16;
-    const predictor = t * (h * bf16 + routerRowBytes(c) + @as(u64, c.n_routed_experts) * @as(u64, c.n_experts_per_tok));
+    const predictor = predictorBytes(c, t);
     const attention = @as(u64, graph.tiles_in_flight) * attnTileBytes(c, @min(t, graph.tile_rows), keys);
     const dense = @as(u64, graph.tiles_in_flight) * @as(u64, @min(t, graph.dense_tile_rows)) * denseRowBytes(c);
-    const moe = t * moeRowBytes(c);
+    const moe = t * moeRowBytes(c) + if (experts.prompt_stage_rows > 0) predictor else 0;
     return stream + @max(@max(predictor, attention), @max(dense, moe));
+}
+
+/// P1's predictor over `t` rows (graph.zig `predictedCounts`): the normed rows, the router's row, the counts' mask.
+pub fn predictorBytes(c: *const beam.Config, t: u64) u64 {
+    return t * (@as(u64, c.hidden_size) * bf16 + routerRowBytes(c) + @as(u64, c.n_routed_experts) * @as(u64, c.n_experts_per_tok));
 }
 
 /// The decode wave: a step's graph between two routing barriers (the layers' arrays at one row, the widest attention
@@ -256,6 +262,9 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         .{ .name = "hitpass_luts", .bytes = @splat(if (in.decode_moe == .hitpass) hitpassLutBytes(in) else 0), .at_construction = false },
         // `decode_glue: fused`: the glue's texts, pipelines and configs (glue.zig), declared; 0 under ops.
         .{ .name = "glue_kernels", .bytes = @splat(if (in.decode_glue == .fused) glue_kernels_bytes else 0), .at_construction = true },
+        // P6's staging rows (experts.zig `prompt_stage_rows`): host pages in the prompt phase only (the phase change
+        // frees them with the transient scratch), each component's bank page-rounded.
+        .{ .name = "slot_stage", .bytes = .{ stageBytes(in), 0 }, .at_construction = true },
     };
     return a.dupe(Term, &terms);
 }
@@ -264,6 +273,13 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
 pub fn hitpassLutBytes(in: *const Inputs) u64 {
     const g = in.geometry;
     return shared_experts.devLutBytes(@as(u64, g.first_moe_layer) + g.num_moe_layers, g.num_experts, in.page);
+}
+
+/// P6's staging rows (`experts.prompt_stage_rows`): a slot row each, at the record stride or the line-isolated slot row,
+/// whichever is larger (the transient scratch's rule), and each component's bank rounded to a page.
+pub fn stageBytes(in: *const Inputs) u64 {
+    const g = in.geometry;
+    return @as(u64, experts.prompt_stage_rows) * @max(g.record_bytes, g.slot_row_bytes) + bank.n_components * in.page;
 }
 
 /// The shared route's inputs at this bill's geometry: the NVFP4 tile, the source's own sizes, the decode texts under
@@ -520,6 +536,15 @@ test "beam bill: the q8 tier bills its residents and a dense layer's prompt view
     std.debug.print("\nBEAM BILL q8 (baseline 35.06 GB, ctx 32,768): rows {d}/{d} against bf16's {d}/{d}; prompt_view {d} B\n", .{ r8.prompt, r8.decode, r16.prompt, r16.decode, view[0] });
 }
 
+test "beam bill: P6's staging rows bill the prompt phase only: 64 slot rows at the record stride and a page a component" {
+    const a = testing.allocator;
+    const in = try fixtureInputs(32_768);
+    const b = try billOf(a, &in);
+    defer b.free(a);
+    try testing.expectEqual(@as(u32, 64), experts.prompt_stage_rows);
+    try testing.expectEqual([2]u64{ 64 * 22_122_496 + bank.n_components * 16_384, 0 }, termOf(b, "slot_stage"));
+}
+
 test "beam bill: the keep-warm route bills MiMo's declared engine from construction; the control, none" {
     const a = testing.allocator;
     var in = try fixtureInputs(32_768);
@@ -552,6 +577,8 @@ test "beam bill: the attention tile bills the fused attention's working set and 
         const w = promptWaveBytes(&c, t, keys);
         try testing.expect(w >= 9 * t * c.hidden_size * bf16 + @as(u64, graph.tiles_in_flight) * attnTileBytes(&c, @min(t, graph.tile_rows), keys));
         try testing.expect(w >= t * moeRowBytes(&c));
+        // P1: the next layer's early predictor beside the MoE stage (the staging rows on).
+        try testing.expect(w >= 9 * t * c.hidden_size * bf16 + t * moeRowBytes(&c) + predictorBytes(&c, t));
         try testing.expect(attnTileBytes(&c, 1, keys) >= 2 * keys * c.n_kv_heads * c.head_dim * bf16);
     };
 }
