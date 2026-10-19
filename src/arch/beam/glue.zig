@@ -17,7 +17,10 @@
 //!     request's step under the card's sampling (a top_p filter: sdk_ext/sampler.zig `chosen`, acceptance.zig
 //!     `sampledRows`), MLX's softmax and cumsum over the vocabulary spread over many threadgroups with every sum in
 //!     MLX's order (its single threadgroup's loop is a threadgroup a block here), MLX's sort kept: eight launches and the
-//!     sort for the stock chain's 25 and the sort.
+//!     sort for the stock chain's 25 and the sort;
+//!   - `glue_q8_gemv` (the q8 tier): a decode row's q8 trunk GEMVs (the fused q / k / v / gate, o, a dense layer's gate,
+//!     up and down: `Q8Site`) with MLX's affine_qmv_fast arithmetic row for row, two rows a simdgroup and two
+//!     simdgroups a threadgroup (`q8PlanOf`); the head keeps MLX's qmv.
 //! Stock: the router is the input cast, the GEMV and 17 ops (sigmoid, add, the groups' topk and sum, negation,
 //! argpartition, the group ids, equal, sum, greater, where, negation, argpartition, take_along_axis, sum, add, divide);
 //! the predictor is the cast, the GEMV, sigmoid and add. Exact: the ids, the weights, the predictor's scores, the
@@ -165,6 +168,11 @@ pub const Kernels = struct {
     sample_zi: T = .{ .ctx = null },
     sample_zf: T = .{ .ctx = null },
     vocab: u32 = 0,
+    /// The q8 tier only: the q8 GEMV text and its launch at each trunk site whose shape MLX runs as qmv_fast (`Q8Site`;
+    /// a null config: that site keeps MLX's op), and the sites' (N, K).
+    q8: Kernel = .{ .ctx = null },
+    q8_cfg: [q8_sites]Config = @splat(.{ .ctx = null }),
+    q8_nk: [q8_sites][2]u32 = @splat(.{ 0, 0 }),
     /// The GEMV at M = 1: the router's logits (EPI 0) and the predictor's scores (EPI 1).
     route_cfg: Config = .{ .ctx = null },
     pred_cfg: Config = .{ .ctx = null },
@@ -181,10 +189,10 @@ pub const Kernels = struct {
     eps: f32 = 0,
 
     pub fn deinit(k: *Kernels) void {
-        for ([_]Kernel{ k.gemv, k.select, k.qk, k.add_norm, k.combine, k.sample_temper, k.sample_fold, k.sample_scan, k.sample_onehot }) |x| if (x.ctx != null) {
+        for ([_]Kernel{ k.gemv, k.select, k.qk, k.add_norm, k.combine, k.q8, k.sample_temper, k.sample_fold, k.sample_scan, k.sample_onehot }) |x| if (x.ctx != null) {
             mtl.mlx_fast_metal_kernel_free(x);
         };
-        for ([_]Config{ k.route_cfg, k.pred_cfg, k.add_norm_cfg, k.sample_temper_cfg, k.sample_onehot_cfg } ++ k.select_cfg ++ k.qk_cfg ++ k.combine_cfg ++ k.sample_fold_cfg ++ k.sample_scan_cfg) |cfg| if (cfg.ctx != null) {
+        for ([_]Config{ k.route_cfg, k.pred_cfg, k.add_norm_cfg, k.sample_temper_cfg, k.sample_onehot_cfg } ++ k.select_cfg ++ k.qk_cfg ++ k.combine_cfg ++ k.q8_cfg ++ k.sample_fold_cfg ++ k.sample_scan_cfg) |cfg| if (cfg.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         };
         for ([_]T{ k.consts, k.combine_consts, k.sample_zi, k.sample_zf }) |x| if (x.ctx != null) {
@@ -390,6 +398,16 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const beam.Config, t
     k.combine_consts = mlx.mlx_array_new_data(&cv, &[_]c_int{8}, 1, .float32);
     if (k.combine_consts.ctx == null) return error.MlxError;
     if (sampleRegisters(c.vocab_size)) try installSampler(a, &k, c.vocab_size);
+    if (c.residents_format == .affine8_g64) {
+        k.q8 = try q8Kernel();
+        for (std.enums.values(Q8Site), 0..) |site, i| {
+            const nk = q8ShapeOf(c, site);
+            const plan = q8PlanOf(site);
+            if (!q8Registers(nk[0], nk[1], plan)) continue;
+            k.q8_cfg[i] = try q8Config(nk[0], nk[1], plan);
+            k.q8_nk[i] = nk;
+        }
+    }
     selfCheck(a, s, c, &k, tables, diag) catch |err| {
         // A differing array names itself; any other failure is MLX's (a Metal compile error names the line).
         if (err != error.BeamGlueCheck) {
@@ -716,6 +734,19 @@ pub fn selfCheck(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const beam.Config,
         for ([_]acc.Params{ .{ .temperature = 0.7, .top_p = 0.99, .seed = 1 }, .{ .temperature = 1.0, .top_p = 0.5, .seed = 7 } }) |sm|
             try sameBytes(&g, "the sampler's row", try sampleStockRow(&g, lrow, sm, 1000), try sampleRow(&g, k, lrow, sm, 1000), diag);
     }
+    // The q8 GEMV at each registered site's K and plan: 64 rows of a fixed matrix, quantized, against MLX's qmv.
+    for (k.q8_nk, 0..) |nk, i| if (k.q8_cfg[i].ctx != null) {
+        const ms = g.mark();
+        defer g.resetTo(ms);
+        const plan = q8PlanOf(@enumFromInt(i));
+        const cfg = try q8Config(64, nk[1], plan);
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        const wq = try ops.quantizeAffine(&g, try g.reshape(try checkRow(&g, a, 64 * nk[1]), &.{ 64, @intCast(nk[1]) }), 64, 8);
+        const xq = try checkRow(&g, a, nk[1]);
+        var got: [1]T = undefined;
+        try apply(&g, k.q8, cfg, &.{ xq, wq[0], wq[1], wq[2] }, &got);
+        try sameBytes(&g, "the q8 GEMV", try g.quantizedMatmul(xq, wq[0], wq[1], wq[2], true, 8, 64, .affine), got[0], diag);
+    };
 }
 
 const testing = std.testing;
@@ -784,6 +815,14 @@ test "beam glue: the launch geometry (the GEMV's experts / R threadgroups of 256
     try testing.expectEqual([3]u32{ 151_936, 1, 1 }, Launch.sampleRow(151_936).grid);
     for (sample_vocabs) |v| try testing.expect(v > 2 * sample_block and sampleRegisters(v));
     try testing.expect(!sampleRegisters(8192) and !sampleRegisters(256));
+    // The q8 text's sites at Beam 1.0: each a shape MLX runs as qmv_fast, in whole threadgroups of its plan.
+    const beam1: beam.Config = .{ .residents_format = .affine8_g64 };
+    const want = [q8_sites][2]u32{ .{ 14336, 5120 }, .{ 5120, 6144 }, .{ 20480, 5120 }, .{ 5120, 20480 } };
+    for (std.enums.values(Q8Site), want) |site, nk| {
+        try testing.expectEqual(nk, q8ShapeOf(&beam1, site));
+        try testing.expect(q8Registers(nk[0], nk[1], q8PlanOf(site)));
+    }
+    try testing.expect(!q8Registers(5120, 6144 + 64, q8PlanOf(.o)) and !q8Registers(5124, 6144, q8PlanOf(.o)));
 }
 
 test "beam glue: the sampler texts serve the card's sampling only (a top_p filter in (0, 1), no top_k, no min_p)" {
@@ -857,6 +896,19 @@ test "beam glue: the manifest registers the instantiations the install builds (e
         try testing.expect(temper and onehot);
         for (fold) |f| try testing.expect(f);
         for (scan) |f| try testing.expect(f);
+    }
+    // The q8 text at each site's K and plan (Beam 1.0's q8 tier).
+    const beam1: beam.Config = .{ .residents_format = .affine8_g64 };
+    for (std.enums.values(Q8Site)) |site| {
+        const nk = q8ShapeOf(&beam1, site);
+        const plan = q8PlanOf(site);
+        var found = false;
+        for (m.value.kernels) |kk| for (kk.instances) |inst| {
+            const o = inst.object;
+            if (std.mem.eql(u8, kk.name, "glue_q8_gemv") and o.get("K").?.integer == nk[1] and o.get("ROWS").?.integer == plan.rows and
+                o.get("SPT").?.integer == plan.spt and o.get("PF").?.integer == @intFromBool(plan.pf)) found = true;
+        };
+        try testing.expect(found);
     }
 }
 
@@ -1214,6 +1266,54 @@ pub fn q8Config(n: u32, k: u32, plan: Q8Plan) !Config {
 /// down, the head.
 const q8_shapes = [_][2]u32{ .{ 14336, 5120 }, .{ 5120, 6144 }, .{ 20480, 5120 }, .{ 5120, 20480 }, .{ 151936, 5120 } };
 const q8_plans = [_]Q8Plan{ .{ .rows = 4, .spt = 2, .pf = false }, .{ .rows = 4, .spt = 2, .pf = true }, .{ .rows = 8, .spt = 2, .pf = true }, .{ .rows = 8, .spt = 1, .pf = true }, .{ .rows = 4, .spt = 4, .pf = true }, .{ .rows = 2, .spt = 4, .pf = true }, .{ .rows = 8, .spt = 4, .pf = true }, .{ .rows = 2, .spt = 2, .pf = true } };
+
+/// The trunk's q8 projections a decode step runs through the text (graph.zig `projectRow`): the fused q / k / v / gate,
+/// o, a dense layer's gate and up, its down. The head keeps MLX's qmv (1,132 GB/s in situ: the fold-7 inventory).
+pub const Q8Site = enum { qkvg, o, dense_in, dense_out };
+pub const q8_sites = @typeInfo(Q8Site).@"enum".fields.len;
+
+/// A site's (N, K) at the model's geometry.
+pub fn q8ShapeOf(c: *const beam.Config, site: Q8Site) [2]u32 {
+    const qd = c.n_heads * c.head_dim;
+    const kd = c.n_kv_heads * c.head_dim;
+    return switch (site) {
+        .qkvg => .{ 2 * qd + 2 * kd, c.hidden_size },
+        .o => .{ c.hidden_size, qd },
+        .dense_in => .{ c.intermediate_size, c.hidden_size },
+        .dense_out => .{ c.hidden_size, c.intermediate_size },
+    };
+}
+
+/// The plan each site runs: two rows a simdgroup, two simdgroups a threadgroup, the next block's codes first (the
+/// bench's fastest on both pairs, `beam glue GPU bench: the trunk's q8 GEMVs`, 383cc4d: q / k / v / gate then o 922
+/// GB/s, the dense gate then down 1,011 GB/s, against MLX's qmv at 843 GB/s on the dense pair).
+pub fn q8PlanOf(site: Q8Site) Q8Plan {
+    return switch (site) {
+        .qkvg, .o, .dense_in, .dense_out => .{ .rows = 2, .spt = 2, .pf = true },
+    };
+}
+
+/// The text serves a shape that MLX runs as affine_qmv_fast (quantized.cpp: N a multiple of 8, K of 256: the text keeps
+/// that kernel's arithmetic, not qmv's) in whole simdgroups of the plan.
+pub fn q8Registers(n: u32, k: u32, plan: Q8Plan) bool {
+    return n % 8 == 0 and k % 256 == 0 and n % (plan.rows * plan.spt) == 0;
+}
+
+/// A decode row's product with a q8 projection through the text where its shape registers: x bf16 [1, K], the
+/// projection's codes [N, K / 4] u32, scales and biases [N, K / 64] bf16 -> bf16 [1, N] (MLX's quantized_matmul's bits);
+/// null where no site has the shape (the caller keeps MLX's op).
+pub fn q8Gemv(g: *G, k: *const Kernels, x: T, w: T, scales: T, biases: T) !?T {
+    if (k.q8.ctx == null) return null;
+    const ws = g.shapeOf(w);
+    const n: u32 = @intCast(ws.dim(0));
+    const kk: u32 = @intCast(ws.dim(1) * 4);
+    for (k.q8_nk, k.q8_cfg) |nk, cfg| if (cfg.ctx != null and nk[0] == n and nk[1] == kk) {
+        var out: [1]T = undefined;
+        try apply(g, k.q8, cfg, &.{ x, w, scales, biases }, &out);
+        return out[0];
+    };
+    return null;
+}
 
 fn q8Weights(a: std.mem.Allocator, g: *G, n: u32, k: u32, seed: u64) ![3]T {
     const wt = try testBf16(a, g, &.{ @intCast(n), @intCast(k) }, 0.02, seed);
