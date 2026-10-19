@@ -684,6 +684,35 @@ runs 2 and 3 of an ABBA. In the last four ABBAs, run 2 read 1.7 to 4.2 % less pr
 the prompt's code. Delta 0.2 gives 16 to 18 % more decode than `exact` (mean 37.98 against 32.39 tok/s). Smaller
 deltas are faster and less faithful.
 
+At the shipped defaults (fold 11, 3d09b0d; the same rows, pack and workload, no rule named) the two seeds read 36.83 /
+38.82 tok/s decode, 1,024.2 / 1,051.3 tok/s prefill, 16.47 / 16.05 s TTFT, 236.7 GB peak and 0 pageouts. The texts and
+the rounds (338 / 328) are those of the `typical` 0.2 runs above, bit for bit. The texts are not the `exact` texts: the
+two rules accept different drafts.
+
+The fidelity of each rule over long texts, on the fold-10 bundle, 193 / 203 rows, depth 3: 3 prompts (the coding,
+explainer and prose workloads), 2,048 greedy tokens each. The serial model scores every position of each text in one
+prompt pass (6,144 positions a rule). The excess surprisal of a token is ln p(the top choice) - ln p(the token).
+
+| Rule | Top-1 agreement with the serial model | Mean excess surprisal | Tokens more than 2 nats below the top choice | Tokens outside the top 20 | Repeated 4-grams, first / second half |
+|---|---|---|---|---|---|
+| `exact` | 98.78 % | 0.0016 nats | 0 | 0 | 7.4 / 10.5 % |
+| `typical` 0.2 (the default) | 87.39 % | 0.119 nats | 74 | 1 | 8.3 / 19.4 % |
+| `typical` 0.1 | 87.17 % | 0.158 nats | 167 | 4 | 6.9 / 22.0 % |
+| `typical` 0.05 | 84.64 % | 0.201 nats | 228 | 5 | 11.7 / 20.7 % |
+
+What delta 0.2 costs in fidelity:
+
+- About 1 token in 8 (12.6 %) is not the serial model's top choice. With `exact` it is about 1 token in 80 (1.2 %),
+  and those are near ties.
+- Most of the other choices are near the top: 731 of the 775 are the model's second to fifth choice, and 1 is outside
+  the top 20.
+- 74 of the 6,144 tokens are more than 2 nats below the top choice. `exact` has none.
+- The second half of a text repeats more: 19.4 % of its 4-grams against 10.5 % with `exact`.
+- The cost does not grow along a text: the mean excess surprisal by quarter is 0.135, 0.126, 0.110 and 0.107 nats.
+  All texts run to the 2,048-token cap, and no text ends in a cycle.
+
+The 0.2 values are equal to those of the fold-7 bundle: folds 8 to 10 do not change the lane's bytes.
+
 ### The q8 pack
 
 `Beam-1.0-501B-A23B-NVFP4-q8-mlx-stream` (`--residents q8 --bank-from <the BF16 pack>`: `experts.bin` and its
