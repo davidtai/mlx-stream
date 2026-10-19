@@ -21,9 +21,12 @@ def utc():
 class Journal:
     """`table` is the pin table ({name: {sha256, size}}) the sources are checked against. A missing source is
     downloaded by `download` (fetch.Fetcher's), else refused. `verified` names the work directory's record of the
-    sources already hashed: a second release built into the same pack (the drafter's) keeps its own record."""
+    sources already hashed: a second release built into the same pack (the drafter's) keeps its own record.
+    `lock_fd`: the work directory's lock, already held by this run's other journal (`all` with the drafter step):
+    this journal shares it and does not release it."""
 
-    def __init__(self, *, tool, table, src, out, work=None, disk_margin_gb=10.0, verified="sources-verified.json"):
+    def __init__(self, *, tool, table, src, out, work=None, disk_margin_gb=10.0, verified="sources-verified.json",
+                 lock_fd=None):
         self.tool = tool
         self.table = table
         self.src = Path(src).expanduser().resolve()
@@ -34,18 +37,23 @@ class Journal:
             d.mkdir(parents=True, exist_ok=True)
         if os.stat(self.work).st_dev != os.stat(self.out).st_dev:
             raise PrepError(f"--work {self.work} must be on the same filesystem as --out (outputs are renamed in)")
-        self.lock_fd = os.open(self.work / ".lock", os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(self.lock_fd)
-            raise PrepError(f"another {tool} run holds {self.work / '.lock'}") from None
+        self.owns_lock = lock_fd is None
+        if lock_fd is not None:
+            self.lock_fd = lock_fd
+        else:
+            self.lock_fd = os.open(self.work / ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(self.lock_fd)
+                raise PrepError(f"another {tool} run holds {self.work / '.lock'}") from None
         self.journal_path = self.work / "journal.jsonl"
         self.verified_path = self.work / verified
         self.verified = json.loads(self.verified_path.read_text()) if self.verified_path.exists() else {}
 
     def close(self):
-        os.close(self.lock_fd)
+        if self.owns_lock:
+            os.close(self.lock_fd)
 
     # journal ------------------------------------------------------------------------------------------------------
     def log(self, step, event, **kw):

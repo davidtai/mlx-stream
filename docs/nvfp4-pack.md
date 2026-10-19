@@ -20,8 +20,8 @@ past the page cache. GB are decimal.
 | `expert-manifest.json` | Format `mlx-stream-nvfp4-expert-bank-v1`, layout `nvfp4-gud-9part`: the geometry, the nine parts, each record's offset, length and sha256, the source repository, revision and per-file sha256, and the size and sha256 of `experts.bin`. |
 | `tokenizer.json`, `tokenizer_config.json`, `generation_config.json`, `chat_template.jinja` | Copies of the checkpoint's files. |
 | `expert-usage-v1.json` | Only with `--usage FILE`: the resident seed's profile (`src/sdk_ext/expert/usage.zig`). Per routed layer and expert, the routed count over a set of requests. At the load the server fills each layer's prompt rows with the layer's most used experts, so the first request does not start cold. |
-| `drafter.safetensors`, `drafter-manifest.json` | Optional: the drafter sidecar (see "The drafter sidecar"). A pack has both files or neither. |
-| `pack-sha256.txt` | The sha256 of the other files: nine, one more with `--usage`, two more with the drafter sidecar. |
+| `drafter.safetensors`, `drafter-manifest.json` | The drafter sidecar (see "The drafter sidecar"). A Beam pack needs both: Beam's draft lane is on by default, and a load of a pack without the pair refuses until its settings name `"mtp_lane": false`. A pack has both files or neither. |
+| `pack-sha256.txt` | The sha256 of the other files: nine, one more with `--usage`, two more with the drafter sidecar. A Beam pack lists twelve. |
 
 The `expert_streaming` block in `config.json`:
 
@@ -110,9 +110,15 @@ nearest, logs the tensor and its relative error (1 f32 ulp, at most 1.2e-7), and
 
 ## Making a pack
 
+A Beam pack, in one run: the residents, the bank, the usage seed and the drafter sidecar, then verify.
+
 ```sh
-python3 -I scripts/prepare_nvfp4_pack.py all --family beam --src SRC --out PACK --delete-verified [--fetch-with hf]
+python3 -I scripts/prepare_nvfp4_pack.py all --family beam --src SRC --out PACK --delete-verified \
+    --usage FILE --drafter-src DSRC [--fetch-with hf]
 ```
+
+`DSRC` holds the drafter release (see "The drafter sidecar"). The drafter step runs after config and before verify,
+so verify lists the pair in `pack-sha256.txt` and `--delete-verified` then deletes the parity shard.
 
 The script needs Python 3.8 or later and numpy. It does not use torch, mlx or the GPU. It reads and writes large
 files with `F_NOCACHE`. A journal and state files in `PACK/.prepare` let a run continue after an interruption: run
@@ -141,13 +147,14 @@ The steps of `all`, in order. Each step is also a subcommand.
 5. **config**: `config.json` by the rules above, and the four copied files. With `--usage FILE`, the usage file too:
    the script checks it as the server's load reads it (the v1 form; the pack's `model_type`, routed layers and
    experts), then copies it as `expert-usage-v1.json`.
-6. **verify**: the file set; `config.json`; the manifest; a seeded sample of records (`--samples`, default 16)
+6. **drafter** (with `--drafter-src`): the drafter sidecar (see "The drafter sidecar").
+7. **verify**: the file set; `config.json`; the manifest; a seeded sample of records (`--samples`, default 16)
    against the records made again from the source shards, byte for byte; for three of them, four rows of each
    projection dequantized both ways (the checkpoint's and the bank's, within 2 f32 ulps); every resident tensor's
    sha256 (the read-back and the index's); each resident against its source shard when the shard is in `SRC` (a
    release tensor byte for byte, a q8 projection quantized again to the same bytes, each value within half a scale
-   of the release's); with `--usage`, the pack's usage file against the given file; then `pack-sha256.txt`. With
-   `--delete-verified` it then deletes the keep set.
+   of the release's); with `--usage`, the pack's usage file against the given file; the drafter pair when the pack
+   holds it ("Verify and the drafter"); then `pack-sha256.txt`. With `--delete-verified` it then deletes the keep set.
 
 The script also refuses: a missing or an extra tensor in the index or a shard; an E4M3 block scale that is NaN; a
 quantization that is not NVFP4 with group size 16; a resident linear that `hf_quant_config.json` does not exclude
@@ -210,8 +217,9 @@ With `--pins` the script uses the table's repository and revision and never down
 
 ## The drafter sidecar
 
-The drafter step adds a DFlash2 drafter to a pack, for the draft lane of the arch. The step is not part of `all`. Run
-it on a pack that the steps above made.
+The drafter step adds a DFlash2 drafter to a pack, for the draft lane of the arch. A Beam pack needs it: `all` runs
+the step when `--drafter-src` names the drafter release (Making a pack). The `drafter` subcommand adds the drafter
+to a pack that `all` made without it:
 
 ```sh
 python3 -I scripts/prepare_nvfp4_pack.py drafter --family beam --drafter-src SRC --out PACK \
@@ -321,8 +329,9 @@ a different shape, a `hidden_size` that is not the pack's, a target layer that i
 the pack holds the two files, `verify` does the read-back check of the step again, with the config check against the
 pack's `config.json`. Then `pack-sha256.txt` lists the two files. A pack without the drafter verifies as before.
 
-After the drafter step, run `verify` again to add the two files to `pack-sha256.txt`. `verify` needs a routed shard in
-`SRC` for its parity sample.
+After the `drafter` subcommand, run `verify` again to add the two files to `pack-sha256.txt`. `verify` needs a routed
+shard in `SRC` for its parity sample, so `all --delete-verified` without `--drafter-src` leaves a pack that a later
+`verify` cannot list the pair in until a routed shard is fetched again. `all --drafter-src` has no such step.
 
 ### Sizes and the fixture drafter
 

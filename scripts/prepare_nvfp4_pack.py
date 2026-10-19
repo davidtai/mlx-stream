@@ -23,20 +23,22 @@ The pack is exactly these 9 files, plus pack-sha256.txt:
   config.json, model.safetensors, model.safetensors.index.json, experts.bin, expert-manifest.json, tokenizer.json,
   tokenizer_config.json, generation_config.json, chat_template.jinja
 With --usage FILE it also holds expert-usage-v1.json: the resident seed's profile (src/sdk_ext/expert/usage.zig),
-which the server reads at the load to fill its prompt rows before the first request. Once the drafter step has run,
-it also holds the drafter sidecar: drafter.safetensors and drafter-manifest.json (both or neither). The build's
-journal and state live in a work directory (default OUT/.prepare); delete it once the pack verifies.
+which the server reads at the load to fill its prompt rows before the first request. With the drafter step it also
+holds the drafter sidecar: drafter.safetensors and drafter-manifest.json (both or neither). A Beam pack needs the
+sidecar: Beam's draft lane is on by default, and a load of a pack without the pair refuses until its settings name
+mtp_lane: false. The build's journal and state live in a work directory (default OUT/.prepare); delete it once the
+pack verifies.
 
-Run:
-  python3 -I scripts/prepare_nvfp4_pack.py all --family beam --src SRC --out OUT [--delete-verified] \\
-      [--fetch-with hf]
+Run (a Beam pack: the residents, the bank, the usage seed and the drafter, verified, in one run):
+  python3 -I scripts/prepare_nvfp4_pack.py all --family beam --src SRC --out OUT --delete-verified \\
+      --usage FILE --drafter-src DSRC [--fetch-with hf]
   python3 -I scripts/prepare_nvfp4_pack.py drafter --family beam --drafter-src DSRC --out OUT \\
       [--drafter-pins PINS] [--work DIR]
 
 `all` runs, in order: fetch (the 7 metadata files), the shard pass (residents and bank, one shard at a time, each
-shard fetched when it is needed), residents (rename and index), bank (manifest), config, verify. Each step is also a
-subcommand and resumes from the journal and the state files, so rerunning the same command continues an interrupted
-build.
+shard fetched when it is needed), residents (rename and index), bank (manifest), config, the drafter step (with
+--drafter-src), verify. Each step is also a subcommand and resumes from the journal and the state files, so rerunning
+the same command continues an interrupted build.
   fetch      the Hub tree at the revision (sizes, LFS oids), then resumable HTTP range downloads into SRC (or `hf
              download` with --fetch-with hf), each file's sha256 checked against the pin (`--files meta` fetches only
              the metadata files; `--files all`, the default, every shard too)
@@ -58,13 +60,14 @@ build.
              value within half a scale of the release's), with --usage the pack's usage file against the given one,
              the drafter sidecar when the pack holds it (as the drafter step's read back), then pack-sha256.txt
 
-`drafter` is not part of `all`: it adds the DFlash2 drafter to a built pack (format mlx-stream-dflash2-drafter-v1,
-scripts/packlib/drafter.py). DSRC holds the drafter release's config.json and model.safetensors (README.md optional);
-nothing is downloaded. Each file in DSRC is checked against its pin; the drafter's config (as z-lab dflash reads it)
-against the pack's config.json; its safetensors header against the drafter's tensor set. drafter.safetensors is then
-the release's model.safetensors byte for byte (a hard link on one filesystem, else an uncached copy) and
-drafter-manifest.json carries every tensor's sha256 from one uncached read of it; both are read back. Run verify again
-to list the pair in pack-sha256.txt.
+`drafter` (in `all` with --drafter-src, before verify) adds the DFlash2 drafter to a pack (format
+mlx-stream-dflash2-drafter-v1, scripts/packlib/drafter.py). DSRC holds the drafter release's config.json and
+model.safetensors (README.md optional); nothing is downloaded. Each file in DSRC is checked against its pin; the
+drafter's config (as z-lab dflash reads it) against the pack's config.json; its safetensors header against the drafter's
+tensor set. drafter.safetensors is then the release's model.safetensors byte for byte (a hard link on one filesystem,
+else an uncached copy) and drafter-manifest.json carries every tensor's sha256 from one uncached read of it; both are
+read back. In `all` the verify that follows lists the pair in pack-sha256.txt. On a built pack, run verify again to list
+it (verify needs a routed shard in SRC for its parity sample).
 
 --layers 0-N builds a slice: the first N + 1 layers (from 0, with a full_attention layer), config.json cut to them,
 the embedding, final norm and head kept, the manifest's source pin with "layers": [0, N] (docs/nvfp4-pack.md).
@@ -457,7 +460,7 @@ class DrafterCtx(journal.Journal):
     --drafter-pins) and never downloaded; the pack in --out; the pack's journal in --work, with its own record of the
     drafter files hashed."""
 
-    def __init__(self, a):
+    def __init__(self, a, lock_fd=None):
         self.fam = FAMILIES[a.family]
         if self.fam.refusal:
             raise PrepError(self.fam.refusal)
@@ -465,7 +468,8 @@ class DrafterCtx(journal.Journal):
         self.repo, self.revision, table = fetch.load_pins(path, None if a.drafter_pins else self.fam.drafter_repo,
                                                           self.fam.drafter_revision, drafter.SOURCE_FILES)
         journal.Journal.__init__(self, tool=TOOL, table=table, src=a.drafter_src, out=a.out, work=a.work,
-                                 disk_margin_gb=a.disk_margin_gb, verified="drafter-sources-verified.json")
+                                 disk_margin_gb=a.disk_margin_gb, verified="drafter-sources-verified.json",
+                                 lock_fd=lock_fd)
 
 
 def keep_set(a, plan):
@@ -1037,6 +1041,12 @@ def step_all(a, ctx):
     step_residents(a, ctx, both)
     step_bank(a, ctx, both)
     step_config(a, ctx)
+    if a.drafter_src is not None:  # before verify: it lists the pair, and --delete-verified keeps its parity shard
+        dctx = DrafterCtx(a, lock_fd=ctx.lock_fd)
+        try:
+            step_drafter(a, dctx)
+        finally:
+            dctx.close()
     step_verify(a, ctx)
 
 
@@ -1046,9 +1056,10 @@ STEPS = {
     "bank": (step_bank, "experts.bin + expert-manifest.json: every routed expert as one NVFP4 record"),
     "config": (step_config, "config.json by rule from the release; tokenizer files and template copied"),
     "verify": (step_verify, "file set, manifest, bank parity sample, dequant spot check, residents, pack-sha256.txt"),
-    "all": (step_all, "fetch (metadata), the shard pass, residents, bank, config, verify"),
+    "all": (step_all, "fetch (metadata), the shard pass, residents, bank, config, the drafter (with --drafter-src), "
+                      "verify"),
     "drafter": (step_drafter, "drafter.safetensors + drafter-manifest.json: the DFlash2 drafter as a verified "
-                              "sidecar of a built pack (not in all)"),
+                              "sidecar of a built pack (in all with --drafter-src)"),
 }
 
 
@@ -1065,6 +1076,13 @@ def parse_args(argv):
     g.add_argument("--drafter-src", required=True, metavar="SRC",
                    help="directory of the drafter release's config.json and model.safetensors (README.md optional); "
                         "never downloaded into")
+    g.add_argument("--drafter-pins", metavar="JSON", help="a pin table other than the family's drafter table (a "
+                                                          "synthetic drafter)")
+    in_all = argparse.ArgumentParser(add_help=False)
+    g = in_all.add_argument_group("the drafter release (all: the drafter step before verify)")
+    g.add_argument("--drafter-src", metavar="SRC",
+                   help="directory of the drafter release's config.json and model.safetensors: all runs the drafter "
+                        "step after config, so verify lists the pair in pack-sha256.txt (a Beam pack needs it)")
     g.add_argument("--drafter-pins", metavar="JSON", help="a pin table other than the family's drafter table (a "
                                                           "synthetic drafter)")
     common = argparse.ArgumentParser(add_help=False)
@@ -1103,10 +1121,13 @@ def parse_args(argv):
                                  epilog="Run `<step> --help` for the options.")
     sp = ap.add_subparsers(dest="step", required=True, metavar="step")
     for name, (_, text) in STEPS.items():
-        sp.add_parser(name, parents=[pack, side if name == "drafter" else common], help=text, description=text)
+        parents = [pack, side] if name == "drafter" else [pack, common, in_all] if name == "all" else [pack, common]
+        sp.add_parser(name, parents=parents, help=text, description=text)
     a = ap.parse_args(argv)
     if a.step == "drafter":
         return a
+    if a.step != "all":
+        a.drafter_src = a.drafter_pins = None
     if a.keep_for_parity < 0:
         ap.error("--keep-for-parity must be 0 or more")
     if a.samples < 1:

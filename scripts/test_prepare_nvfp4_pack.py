@@ -867,6 +867,39 @@ def _target(cfg, ts):
     cfg["dflash_config"]["target_layer_ids"] = [1, 3, 7]
 
 
+class AllWithDrafter(unittest.TestCase):
+    """A Beam pack's build in one run: `all --delete-verified --usage FILE --drafter-src DSRC` runs the drafter step
+    after config and before verify, so verify lists the pair (12 files with the usage file) and then deletes the parity
+    shard: the source directory ends with no shard."""
+
+    def test_all_builds_the_drafter_into_the_pack_and_lists_it(self):
+        tmp = Path(tempfile.mkdtemp(prefix="nvfp4-all-drafter-test-"))
+        try:
+            fix, dsrc, pack = tmp / "fix", tmp / "dsrc", tmp / "pack"
+            fx.build(fix, SEED)
+            fx.build_drafter(dsrc, SEED)
+            u = tmp / "u.json"
+            u.write_text(json.dumps(usage_doc()))
+            rc, log = run("all", *build_args(fix, pack, "--delete-verified", "--usage", str(u), "--drafter-src",
+                                             str(dsrc), "--drafter-pins", str(dsrc / fx.PINS)))
+            self.assertEqual(rc, 0, log)
+            self.assertLess(log.index("[drafter] done"), log.index("[verify] drafter"))
+            want = sorted(conv.PACK_FILES + [usage.FILE] + list(drafter.FILES))
+            self.assertEqual(sorted(p.name for p in pack.iterdir() if p.name not in (".prepare", "pack-sha256.txt")),
+                             want)
+            sums = dict(reversed(ln.split("  ")) for ln in (pack / "pack-sha256.txt").read_text().splitlines())
+            self.assertEqual((sorted(sums), len(sums)), (want, 12))
+            for name in want:
+                self.assertEqual(sums[name], hashlib.sha256((pack / name).read_bytes()).hexdigest(), name)
+            self.assertEqual(sorted(p.name for p in fix.glob("*.safetensors")), [])
+            # The run released its lock: the next run takes it.
+            rc, log = run("verify", *build_args(fix, pack, "--usage", str(u)))
+            self.assertEqual(rc, 1, log)
+            self.assertIn("no routed shard in", log)
+        finally:
+            shutil.rmtree(tmp)
+
+
 class Drafter(unittest.TestCase):
     """The tiny DFlash2 drafter (beam_fixture.py --drafter) through the drafter step into a fixture pack (`all`, the
     shards kept for verify): the manifest against the file, verify with the pair and without it, the copy, the rerun,
