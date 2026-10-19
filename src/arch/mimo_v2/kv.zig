@@ -348,7 +348,7 @@ pub const RingOps = struct {
     n: usize = 0,
     /// The lanes' row writes: MLX's dynamic slice update (false: the SDK's `write` as MiMo runs it), or its static one
     /// (`sliceUpdateRow`: one copy kernel an append, the dynamic update's offset kernel gone; the same bytes at the same
-    /// place). The ring's own setting (`SlidingRing.static_rows`).
+    /// place). Set per append by the ring (`SlidingRing.static_max_rows`).
     static_rows: bool = false,
 
     pub const Shape = struct {
@@ -479,8 +479,9 @@ pub const SlidingRing = struct {
     k: Lane = empty,
     v: Lane = empty,
     s: Stream = .{},
-    /// The appends' row writes (`RingOps.static_rows`): false for MiMo and the drafter, true for Beam's decode lanes.
-    static_rows: bool = false,
+    /// The appends of at most this many rows write with MLX's static slice update (`RingOps.static_rows`); larger ones
+    /// with the dynamic update. 0 (MiMo, the drafter): every append dynamic. Beam's: its decode lane's rows.
+    static_max_rows: u32 = 0,
 
     /// Construction: both slots of both lanes at the ring base (lazy zeros,
     /// materialized by the first write that reaches each slot).
@@ -536,7 +537,7 @@ pub const SlidingRing = struct {
         const s = r.s;
         const pos = r.k.logicalLen();
         {
-            var g: RingOps = .{ .s = s, .static_rows = r.static_rows };
+            var g: RingOps = .{ .s = s, .static_rows = n <= r.static_max_rows };
             defer g.reset();
             try r.k.append(&g, k);
             try r.v.append(&g, v);

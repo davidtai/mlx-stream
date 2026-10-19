@@ -449,9 +449,13 @@ fn headBias(s: mlx.mlx_stream, b: T, dt: mlx.mlx_dtype) !T {
 
 // ── The decode state ──
 
+/// A decode-lane call's rows at most (`experts.decode_lane_rows`): its KV writes take MLX's static slice update (one copy
+/// kernel a write); a prompt tile's keep the dynamic update (the start array, its offset kernel and the copy).
+const static_kv_rows: u32 = experts.decode_lane_rows;
+
 /// A full layer's K and V slabs [1, kv heads, cap, head_dim] bf16, allocated once at the billed positions, written by
-/// position (MLX's static slice_update: in place when the slab is the only reference, as it is between steps; one copy
-/// kernel a write).
+/// position (MLX's slice_update, static on a decode-lane call: in place when the slab is the only reference, as it is
+/// between steps).
 pub const Slab = struct {
     k: ?T = null,
     v: ?T = null,
@@ -465,9 +469,18 @@ pub const Slab = struct {
     /// Writes `n` rows at `pos` and returns the views [0, pos + n) (scoped to the caller's mark).
     fn append(self: *Slab, g: *G, k: T, v: T, pos: u32, n: u32) !struct { k: T, v: T } {
         const sk = g.shapeOf(self.k.?);
-        const start = [4]c_int{ 0, 0, @intCast(pos), 0 };
-        const nk = try sliceUpdateAt(g, self.k.?, k, start);
-        const nv = try sliceUpdateAt(g, self.v.?, v, start);
+        var nk: T = undefined;
+        var nv: T = undefined;
+        if (n <= static_kv_rows) {
+            const start = [4]c_int{ 0, 0, @intCast(pos), 0 };
+            nk = try sliceUpdateAt(g, self.k.?, k, start);
+            nv = try sliceUpdateAt(g, self.v.?, v, start);
+        } else {
+            const start = [_]i32{ 0, 0, @intCast(pos), 0 };
+            const st = try g.hostArray(std.mem.sliceAsBytes(&start), &.{4}, .int32);
+            nk = try g.sliceUpdateDyn(self.k.?, k, st);
+            nv = try g.sliceUpdateDyn(self.v.?, v, st);
+        }
         const end: c_int = @intCast(pos + n);
         const view_k = try g.slice(nk, &.{ 0, 0, 0, 0 }, &.{ sk.d[0], sk.d[1], end, sk.d[3] }, &.{ 1, 1, 1, 1 });
         const view_v = try g.slice(nv, &.{ 0, 0, 0, 0 }, &.{ sk.d[0], sk.d[1], end, sk.d[3] }, &.{ 1, 1, 1, 1 });
@@ -493,8 +506,8 @@ fn sliceUpdateAt(g: *G, src: T, update: T, start: [4]c_int) !T {
 }
 
 /// The decode state of one request: each sliding layer's ring (MiMo's BF16 window ring over the SDK lanes,
-/// `mimo_v2/kv.zig` `SlidingRing`, its rows written by MLX's static slice update), each full layer's slab, bounded at
-/// `cap` positions.
+/// `mimo_v2/kv.zig` `SlidingRing`, a decode-lane call's rows written by MLX's static slice update), each full layer's
+/// slab, bounded at `cap` positions.
 pub const Cache = struct {
     a: std.mem.Allocator,
     rings: []kv.SlidingRing,
@@ -509,7 +522,7 @@ pub const Cache = struct {
         errdefer for (rings[0..n_rings]) |*r| r.deinit();
         for (rings) |*r| {
             r.* = try kv.SlidingRing.allocate(c.n_kv_heads, c.head_dim, c.head_dim, c.sliding_window, g.s);
-            r.static_rows = true;
+            r.static_max_rows = static_kv_rows;
             n_rings += 1;
         }
         const slabs = try a.alloc(Slab, c.nFull());
@@ -1470,7 +1483,7 @@ test "beam graph GPU: the decode lanes' static row writes are the dynamic ones b
     var rings: [2]kv.SlidingRing = undefined;
     for (&rings, 0..) |*r, i| {
         r.* = try kv.SlidingRing.allocate(c.n_kv_heads, c.head_dim, c.head_dim, c.sliding_window, g.s);
-        r.static_rows = i == 1;
+        r.static_max_rows = if (i == 1) std.math.maxInt(u32) else 0;
     }
     defer for (&rings) |*r| r.deinit();
     // A prompt's tiles (the slot holds 1,040 rows: the third tile compacts), then 1,100 decode rows (two more
