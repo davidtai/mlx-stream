@@ -14,7 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 KDIR = os.path.join(HERE, "..", "src", "kernels", "decode_glue")
 
 HEADERS = [("decode_glue", "header_decode_glue.metal"), ("decode_glue_combine", "header_decode_glue_combine.metal"),
-           ("decode_glue_q8", "header_decode_glue_q8.metal")]
+           ("decode_glue_q8", "header_decode_glue_q8.metal"), ("decode_glue_sample", "header_decode_glue_sample.metal")]
 # The decode lane's rows (beam experts.zig `decode_lane_rows`): the select text's launches at M = 1 .. 4.
 LANE_ROWS = 4
 
@@ -75,6 +75,36 @@ Q8_PLANS = [(4, 2, 0), (4, 2, 1), (8, 2, 1), (8, 1, 1), (4, 4, 1), (2, 4, 1), (8
 Q8_K = [5120, 6144, 20480]
 
 
+# The sampler texts' vocabularies (beam glue.zig `sample_vocabs`: past 8,192, MLX's 1,024-thread scan and looped
+# softmax) and the elementwise texts' threadgroup (`sample_row_threads`).
+SAMPLE_VOCABS = [151936]
+SAMPLE_ROW_THREADS = 256
+
+
+def sample_texts(vocabs):
+    """The sampler's four texts at each vocabulary: the temper, the fold (MODE 0 the filter's softmax, 1 the draw's), the
+    scan (MODE x STAGE 0 the blocks' carries, 1 the counts; DBG 1 is the device test's, not installed), the one-hot."""
+    nb = "ceil(V/4096)"
+    rows = arg("lt", "float32", [1, "V"]), arg("sorted", "float32", [1, "V"]), arg("cnt", "int32", [nb])
+    return [
+        {"name": "glue_sample_temper", "headers": ["decode_glue_sample"], "template": ["V"],
+         "inputs": [arg("x", "float32", [1, "V"]), arg("consts", "float32", [8])],
+         "outputs": [arg("lt", "float32", [1, "V"]), arg("nlt", "float32", [1, "V"])], "grid": ["V", 1, 1],
+         "threadgroup": [SAMPLE_ROW_THREADS, 1, 1], "instances": [{"V": v} for v in vocabs]},
+        {"name": "glue_sample_fold", "headers": ["decode_glue_sample"], "template": ["V", "MODE"], "inputs": list(rows),
+         "outputs": [arg("part", "float32", [64])], "grid": [1024, 1, 1], "threadgroup": [32, 1, 1],
+         "instances": [{"V": v, "MODE": m} for v in vocabs for m in (0, 1)]},
+        {"name": "glue_sample_scan", "headers": ["decode_glue_sample"], "template": ["V", "MODE", "STAGE", "DBG"],
+         "inputs": list(rows) + [arg("part", "float32", [64]), arg("tri", "float32", ["3*%s+3" % nb]), arg("consts", "float32", [8])],
+         "outputs": [arg("tri_out", "float32", ["3*%s+3" % nb]), arg("cnt_out", "int32", [nb]), arg("dbg", "float32", [1, "DBG?V:1"])],
+         "grid": ["1024*%s" % nb, 1, 1], "threadgroup": [1024, 1, 1],
+         "instances": [{"V": v, "MODE": m, "STAGE": st, "DBG": 0} for v in vocabs for m in (0, 1) for st in (0, 1)]},
+        {"name": "glue_sample_onehot", "headers": ["decode_glue_sample"], "template": ["V"], "inputs": [arg("cnt", "int32", [nb])],
+         "outputs": [arg("out", "float32", [1, "V"])], "grid": ["V", 1, 1], "threadgroup": [SAMPLE_ROW_THREADS, 1, 1],
+         "instances": [{"V": v} for v in vocabs]},
+    ]
+
+
 # The q / k norm text's heads a threadgroup (beam glue.zig `heads_per_group`).
 HEADS_PER_GROUP = 8
 # The combine text's columns a threadgroup (beam glue.zig `combine_threads`).
@@ -118,7 +148,8 @@ def build(case):
     m = {"format": "mlx-stream-decode-glue-kernels-v1", "case": case, "headers": [dict(id=i, **text(f)) for i, f in HEADERS],
          "kernels": []}
     q8v = [{"K": k, "ROWS": r, "SPT": t, "PF": f} for k in Q8_K for r, t, f in Q8_PLANS] if case == "beam" else []
-    for k in (gemv(gv), select(sv), qk_norm(qv), add_norm(av), combine(cv), q8_gemv(q8v)):
+    sample = sample_texts(SAMPLE_VOCABS if case == "beam" else [])
+    for k in [gemv(gv), select(sv), qk_norm(qv), add_norm(av), combine(cv), q8_gemv(q8v)] + sample:
         m["kernels"].append(dict(k, source=text(k["name"] + ".metal")))
     return (json.dumps(m, separators=(",", ":"), sort_keys=True) + "\n").encode()
 

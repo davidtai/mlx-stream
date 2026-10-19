@@ -112,7 +112,7 @@ pub const Module = struct {
                 return e;
             };
             self.routes.glue = &self.glue_kernels;
-            log.info("beam decode glue installed: q/k/v/gate one GEMV, q/k norms and RoPE (or the query scale) one launch, each sublayer boundary one launch, router {d} threadgroups + select, predictor {d} threadgroups (decode_glue=fused); self-check passed\n", .{ model.n_routed_experts / glue.rows_per_group, model.n_routed_experts / glue.rows_per_group });
+            log.info("beam decode glue installed: q/k/v/gate one GEMV, q/k norms and RoPE (or the query scale) one launch, each sublayer boundary one launch, router {d} threadgroups + select, predictor {d} threadgroups, a routed decode call's join + combine + scale one launch, the sampler's row {s} (decode_glue=fused); self-check passed\n", .{ model.n_routed_experts / glue.rows_per_group, model.n_routed_experts / glue.rows_per_group, if (self.glue_kernels.vocab != 0) "8 launches + MLX's sort (top_p)" else "the stock chain" });
         }
         errdefer self.glue_kernels.deinit();
         // The expert source at the plan's rows, split between the routed layers at the same total (`layerSplit`: the
@@ -275,6 +275,21 @@ pub const Module = struct {
         self.decode = .{ .active = true, .s0 = self.src.stats(), .prompt_tokens = prompt_tokens };
         // The lane's receipt reads the stream's misses and bytes over the decode.
         if (self.lane) |l| l.stats.base.stream_start = self.decode.s0;
+    }
+
+    /// The plugin's row for `logits` (owned) predicting absolute position `pos` (sdk_ext/sampler.zig `chosen`): through
+    /// the decode glue's sampler texts when they serve the bound request (`glue.sampleServes`: the card's top_p filter),
+    /// else the sampler's own graph. The same row either way, bit for bit (the install's self-check, the device tests).
+    pub fn chosen(self: *Module, logits: T, pos: u64) !T {
+        const sm = self.sampler.active orelse return logits;
+        const k = self.routes.glue orelse return self.sampler.chosen(logits, pos);
+        if (!glue.sampleServes(k, sm)) return self.sampler.chosen(logits, pos);
+        const g = &self.sampler.g;
+        defer g.reset();
+        const row = try g.reshape(logits, &.{ 1, @intCast(k.vocab) });
+        const out = g.keep(try glue.sampleRow(g, k, row, sm, pos));
+        _ = mlx.mlx_array_free(logits);
+        return out;
     }
 
     /// A serial step (or a short extend) after the committed positions: the last row's logits f32 [1, vocab]. A step

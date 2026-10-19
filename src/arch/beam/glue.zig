@@ -12,7 +12,12 @@
 //!     depth-scaled add, the next sublayer's norm);
 //!   - `glue_moe_combine`: a decode-lane call's routed combine with the scheduler's join folded in and the routed scale
 //!     (the join's take, route.zig `combineStock`'s cast, product, sum and cast, graph.zig ScaleBy: six launches), the
-//!     routed rows read in place through the join's order.
+//!     routed rows read in place through the join's order;
+//!   - `glue_sample_temper`, `glue_sample_fold`, `glue_sample_scan`, `glue_sample_onehot`: the plugin's row for a bound
+//!     request's step under the card's sampling (a top_p filter: sdk_ext/sampler.zig `chosen`, acceptance.zig
+//!     `sampledRows`), MLX's softmax and cumsum over the vocabulary spread over many threadgroups with every sum in
+//!     MLX's order (its single threadgroup's loop is a threadgroup a block here), MLX's sort kept: eight launches and the
+//!     sort for the stock chain's 25 and the sort.
 //! Stock: the router is the input cast, the GEMV and 17 ops (sigmoid, add, the groups' topk and sum, negation,
 //! argpartition, the group ids, equal, sum, greater, where, negation, argpartition, take_along_axis, sum, add, divide);
 //! the predictor is the cast, the GEMV, sigmoid and add. Exact: the ids, the weights, the predictor's scores, the
@@ -30,6 +35,8 @@ const kset = @import("../../sdk_ext/kernel_set.zig");
 const mimo_math = @import("../mimo_v2/math.zig");
 const route = @import("../mimo_v2/route.zig");
 const beam = @import("config.zig");
+const acc = @import("../../sdk_ext/acceptance.zig");
+const sampler = @import("../../sdk_ext/sampler.zig");
 
 pub const G = ops.MlxOps;
 pub const T = G.T;
@@ -47,6 +54,14 @@ pub const gemv_threads: u32 = 256;
 pub const heads_per_group: u32 = 8;
 /// The combine text's columns a threadgroup (one thread a column of a row; a narrower model takes one threadgroup).
 pub const combine_threads: u32 = 256;
+/// The vocabularies the sampler texts register (Beam 1.0's): each past 8,192, where MLX's cumsum takes its 1,024-thread
+/// threadgroup (scan.cpp: 4 values a thread, a 4,096-value block a loop iteration) and its softmax the looped kernel
+/// (past 4,096: softmax.cpp, the same 1,024 threads and blocks).
+pub const sample_vocabs = [_]u32{151_936};
+/// MLX's scan and looped softmax block: 1,024 threads of 4 values.
+pub const sample_block: u32 = 4096;
+/// The sampler's elementwise texts' threadgroup.
+pub const sample_row_threads: u32 = 256;
 
 // ── the texts and their pins (src/kernels/decode_glue/manifest_beam.json) ──
 
@@ -63,10 +78,15 @@ pub const texts = struct {
     pub const combine = @embedFile(dir ++ "glue_moe_combine.metal");
     pub const header_q8 = @embedFile(dir ++ "header_decode_glue_q8.metal");
     pub const q8 = @embedFile(dir ++ "glue_q8_gemv.metal");
+    pub const header_sample = @embedFile(dir ++ "header_decode_glue_sample.metal");
+    pub const sample_temper = @embedFile(dir ++ "glue_sample_temper.metal");
+    pub const sample_fold = @embedFile(dir ++ "glue_sample_fold.metal");
+    pub const sample_scan = @embedFile(dir ++ "glue_sample_scan.metal");
+    pub const sample_onehot = @embedFile(dir ++ "glue_sample_onehot.metal");
 };
 /// sha256 of manifest_beam.json (scripts/decode_glue_manifest.py prints it), which records every text's sha256 (checked
 /// against the pins by a CPU test).
-pub const manifest_sha256 = "439d0923180468f6822b9cac3ad16a14562a59c71d572faeadbf685b9b9992e2";
+pub const manifest_sha256 = "fc00cf4574be7256aee6ec19b12af277a0e923c1bac16be60ec445e9ace5255b";
 pub const text_pins = [_]kset.TextPin{
     .{ .file = "header_decode_glue.metal", .text = texts.header, .sha256 = "6bec0858b4e0754c74a4eee95560bd78f0942ecc092cc50d50bcc7840977e484" },
     .{ .file = "glue_router_gemv.metal", .text = texts.gemv, .sha256 = "1c82d26867b1c277adb2ca003200f6c05c3ecc396126b74ac571854b202bdcb7" },
@@ -77,6 +97,11 @@ pub const text_pins = [_]kset.TextPin{
     .{ .file = "glue_moe_combine.metal", .text = texts.combine, .sha256 = "836812cc11442c1494947afb502862303caf5a244c1dcb7fbd67a61e0914fb5d" },
     .{ .file = "header_decode_glue_q8.metal", .text = texts.header_q8, .sha256 = "e4273595fa3f04409b6fd06d3ae0628f322181000fce9f75ef244dbaebb4d7d8" },
     .{ .file = "glue_q8_gemv.metal", .text = texts.q8, .sha256 = "b1f432fda5cec73ab5a8d0e60606e51a5ae9f1aa9bb92cd28ea630ec1855bbd6" },
+    .{ .file = "header_decode_glue_sample.metal", .text = texts.header_sample, .sha256 = "d27e66ea7eb6d7f9098771bd16b3b4aecafd13ad8538eee4a040c80f8df42511" },
+    .{ .file = "glue_sample_temper.metal", .text = texts.sample_temper, .sha256 = "a4cac7a90078741fba8448e5e0b6f6ba9c7926f644e5873a06da5dbca5069937" },
+    .{ .file = "glue_sample_fold.metal", .text = texts.sample_fold, .sha256 = "db8131c014d288c844a730d33c0f54940bc56ecaa596456e54fcc0bc61a2a11d" },
+    .{ .file = "glue_sample_scan.metal", .text = texts.sample_scan, .sha256 = "370fae24746a9d4c474c599379535731488f98bcb290d1804a84e9ff0c0dfd85" },
+    .{ .file = "glue_sample_onehot.metal", .text = texts.sample_onehot, .sha256 = "bc0c2c7e4c958f17fb66189e0d03925046430d0daab0f169e4aea255ba4d1f3c" },
 };
 
 pub fn checkPins() !void {
@@ -124,6 +149,22 @@ pub const Kernels = struct {
     combine_cfg: [max_rows]Config = @splat(.{ .ctx = null }),
     /// f32 [8]: the routed scale (graph.zig ScaleBy's factor, `routed_scaling_factor`), then zeros.
     combine_consts: T = .{ .ctx = null },
+    /// The sampler texts at the model's vocabulary (`vocab`; 0: not one `sample_vocabs` registers, the sampler's own
+    /// graph serves): the temper, the fold (MODE 0 the filter's softmax, 1 the draw's), the scan (index 2 MODE + STAGE)
+    /// and the one-hot.
+    sample_temper: Kernel = .{ .ctx = null },
+    sample_fold: Kernel = .{ .ctx = null },
+    sample_scan: Kernel = .{ .ctx = null },
+    sample_onehot: Kernel = .{ .ctx = null },
+    sample_temper_cfg: Config = .{ .ctx = null },
+    sample_fold_cfg: [2]Config = @splat(.{ .ctx = null }),
+    sample_scan_cfg: [4]Config = @splat(.{ .ctx = null }),
+    sample_onehot_cfg: Config = .{ .ctx = null },
+    /// The inputs a stage reads nothing from: int32 [blocks] (the filter's counts) and f32 [3 blocks + 3] (stage 0's
+    /// carries), zeros.
+    sample_zi: T = .{ .ctx = null },
+    sample_zf: T = .{ .ctx = null },
+    vocab: u32 = 0,
     /// The GEMV at M = 1: the router's logits (EPI 0) and the predictor's scores (EPI 1).
     route_cfg: Config = .{ .ctx = null },
     pred_cfg: Config = .{ .ctx = null },
@@ -140,13 +181,13 @@ pub const Kernels = struct {
     eps: f32 = 0,
 
     pub fn deinit(k: *Kernels) void {
-        for ([_]Kernel{ k.gemv, k.select, k.qk, k.add_norm, k.combine }) |x| if (x.ctx != null) {
+        for ([_]Kernel{ k.gemv, k.select, k.qk, k.add_norm, k.combine, k.sample_temper, k.sample_fold, k.sample_scan, k.sample_onehot }) |x| if (x.ctx != null) {
             mtl.mlx_fast_metal_kernel_free(x);
         };
-        for ([_]Config{ k.route_cfg, k.pred_cfg, k.add_norm_cfg } ++ k.select_cfg ++ k.qk_cfg ++ k.combine_cfg) |cfg| if (cfg.ctx != null) {
+        for ([_]Config{ k.route_cfg, k.pred_cfg, k.add_norm_cfg, k.sample_temper_cfg, k.sample_onehot_cfg } ++ k.select_cfg ++ k.qk_cfg ++ k.combine_cfg ++ k.sample_fold_cfg ++ k.sample_scan_cfg) |cfg| if (cfg.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         };
-        for ([_]T{ k.consts, k.combine_consts }) |x| if (x.ctx != null) {
+        for ([_]T{ k.consts, k.combine_consts, k.sample_zi, k.sample_zf }) |x| if (x.ctx != null) {
             _ = mlx.mlx_array_free(x);
         };
         k.* = .{};
@@ -192,7 +233,32 @@ pub const Launch = struct {
     pub fn combine(hidden: u32, rows: u32) Launch {
         return .{ .grid = .{ hidden, rows, 1 }, .group = .{ @min(hidden, combine_threads), 1, 1 } };
     }
+
+    /// The sampler's temper and one-hot: a thread a value of the row, `sample_row_threads` a threadgroup.
+    pub fn sampleRow(vocab: u32) Launch {
+        return .{ .grid = .{ vocab, 1, 1 }, .group = .{ sample_row_threads, 1, 1 } };
+    }
+
+    /// The sampler's fold: MLX's 1,024 softmax threads, a simdgroup a threadgroup (MLX's simdgroup s is threadgroup s).
+    pub fn sampleFold() Launch {
+        return .{ .grid = .{ 1024, 1, 1 }, .group = .{ 32, 1, 1 } };
+    }
+
+    /// The sampler's scan: a 1,024-thread threadgroup a block of `sample_block` values (MLX's loop iteration).
+    pub fn sampleScan(vocab: u32) Launch {
+        return .{ .grid = .{ 1024 * sampleBlocks(vocab), 1, 1 }, .group = .{ 1024, 1, 1 } };
+    }
 };
+
+/// The blocks of MLX's scan and looped softmax over a row of `vocab` values.
+pub fn sampleBlocks(vocab: u32) u32 {
+    return (vocab + sample_block - 1) / sample_block;
+}
+
+/// The sampler texts serve a model of this vocabulary (`sample_vocabs`).
+pub fn sampleRegisters(vocab: u32) bool {
+    return std.mem.indexOfScalar(u32, &sample_vocabs, vocab) != null;
+}
 
 /// MLX's rms threadgroup at width `d` (normalization.cpp RMSNorm::eval_gpu): rms_looped's 1,024 threads past
 /// RMS_LOOPED_LIMIT (4,096), else rms_single_row's 32 x ceil(d / 128).
@@ -247,6 +313,41 @@ fn selectConfig(geo: Geometry, rows: u32) !Config {
     return kset.buildConfig(.{ .grid = l.grid, .threadgroup = l.group, .out_shapes = &.{ &shape, &shape }, .out_dtypes = &.{ .uint32, .float32 }, .template = &t });
 }
 
+fn sampleTemperConfig(vocab: u32) !Config {
+    const l = Launch.sampleRow(vocab);
+    const shape = [_]c_int{ 1, @intCast(vocab) };
+    const t = templateOf(&.{"V"}, .{@intCast(vocab)});
+    return kset.buildConfig(.{ .grid = l.grid, .threadgroup = l.group, .out_shapes = &.{ &shape, &shape }, .out_dtypes = &.{ .float32, .float32 }, .template = &t });
+}
+
+fn sampleFoldConfig(vocab: u32, mode: i32) !Config {
+    const l = Launch.sampleFold();
+    const shape = [_]c_int{64};
+    const t = templateOf(&.{ "V", "MODE" }, .{ @intCast(vocab), mode });
+    return kset.buildConfig(.{ .grid = l.grid, .threadgroup = l.group, .out_shapes = &.{&shape}, .out_dtypes = &.{.float32}, .template = &t });
+}
+
+/// The scan at MODE and STAGE; `dbg`: the device test's (every scan output into its third output, [1, vocab]; else [1, 1],
+/// unwritten).
+fn sampleScanConfig(vocab: u32, mode: i32, stage: i32, dbg: bool) !Config {
+    const l = Launch.sampleScan(vocab);
+    const nb: c_int = @intCast(sampleBlocks(vocab));
+    const tri = [_]c_int{3 * nb + 3};
+    const cnt = [_]c_int{nb};
+    const dbg_one = [_]c_int{ 1, 1 };
+    const dbg_row = [_]c_int{ 1, @intCast(vocab) };
+    const t = templateOf(&.{ "V", "MODE", "STAGE", "DBG" }, .{ @intCast(vocab), mode, stage, @intFromBool(dbg) });
+    const dshape: []const c_int = if (dbg) &dbg_row else &dbg_one;
+    return kset.buildConfig(.{ .grid = l.grid, .threadgroup = l.group, .out_shapes = &.{ &tri, &cnt, dshape }, .out_dtypes = &.{ .float32, .int32, .float32 }, .template = &t });
+}
+
+fn sampleOnehotConfig(vocab: u32) !Config {
+    const l = Launch.sampleRow(vocab);
+    const shape = [_]c_int{ 1, @intCast(vocab) };
+    const t = templateOf(&.{"V"}, .{@intCast(vocab)});
+    return kset.buildConfig(.{ .grid = l.grid, .threadgroup = l.group, .out_shapes = &.{&shape}, .out_dtypes = &.{.float32}, .template = &t });
+}
+
 /// The model's tables the self-check runs over (construction only): the first routed layer's router (its F32 weight
 /// and correction bias), the next routed layer's (the predictor's), the first layer's q_norm and k_norm, and its
 /// post-attention and pre-feedforward norms.
@@ -288,6 +389,7 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const beam.Config, t
     cv[0] = c.routed_scaling;
     k.combine_consts = mlx.mlx_array_new_data(&cv, &[_]c_int{8}, 1, .float32);
     if (k.combine_consts.ctx == null) return error.MlxError;
+    if (sampleRegisters(c.vocab_size)) try installSampler(a, &k, c.vocab_size);
     selfCheck(a, s, c, &k, tables, diag) catch |err| {
         // A differing array names itself; any other failure is MLX's (a Metal compile error names the line).
         if (err != error.BeamGlueCheck) {
@@ -299,8 +401,34 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const beam.Config, t
     return k;
 }
 
+/// The sampler texts at `vocab` into `k` (past MLX's 8,192: install's at a `sample_vocabs` model, the device tests' at
+/// others): the kernel objects, the launches, the zero inputs.
+fn installSampler(a: std.mem.Allocator, k: *Kernels, vocab: u32) !void {
+    std.debug.assert(vocab > 2 * sample_block);
+    k.vocab = vocab;
+    k.sample_temper = try newKernel("beam_glue_sample_temper", &.{ "x", "consts" }, &.{ "lt", "nlt" }, texts.sample_temper, texts.header_sample);
+    k.sample_fold = try newKernel("beam_glue_sample_fold", &.{ "lt", "sorted", "cnt" }, &.{"part"}, texts.sample_fold, texts.header_sample);
+    k.sample_scan = try newKernel("beam_glue_sample_scan", &.{ "lt", "sorted", "cnt", "part", "tri", "consts" }, &.{ "tri_out", "cnt_out", "dbg" }, texts.sample_scan, texts.header_sample);
+    k.sample_onehot = try newKernel("beam_glue_sample_onehot", &.{"cnt"}, &.{"out"}, texts.sample_onehot, texts.header_sample);
+    k.sample_temper_cfg = try sampleTemperConfig(vocab);
+    for (&k.sample_fold_cfg, 0..) |*cfg, mode| cfg.* = try sampleFoldConfig(vocab, @intCast(mode));
+    for (&k.sample_scan_cfg, 0..) |*cfg, i| cfg.* = try sampleScanConfig(vocab, @intCast(i / 2), @intCast(i % 2), false);
+    k.sample_onehot_cfg = try sampleOnehotConfig(vocab);
+    const nb = sampleBlocks(vocab);
+    const zi = try a.alloc(i32, nb);
+    defer a.free(zi);
+    @memset(zi, 0);
+    k.sample_zi = mlx.mlx_array_new_data(zi.ptr, &[_]c_int{@intCast(nb)}, 1, .int32);
+    if (k.sample_zi.ctx == null) return error.MlxError;
+    const zf = try a.alloc(f32, 3 * nb + 3);
+    defer a.free(zf);
+    @memset(zf, 0);
+    k.sample_zf = mlx.mlx_array_new_data(zf.ptr, &[_]c_int{@intCast(3 * nb + 3)}, 1, .float32);
+    if (k.sample_zf.ctx == null) return error.MlxError;
+}
+
 fn apply(g: *G, kernel: Kernel, cfg: Config, inputs: []const T, outs: []T) !void {
-    var raw: [2]T = undefined;
+    var raw: [3]T = undefined;
     try kset.applyConfig(kernel, cfg, inputs, raw[0..outs.len], g.s);
     for (outs, raw[0..outs.len]) |*o, x| o.* = try g.adopt(x);
 }
@@ -398,6 +526,60 @@ pub fn combineStockRows(g: *G, c: *const beam.Config, rows: T, order: T, weights
     const graph = @import("graph.zig");
     const joined = try g.reshape(try g.take(rows, order, 0), &.{ @intCast(n), @intCast(c.n_experts_per_tok), @intCast(c.hidden_size) });
     return graph.scaleBy(g, try route.combineStock(g, joined, weights, c.n_experts_per_tok), try g.scalar(c.routed_scaling, .float32));
+}
+
+/// The sampler texts serve a bound request's rows (sdk_ext/sampler.zig `chosen`): installed at the model's vocabulary
+/// and the request's sampling the card's shape, a top_p filter in (0, 1) without top_k or min_p (the filter keeps at
+/// least the top token there). Any other sampling takes the sampler's own graph.
+pub fn sampleServes(k: *const Kernels, sm: acc.Params) bool {
+    return k.vocab != 0 and sm.top_k == 0 and sm.min_p == null and sm.top_p > 0 and sm.top_p < 1;
+}
+
+/// The plugin's row for a bound request's logits `logits` f32 [1, vocab] predicting absolute position `pos`: f32 [1,
+/// vocab], 0 at the token acceptance.zig `sampledRows` draws there (the tempered row's top_p filter through MLX's sort,
+/// softmax and cumsum; the filtered row's softmax; its cumsum against drawV(seed, pos) x the total) and -inf elsewhere,
+/// bit for bit the sampler's own row (`sampleStockRow`). The temper, MLX's sort, then per stage (the filter, the draw)
+/// the fold, the scan's carries and its counts, then the one-hot: eight launches and the sort.
+pub fn sampleRow(g: *G, k: *const Kernels, logits: T, sm: acc.Params, pos: u64) !T {
+    std.debug.assert(sampleServes(k, sm));
+    return sampleRowWith(g, k, logits, sm, pos, null);
+}
+
+/// The device test's count stages: their configs at DBG 1 and each stage's scan (`dbg` [1, vocab] f32).
+const DebugScans = struct { cfg: [2]Config, out: [2]T = undefined };
+
+fn sampleRowWith(g: *G, k: *const Kernels, logits: T, sm: acc.Params, pos: u64, dbg: ?*DebugScans) !T {
+    // acceptance.zig's scalars as `G.scalar` rounds them: 1 / T in f32, top_p, the token's uniform (drawUniforms).
+    var cv: [8]f32 = @splat(0);
+    cv[0] = 1.0 / sm.temperature;
+    cv[1] = sm.top_p;
+    cv[2] = acc.drawV(sm.seed, pos);
+    const consts = try g.hostArray(std.mem.sliceAsBytes(&cv), &.{8}, .float32);
+    var tl: [2]T = undefined;
+    try apply(g, k.sample_temper, k.sample_temper_cfg, &.{ logits, consts }, &tl);
+    // The descending row: MLX's ascending sort of the negated row (`filteredRows`' neg, sort, neg; the texts negate).
+    const sorted = try g.sort(tl[1], -1);
+    var counts = k.sample_zi;
+    for (0..2) |mode| {
+        var part: [1]T = undefined;
+        try apply(g, k.sample_fold, k.sample_fold_cfg[mode], &.{ tl[0], sorted, counts }, &part);
+        var carries: [1]T = undefined;
+        try apply(g, k.sample_scan, k.sample_scan_cfg[2 * mode], &.{ tl[0], sorted, counts, part[0], k.sample_zf, consts }, &carries);
+        var out: [3]T = undefined;
+        const cfg = if (dbg) |d| d.cfg[mode] else k.sample_scan_cfg[2 * mode + 1];
+        try apply(g, k.sample_scan, cfg, &.{ tl[0], sorted, counts, part[0], carries[0], consts }, &out);
+        if (dbg) |d| d.out[mode] = out[2];
+        counts = out[1];
+    }
+    var hot: [1]T = undefined;
+    try apply(g, k.sample_onehot, k.sample_onehot_cfg, &.{counts}, &hot);
+    return hot[0];
+}
+
+/// `sampleRow`'s stock route (the self-check's and the device tests' control): the sampler's own row
+/// (sdk_ext/sampler.zig `hotRow`).
+pub fn sampleStockRow(g: *G, logits: T, sm: acc.Params, pos: u64) !T {
+    return sampler.hotRow(g, logits, sm, pos);
 }
 
 // ── the self-check (construction, once) ──
@@ -524,6 +706,16 @@ pub fn selfCheck(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const beam.Config,
         const weights = try g.hostArray(std.mem.sliceAsBytes(wv[0 .. n * kk_n]), &.{ @intCast(n), @intCast(kk_n) }, .float32);
         try sameBytes(&g, "the combined routed rows", try combineStockRows(&g, c, wave, order, weights, n), try combineRows(&g, k, wave, order, weights, n), diag);
     }
+    // The sampler at the model's vocabulary: a fixed row of logits (the check row's values times 4) at the card's
+    // sampling and at a narrower filter, against the sampler's own row.
+    if (k.vocab != 0) {
+        const ms = g.mark();
+        defer g.resetTo(ms);
+        const lrow = try g.mul(try g.astype(try checkRow(&g, a, k.vocab), .float32), try g.scalar(4, .float32));
+        try g.evalAll(&.{lrow});
+        for ([_]acc.Params{ .{ .temperature = 0.7, .top_p = 0.99, .seed = 1 }, .{ .temperature = 1.0, .top_p = 0.5, .seed = 7 } }) |sm|
+            try sameBytes(&g, "the sampler's row", try sampleStockRow(&g, lrow, sm, 1000), try sampleRow(&g, k, lrow, sm, 1000), diag);
+    }
 }
 
 const testing = std.testing;
@@ -583,6 +775,27 @@ test "beam glue: the launch geometry (the GEMV's experts / R threadgroups of 256
         try testing.expectEqual([3]u32{ 256, 1, 1 }, cb.group);
     }
     try testing.expectEqual([3]u32{ 256, 1, 1 }, Launch.combine(256, 1).group);
+    // The sampler at Beam 1.0's vocabulary: 38 blocks of 4,096 (the last 384 values); the fold's 32 simdgroups.
+    try testing.expectEqual(@as(u32, 38), sampleBlocks(151_936));
+    try testing.expectEqual([3]u32{ 38 * 1024, 1, 1 }, Launch.sampleScan(151_936).grid);
+    try testing.expectEqual([3]u32{ 1024, 1, 1 }, Launch.sampleScan(151_936).group);
+    try testing.expectEqual([3]u32{ 1024, 1, 1 }, Launch.sampleFold().grid);
+    try testing.expectEqual([3]u32{ 32, 1, 1 }, Launch.sampleFold().group);
+    try testing.expectEqual([3]u32{ 151_936, 1, 1 }, Launch.sampleRow(151_936).grid);
+    for (sample_vocabs) |v| try testing.expect(v > 2 * sample_block and sampleRegisters(v));
+    try testing.expect(!sampleRegisters(8192) and !sampleRegisters(256));
+}
+
+test "beam glue: the sampler texts serve the card's sampling only (a top_p filter in (0, 1), no top_k, no min_p)" {
+    const k: Kernels = .{ .vocab = 151_936 };
+    try testing.expect(sampleServes(&k, .{ .temperature = 0.7, .top_p = 0.99, .seed = 1 }));
+    try testing.expect(sampleServes(&k, .{ .temperature = 1.3, .top_p = 0.5 }));
+    try testing.expect(!sampleServes(&k, .{ .temperature = 0.7, .top_p = 1.0 }));
+    try testing.expect(!sampleServes(&k, .{ .temperature = 0.7, .top_p = 0.0 }));
+    try testing.expect(!sampleServes(&k, .{ .temperature = 0.7, .top_p = 0.9, .top_k = 40 }));
+    try testing.expect(!sampleServes(&k, .{ .temperature = 0.7, .top_p = 0.9, .min_p = 0.05 }));
+    const none: Kernels = .{};
+    try testing.expect(!sampleServes(&none, .{ .temperature = 0.7, .top_p = 0.99 }));
 }
 
 test "beam glue: the manifest registers the instantiations the install builds (each geometry at M = 1 and the lane's widths)" {
@@ -617,13 +830,33 @@ test "beam glue: the manifest registers the instantiations the install builds (e
                 if (int(o, "D") == geo.hidden and int(o, "TPG") == normThreads(geo.hidden)) add_found = true;
             } else if (std.mem.eql(u8, kk.name, "glue_moe_combine")) {
                 if (int(o, "D") == geo.hidden and int(o, "K") == geo.top_k) combine_found[@intCast(int(o, "M") - 1)] = true;
-            } else if (!std.mem.eql(u8, kk.name, "glue_q8_gemv")) return error.BeamGlueManifestKernel;
+            } else if (!std.mem.eql(u8, kk.name, "glue_q8_gemv") and !std.mem.startsWith(u8, kk.name, "glue_sample_")) return error.BeamGlueManifestKernel;
         };
         for (gemv_found) |f| try testing.expect(f);
         for (select_found) |f| try testing.expect(f);
         for (qk_found) |f| try testing.expect(f);
         try testing.expect(add_found);
         for (combine_found) |f| try testing.expect(f);
+    }
+    // The sampler texts at each registered vocabulary: the temper, the fold at both modes, the scan at both modes and
+    // stages (DBG 0), the one-hot.
+    for (sample_vocabs) |v| {
+        var temper = false;
+        var fold: [2]bool = @splat(false);
+        var scan: [4]bool = @splat(false);
+        var onehot = false;
+        for (m.value.kernels) |kk| for (kk.instances) |inst| {
+            const o = inst.object;
+            if (!std.mem.startsWith(u8, kk.name, "glue_sample_") or o.get("V").?.integer != v) continue;
+            if (std.mem.eql(u8, kk.name, "glue_sample_temper")) temper = true;
+            if (std.mem.eql(u8, kk.name, "glue_sample_onehot")) onehot = true;
+            if (std.mem.eql(u8, kk.name, "glue_sample_fold")) fold[@intCast(o.get("MODE").?.integer)] = true;
+            if (std.mem.eql(u8, kk.name, "glue_sample_scan") and o.get("DBG").?.integer == 0)
+                scan[@intCast(2 * o.get("MODE").?.integer + o.get("STAGE").?.integer)] = true;
+        };
+        try testing.expect(temper and onehot);
+        for (fold) |f| try testing.expect(f);
+        for (scan) |f| try testing.expect(f);
     }
 }
 
@@ -639,6 +872,15 @@ test "beam glue: the texts name the shapes they are launched at" {
     try testing.expect(std.mem.indexOf(u8, texts.combine, "rows[size_t(o[k]) * D + h]") != null);
     try testing.expect(std.mem.indexOf(u8, texts.combine, "static_cast<bfloat16_t>(static_cast<float>(routed) * consts[0])") != null);
     try testing.expect(std.mem.indexOf(u8, texts.header_combine, "#pragma METAL fp contract(off)") != null);
+    // The sampler: softmax_looped's fast::exp and its -FLT_MAX start, contiguous_scan's output order, the filter's and
+    // the draw's counts; no contraction pragma (its sums have no products to fuse).
+    try testing.expect(std.mem.indexOf(u8, texts.header_sample, "float maxval = -metal::numeric_limits<float>::max();") != null);
+    try testing.expect(std.mem.indexOf(u8, texts.header_sample, "metal::fast::exp(vals[b][i] - maxval)") != null);
+    try testing.expect(std.mem.indexOf(u8, texts.header_sample, "fp contract") == null);
+    try testing.expect(std.mem.indexOf(u8, texts.sample_scan, "const float cum = ((v[i] + own) + sgp) + pt;") != null);
+    try testing.expect(std.mem.indexOf(u8, texts.sample_scan, "prefix = ((tri[3 * q] + prefix) + tri[3 * q + 1]) + tri[3 * q + 2];") != null);
+    try testing.expect(std.mem.indexOf(u8, texts.sample_scan, "(MODE == 0) ? ((cum - p[i]) < bound) : (cum < bound)") != null);
+    try testing.expect(std.mem.indexOf(u8, texts.sample_temper, "const float v = x[i] * consts[0];") != null);
 }
 
 // ── The texts on the device (BEAM_PARITY's environment: the box's suites under gpu-lock) ──
@@ -1178,5 +1420,114 @@ test "beam glue GPU bench: a step's routers, the stock ops against the texts at 
         const med: f64 = @floatFromInt(times[times.len / 2]);
         const bytes: f64 = @floatFromInt(@as(u64, layers) * 2 * geo.experts * geo.hidden * 4);
         std.debug.print("BEAM GLUE BENCH {s} R={d}: {d} layers (router + predictor) in {d:.1} us (median of 12), {d:.2} us a layer, {d:.0} GB/s of router weights\n", .{ if (r_rows == 0) "stock" else "texts", r_rows, layers, med / 1e3, med / 1e3 / layers, bytes / med });
+    }
+}
+
+// ── the sampler texts on the device ──
+
+/// A test row of logits f32 [1, v] from `seed`: `kind` 0 normal x 3 (flat), 1 normal x 3 with a leader + 12 (peaked), 2
+/// normal on a grid of 1/8 (ties), 3 normal x 0.05 (near uniform: the filter keeps most of the row), 4 normal x 4 at
+/// bf16's precision (the head's: many ties).
+fn sampleLogits(a: std.mem.Allocator, g: *G, v: u32, kind: usize, seed: u64) !T {
+    const x = try a.alloc(f32, v);
+    defer a.free(x);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    for (x) |*y| y.* = r.floatNorm(f32);
+    switch (kind) {
+        0 => for (x) |*y| {
+            y.* *= 3;
+        },
+        1 => {
+            for (x) |*y| y.* *= 3;
+            x[r.uintLessThan(u32, v)] += 12;
+        },
+        2 => for (x) |*y| {
+            y.* = @round(y.* * 8) / 8;
+        },
+        3 => for (x) |*y| {
+            y.* *= 0.05;
+        },
+        else => for (x) |*y| {
+            y.* = @bitCast(@as(u32, ops.bf16Bits(y.* * 4)) << 16);
+        },
+    }
+    return g.hostArray(std.mem.sliceAsBytes(x), &.{ 1, @intCast(v) }, .float32);
+}
+
+test "beam glue GPU: the sampler texts are the sampler's own row bit for bit (Beam's vocabulary and two others; the card's top_p and others; flat, peaked, tied, near-uniform and bf16 rows; both scans value for value)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var rows: usize = 0;
+    // Beam 1.0's vocabulary (38 blocks, the last of 384 values), a last block of one value, whole blocks.
+    for ([_]u32{ 151_936, 8193, 16_384 }) |v| {
+        var k: Kernels = .{};
+        defer k.deinit();
+        try installSampler(a, &k, v);
+        var dbg: DebugScans = .{ .cfg = .{ try sampleScanConfig(v, 0, 1, true), try sampleScanConfig(v, 1, 1, true) } };
+        defer for (dbg.cfg) |cfg| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        };
+        for (0..5) |kind| for ([_]acc.Params{
+            .{ .temperature = 0.7, .top_p = 0.99 },
+            .{ .temperature = 1.0, .top_p = 0.9 },
+            .{ .temperature = 0.3, .top_p = 0.5 },
+            .{ .temperature = 1.6, .top_p = 0.999 },
+        }) |sm0| for (0..4) |trial| {
+            const ms = g.mark();
+            defer g.resetTo(ms);
+            var sm = sm0;
+            sm.seed = 1 + 7919 * trial + kind;
+            const pos: u64 = 16_384 + 1031 * trial + 17 * kind;
+            const x = try sampleLogits(a, &g, v, kind, 9000 + 100 * kind + trial);
+            try g.evalAll(&.{x});
+            const want = try sampleStockRow(&g, x, sm, pos);
+            try sameBytes(&g, "the sampler's row", want, try sampleRow(&g, &k, x, sm, pos), null);
+            // The scans the counts read, every value: MLX's cumsum of the filter's softmax (over the descending row:
+            // acceptance.zig `filteredRows`' ops) and of the draw's (`drawRows` on the filtered p).
+            try sameBytes(&g, "the sampler's row (the scans' launch)", want, try sampleRowWith(&g, &k, x, sm, pos, &dbg), null);
+            const lt = try g.mul(x, try g.scalar(1.0 / sm.temperature, .float32));
+            const srt = try g.neg(try g.sort(try g.neg(lt), -1));
+            try sameBytes(&g, "the filter's scan", try g.cumsum(try g.softmax(srt, -1), -1), dbg.out[0], null);
+            try sameBytes(&g, "the draw's scan", try g.cumsum((try acc.filteredRows(&g, x, sm)).p, -1), dbg.out[1], null);
+            rows += 1;
+        };
+    }
+    std.debug.print("BEAM GLUE sample: {d} rows bit-equal to the sampler's own (the one-hot rows and both scans, every value)\n", .{rows});
+}
+
+test "beam glue GPU bench: the sampler's row at Beam 1.0's vocabulary, the sampler's own graph against the texts (the card's sampling)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    const v = sample_vocabs[0];
+    var k: Kernels = .{};
+    defer k.deinit();
+    try installSampler(a, &k, v);
+    const x = g.keep(try sampleLogits(a, &g, v, 1, 77));
+    defer g.release(x);
+    try g.evalAll(&.{x});
+    for (0..2) |arm| {
+        var times: [15]u64 = undefined;
+        for (&times, 0..) |*tm, i| {
+            const ms = g.mark();
+            defer g.resetTo(ms);
+            const sm: acc.Params = .{ .temperature = 0.7, .top_p = 0.99, .seed = 1 };
+            const t0 = std.Io.Timestamp.now(testing.io, .awake);
+            const row = if (arm == 0) try sampleStockRow(&g, x, sm, 20_000 + i) else try sampleRow(&g, &k, x, sm, 20_000 + i);
+            try g.evalAll(&.{row});
+            tm.* = @intCast(t0.untilNow(testing.io, .awake).nanoseconds);
+        }
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        std.debug.print("BEAM GLUE BENCH sampler {s}: a row in {d:.1} us (median of 15; the graph, its launches and the wait)\n", .{ if (arm == 0) "stock" else "texts", @as(f64, @floatFromInt(times[times.len / 2])) / 1e3 });
     }
 }
