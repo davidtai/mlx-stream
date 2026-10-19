@@ -139,12 +139,12 @@ pub fn deinit(m: *Module) void {
 /// The prompt pass: the request's sampler bound (`draft_lane.arm`), its last row the plugin's first token when bound.
 pub fn prefill(m: *Module, ids: []const u32, req: sdk.RequestShape) !sdk.mlx.mlx_array {
     m.sampler.begin(draft_lane.laneName(m));
-    return m.sampler.chosen(try m.prefill(ids, req), m.position());
+    return m.chosen(try m.prefill(ids, req), m.position());
 }
 
 /// A serial step: its row the plugin's token at the next position when the request is bound.
 pub fn step(m: *Module, ids: []const u32) !sdk.mlx.mlx_array {
-    return m.sampler.chosen(try m.step(ids), m.position());
+    return m.chosen(try m.step(ids), m.position());
 }
 
 pub fn position(m: *const Module) u64 {

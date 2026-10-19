@@ -54,17 +54,24 @@ pub fn SamplerOf(comptime G: type) type {
             const sm = self.active orelse return logits;
             const g = &self.g;
             defer g.reset();
-            const sh = g.shapeOf(logits);
-            const vocab = sh.dim(-1);
-            const row = try g.reshape(logits, &.{ 1, vocab });
-            const sr = try acc.sampledRows(g, row, sm, pos - 1, &.{});
-            const rank = try g.arange(0, @floatFromInt(vocab), 1, .uint32);
-            const hot = try g.where(try g.equal(rank, sr.tok), try g.scalar(0, .float32), try g.scalar(-std.math.inf(f64), .float32));
-            const out = g.keep(try g.reshape(hot, &.{ 1, vocab }));
+            const out = g.keep(try hotRow(g, logits, sm, pos));
             _ = mlx.mlx_array_free(logits);
             return out;
         }
     };
+}
+
+/// `chosen`'s row on the op backend `g` (a graph, not kept): `logits` (its last axis the vocabulary) predicting the
+/// token at absolute position `pos` -> f32 [1, vocab], 0 at the token `acceptance.sampledRows` draws there and -inf
+/// elsewhere. An arch's own route to the same row checks itself against this one.
+pub fn hotRow(g: anytype, logits: anytype, sm: acc.Params, pos: u64) !@TypeOf(logits) {
+    const sh = g.shapeOf(logits);
+    const vocab = sh.dim(-1);
+    const row = try g.reshape(logits, &.{ 1, vocab });
+    const sr = try acc.sampledRows(g, row, sm, pos - 1, &.{});
+    const rank = try g.arange(0, @floatFromInt(vocab), 1, .uint32);
+    const hot = try g.where(try g.equal(rank, sr.tok), try g.scalar(0, .float32), try g.scalar(-std.math.inf(f64), .float32));
+    return g.reshape(hot, &.{ 1, vocab });
 }
 
 /// A request's binding: its sampling when sampled, null when greedy (the host's argmax).
