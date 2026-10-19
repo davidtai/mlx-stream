@@ -379,17 +379,18 @@ static int wd_running = 0, wd_stop = 0;
 void q3ld_mtl_signal(void *event, uint64_t value);          /* q3_event_shim.mm */
 
 #if defined(Q3LD_INJECT) || defined(Q3LD_EVSIG)
-/* The read log (profile and test builds): every preadv call's [start, end) on the pool's clock, its bytes and its
- * thread's class (1 demand worker, 2 speculative thread, 3 a demand worker's pre-range), as int64[4] entries in a
- * caller-owned buffer (q3ld_test_read_log); past the cap a call is counted (rdlog_dropped), not logged. */
+/* The read log (profile and test builds): every preadv call's [start, end) on the pool's clock, its bytes, its
+ * thread's class (1 demand worker, 2 speculative thread, 3 a demand worker's pre-range) and its file offset (diag,
+ * perf/beam-misspath: a record read twice is two entries at one offset), as int64[5] entries in a caller-owned buffer
+ * (q3ld_test_read_log); past the cap a call is counted (rdlog_dropped), not logged. */
 static int64_t *rdlog = 0, rdlog_cap = 0, rdlog_n = 0, rdlog_dropped = 0;
 static _Thread_local int64_t t_rdrole = 0;
-static void rdlog_put(int64_t t0, int64_t t1, ssize_t r) {
+static void rdlog_put(int64_t t0, int64_t t1, ssize_t r, off_t off) {
     if (!__atomic_load_n(&rdlog, __ATOMIC_ACQUIRE)) return;
     int64_t i = __atomic_fetch_add(&rdlog_n, 1, __ATOMIC_RELAXED);
     if (i >= rdlog_cap) { __atomic_fetch_add(&rdlog_dropped, 1, __ATOMIC_RELAXED); return; }
-    int64_t *e = rdlog + 4 * i;
-    e[0] = t0; e[1] = t1; e[2] = (int64_t)r; e[3] = t_rdrole;
+    int64_t *e = rdlog + 5 * i;
+    e[0] = t0; e[1] = t1; e[2] = (int64_t)r; e[3] = t_rdrole; e[4] = (int64_t)off;
 }
 #define RDROLE(r) (t_rdrole = (r))
 #else
@@ -500,7 +501,7 @@ static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
     ssize_t r;
     int64_t t0 = q3ld_monotonic_ns();
     do { r = preadv(fd, iov, n, off); } while (r < 0 && errno == EINTR);   /* code 1: EINTR retried inside */
-    rdlog_put(t0, q3ld_monotonic_ns(), r);
+    rdlog_put(t0, q3ld_monotonic_ns(), r, off);
     return r;
 }
 #define RANGE_DELAY() range_delay()
@@ -517,7 +518,7 @@ static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
 #endif
     do { r = preadv(fd, iov, n, off); } while (r < 0 && errno == EINTR);
 #ifdef Q3LD_EVSIG
-    rdlog_put(t0, q3ld_monotonic_ns(), r);
+    rdlog_put(t0, q3ld_monotonic_ns(), r, off);
 #endif
     return r;
 }
@@ -2245,7 +2246,7 @@ int32_t q3ld_ev_state(int64_t *out) {
 }
 
 #if defined(Q3LD_INJECT) || defined(Q3LD_EVSIG)
-/* The read log: buf = int64[4 * cap] (n reset to 0) installs it; buf = 0, cap >= 0 reads the count; buf = 0, cap < 0
+/* The read log: buf = int64[5 * cap] (n reset to 0) installs it; buf = 0, cap >= 0 reads the count; buf = 0, cap < 0
  * removes it. Returns the entries logged so far (at most cap); out_dropped (when not null) gets the calls past cap. */
 int64_t q3ld_test_read_log(int64_t *buf, int64_t cap, int64_t *out_dropped) {
     if (buf) {

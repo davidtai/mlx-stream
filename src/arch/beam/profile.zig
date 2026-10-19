@@ -13,13 +13,13 @@
 //!   `BEAM_PROFILE_OUT=<prefix>` where the raw rows land: `<prefix>.prefill-{rows,kernels,reads}.tsv` (and the timeline's
 //!                              own `.prefill-{layers,tiles,cbs}.tsv`), `<prefix>.decode-{timeline.json,kernels.tsv,
 //!                              reads.tsv}`.
-//! The read pool's preadv log (every call's [start, end), bytes and thread class: csrc/q3_lookahead4_exl3.c
+//! The read pool's preadv log (every call's [start, end), bytes, thread class and file offset: csrc/q3_lookahead4_exl3.c
 //! `q3ld_test_read_log`) runs with either timeline. Every request also prints MiMo's per-phase lines (`BEAM_PROFILE`,
 //! `BEAM_AHEAD`, `BEAM_AHEAD_LOOKAHEAD`, `BEAM_IO`) and, at the decode's end, DSV's `DECODE_TIMERS` (a step is a cycle).
 //! The state lives here (no Module field); in a served build every entry below compiles to nothing.
 //!
 //! Its own memory, outside the arch's bill: the prompt timeline's static rows (~29 MB at 2^19 rows), the verify
-//! timeline's (~59 MB at 2^20 rows), the kernel log (64 MB of static rows, touched as filled), the read log (32 MB), the
+//! timeline's (~59 MB at 2^20 rows), the kernel log (64 MB of static rows, touched as filled), the read log (40 MB), the
 //! TSV and JSON text built once at each phase's end (at most ~0.2 GB).
 
 const std = @import("std");
@@ -82,7 +82,7 @@ const State = struct {
 };
 var state: if (enabled) State else void = if (enabled) .{} else {};
 const Storage = struct {
-    var reads: [max_reads][4]i64 = undefined;
+    var reads: [max_reads][5]i64 = undefined;
     /// Each cycle's open (`cycleOpen`: a serial step's forward begin, or a draft round's start), the timeline's clock.
     var opens: [timeline.max_cycles]u64 = undefined;
 };
@@ -444,8 +444,8 @@ fn writeReads(base: []const u8, ext: []const u8) void {
     defer aw.deinit();
     const w = &aw.writer;
     w.print("# reads {d} dropped {d}\n", .{ n, dropped }) catch return;
-    w.writeAll("t0_ns\tt1_ns\tbytes\tclass\n") catch return;
-    for (Storage.reads[0..@min(n, max_reads)]) |e| w.print("{d}\t{d}\t{d}\t{d}\n", .{ e[0], e[1], e[2], e[3] }) catch return;
+    w.writeAll("t0_ns\tt1_ns\tbytes\tclass\toffset\n") catch return;
+    for (Storage.reads[0..@min(n, max_reads)]) |e| w.print("{d}\t{d}\t{d}\t{d}\t{d}\n", .{ e[0], e[1], e[2], e[3], e[4] }) catch return;
     writeOut(base, ext, aw.written());
     log.info(tag ++ "_READ_LOG {s}: reads={d} dropped={d}\n", .{ ext, n, dropped });
 }
