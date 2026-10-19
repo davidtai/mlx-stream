@@ -586,6 +586,16 @@ pub fn project(g: *G, l: Linear, x: T) !T {
     };
 }
 
+/// `project` of a decode row under the decode glue: a q8 projection whose shape the glue's q8 GEMV text registers runs
+/// the text (glue.zig `q8Gemv`: MLX's qmv_fast arithmetic row for row, the same bits); every other call `project`.
+pub fn projectRow(g: *G, gl: ?*const glue.Kernels, l: Linear, x: T) !T {
+    if (gl) |k| switch (l) {
+        .q8 => |q| if (g.shapeOf(x).dim(0) == 1) if (try glue.q8Gemv(g, k, x, q.w, q.scales, q.biases)) |y| return y,
+        .bf16 => {},
+    };
+    return project(g, l, x);
+}
+
 /// A prompt layer's view of `lw`: each q8 projection of its attention and its dense MLP as the BF16 weight MLX's
 /// `dequantize` writes (bf16(s x q + b)), a node of the layer's graph made here once: every tile of the layer reads it,
 /// the layer's end (the forward's mark) releases it. MiMo's and glm5_next's prompt route (the stock GEMM over a
@@ -763,12 +773,13 @@ fn windowMask(g: *G, a: std.mem.Allocator, pos: u32, n: u32, first: u32, keys: u
 /// decode glue's q / k text reads in place.
 const Projections = struct { q: T, k: T, v: T, gate: T, row: ?T = null };
 
-/// The attention's four projections of `xn` [n, hidden]: one GEMV (q8: one qmv) over the fused projection and its four
-/// row slices on a one-row call where `fuseProjections` fused them (the decode lane's step), else the four (`project`).
-fn attnProjections(g: *G, c: *const beam.Config, at: *const Attention, xn: T) !Projections {
+/// The attention's four projections of `xn` [n, hidden]: one GEMV (q8: one qmv, or the glue's q8 text: `projectRow`)
+/// over the fused projection and its four row slices on a one-row call where `fuseProjections` fused them (the decode
+/// lane's step), else the four (`project`).
+fn attnProjections(g: *G, c: *const beam.Config, at: *const Attention, xn: T, gl: ?*const glue.Kernels) !Projections {
     const fused = at.qkvg;
     if (fused == null or g.shapeOf(xn).dim(0) != 1) return .{ .q = try project(g, at.q, xn), .k = try project(g, at.k, xn), .v = try project(g, at.v, xn), .gate = try project(g, at.gate, xn) };
-    const y = try project(g, fused.?, xn);
+    const y = try projectRow(g, gl, fused.?, xn);
     const qd: c_int = @intCast(c.n_heads * c.head_dim);
     const kd: c_int = @intCast(c.n_kv_heads * c.head_dim);
     const b = [_]c_int{ 0, qd, qd + kd, qd + 2 * kd, 2 * qd + 2 * kd };
@@ -783,9 +794,9 @@ fn checkProjections(g: *G, a: std.mem.Allocator, c: *const beam.Config, at: *con
     const m = g.mark();
     defer g.resetTo(m);
     const x = try glue.checkRow(g, a, c.hidden_size);
-    const fused = try attnProjections(g, c, at, x);
+    const fused = try attnProjections(g, c, at, x, null);
     const plain: Attention = .{ .q = at.q, .k = at.k, .v = at.v, .o = at.o, .gate = at.gate, .gate_bias = at.gate_bias, .q_norm = at.q_norm, .k_norm = at.k_norm };
-    const stock = try attnProjections(g, c, &plain, x);
+    const stock = try attnProjections(g, c, &plain, x, null);
     inline for (.{ "q", "k", "v", "gate" }) |f| glue.sameBytes(g, "the fused projections' " ++ f, @field(stock, f), @field(fused, f), null) catch return error.BeamFusedProjections;
 }
 
@@ -823,7 +834,7 @@ pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const 
     const kvh: c_int = @intCast(c.n_kv_heads);
     const hd: c_int = @intCast(c.head_dim);
     const at = &lw.attn;
-    const p = try attnProjections(g, c, at, xn);
+    const p = try attnProjections(g, c, at, xn, if (n == 1) gl else null);
     const qk = if (n == 1 and gl != null and p.row != null) try glue.qkNorm(g, gl.?, p.row.?, at.q_norm, at.k_norm, pos, lw.full, ssmaxAt(pos)) else try qkStock(g, c, at.q_norm, at.k_norm, p.q, p.k, n, pos, lw.full);
     const q = qk.q;
     const k = qk.k;
@@ -845,19 +856,20 @@ pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const 
     // [1, n, heads, d], gated per head: attn * sigmoid(gate_proj(x) + gate_bias), one compiled kernel.
     const o = try g.transposeAxes(out, &.{ 0, 2, 1, 3 });
     const gated = try gateOut(g, c, o, try g.reshape(p.gate, &.{ 1, n, heads, hd }), at.gate_bias);
-    return project(g, at.o, try g.reshape(gated, &.{ n, heads * hd }));
+    return projectRow(g, if (n == 1) gl else null, at.o, try g.reshape(gated, &.{ n, heads * hd }));
 }
 
-/// The dense SwiGLU (f32 activation, `swiglu_f32`), then down.
-pub fn mlp(g: *G, m: Mlp, x: T) !T {
-    const act = try sdk_ext.quant.activation(G, g, .swiglu_f32, try project(g, m.gate, x), try project(g, m.up, x));
-    return project(g, m.down, act);
+/// The dense SwiGLU (f32 activation, `swiglu_f32`), then down; a decode row's projections through `projectRow` (`gl`:
+/// the decode glue, null on a prompt tile).
+pub fn mlp(g: *G, m: Mlp, x: T, gl: ?*const glue.Kernels) !T {
+    const act = try sdk_ext.quant.activation(G, g, .swiglu_f32, try projectRow(g, gl, m.gate, x), try projectRow(g, gl, m.up, x));
+    return projectRow(g, gl, m.down, act);
 }
 
 /// A prompt call's dense MLP over `x` [rows, hidden] in tiles of `dense_tile_rows` rows: each tile committed as built
 /// and the tile before it waited (at most `tiles_in_flight` tiles' intermediates live), the tiles joined.
 fn mlpTiles(g: *G, a: std.mem.Allocator, c: *const beam.Config, m: Mlp, x: T, rows: u32) !T {
-    if (rows <= dense_tile_rows) return mlp(g, m, x);
+    if (rows <= dense_tile_rows) return mlp(g, m, x, null);
     const hidden: c_int = @intCast(c.hidden_size);
     const n_tiles: usize = (rows + dense_tile_rows - 1) / dense_tile_rows;
     const outs = try a.alloc(T, n_tiles);
@@ -868,7 +880,7 @@ fn mlpTiles(g: *G, a: std.mem.Allocator, c: *const beam.Config, m: Mlp, x: T, ro
         const lo: c_int = @intCast(i * dense_tile_rows);
         const hi: c_int = @intCast(@min(rows, (i + 1) * dense_tile_rows));
         const ms = g.mark();
-        o.* = g.keep(try mlp(g, m, try g.slice(x, &.{ lo, 0 }, &.{ hi, hidden }, &.{ 1, 1 })));
+        o.* = g.keep(try mlp(g, m, try g.slice(x, &.{ lo, 0 }, &.{ hi, hidden }, &.{ 1, 1 }), null));
         kept += 1;
         g.resetTo(ms);
         try g.asyncEval(&.{o.*});
@@ -1058,7 +1070,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         const b1 = if (boundary_glue) |k| try glue.addNorm(g, k, attn, x, lw.post_attn_norm, lw.pre_ff_norm, beam.Config.residualIndex(l, false)) else try boundaryStock(g, c, attn, x, lw.post_attn_norm, lw.pre_ff_norm, beam.Config.residualIndex(l, false));
         const x1 = b1.res;
         const h = b1.out;
-        const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, h, rows) else try mlp(g, d, h)) else blk: {
+        const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, h, rows) else try mlp(g, d, h, if (rows == 1) routes.glue else null)) else blk: {
             const r = if (comptime @TypeOf(force) == void) try routeOf(g, c, routes, lw.router.?, h, !prompt) else try forcedRoute(g, c, routes, lw.router.?, h, force, l, start, !prompt);
             if (prompt) try g.asyncEval(&.{ r.indices, r.weights });
             // A decode-lane call under the decode glue: the join, the combine and the routed scale in one text (glue.zig
@@ -1437,8 +1449,8 @@ test "beam graph GPU: the fused projections' one GEMV (q8: one qmv) is the four 
             const m = g.mark();
             defer g.resetTo(m);
             const x = try testBf16(a, &g, &.{ n, h }, 1.0, 1200 + i);
-            const want = try attnProjections(&g, &c, &plain, x);
-            const got = try attnProjections(&g, &c, at, x);
+            const want = try attnProjections(&g, &c, &plain, x, null);
+            const got = try attnProjections(&g, &c, at, x, null);
             inline for (.{ "q", "k", "v", "gate" }) |f| try expectBits(@tagName(fmt) ++ " projection " ++ f, &g, @field(want, f), @field(got, f));
         }
     }

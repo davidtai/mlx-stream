@@ -112,7 +112,7 @@ pub const Module = struct {
                 return e;
             };
             self.routes.glue = &self.glue_kernels;
-            log.info("beam decode glue installed: q/k/v/gate one GEMV, q/k norms and RoPE (or the query scale) one launch, each sublayer boundary one launch, router {d} threadgroups + select, predictor {d} threadgroups, a routed decode call's join + combine + scale one launch, the sampler's row {s} (decode_glue=fused); self-check passed\n", .{ model.n_routed_experts / glue.rows_per_group, model.n_routed_experts / glue.rows_per_group, if (self.glue_kernels.vocab != 0) "8 launches + MLX's sort (top_p)" else "the stock chain" });
+            log.info("beam decode glue installed: q/k/v/gate one GEMV, q/k norms and RoPE (or the query scale) one launch, each sublayer boundary one launch, router {d} threadgroups + select, predictor {d} threadgroups, a routed decode call's join + combine + scale one launch, the sampler's row {s}, the decode row's q8 q/k/v/gate, o and dense GEMVs {s} (decode_glue=fused); self-check passed\n", .{ model.n_routed_experts / glue.rows_per_group, model.n_routed_experts / glue.rows_per_group, if (self.glue_kernels.vocab != 0) "8 launches + MLX's sort (top_p)" else "the stock chain", if (self.glue_kernels.q8.ctx != null) "the q8 text" else "MLX's qmv" });
         }
         errdefer self.glue_kernels.deinit();
         // The expert source at the plan's rows, split between the routed layers at the same total (`layerSplit`: the
