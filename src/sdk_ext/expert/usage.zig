@@ -5,6 +5,8 @@
 //! (`usage` | `none`; default `usage` when the pack has the file, `none` when not) reads it once and fills each layer's
 //! empty prompt rows with the layer's most used experts (`Stream.seedResidents`), so the first request finds them
 //! resident. The seed changes no policy: the seeded experts are residents as a kept resident is (`shrink(.keep)`).
+//! Without a usage seed (`none`, or no file) an arch either loads with empty rows or fills them with each layer's
+//! lowest-index experts (`NoUsage`, the arch's choice: Beam never loads empty).
 //! `prompt_residents` (`PromptResidents`) is the reverse change's route the arches take by the same name.
 
 const std = @import("std");
@@ -30,6 +32,11 @@ pub fn promptResidentsLine(comptime arch: []const u8, residents: PromptResidents
 
 /// `resident_seed`: `usage` (the prompt rows filled from the pack's `expert-usage-v1.json` at the load) or `none`.
 pub const Seed = enum { usage, none };
+
+/// What the load installs when no usage seed applies (`resident_seed: none`, or a pack without the file): `empty`
+/// prompt rows, or each layer's prompt rows filled with its lowest-index experts (`Profile.lowestIndex`), so that
+/// the first request never starts from empty rows. The arch chooses at its call (`residency.seedResidents`).
+pub const NoUsage = enum { empty, lowest_index };
 
 /// The model-settings keys `Settings.apply` reads.
 pub const keys = [_][]const u8{ "resident_seed", "expert_usage_record", "expert_usage_label" };
@@ -345,6 +352,19 @@ pub const Profile = struct {
         p.a.free(p.order_buf);
     }
 
+    /// `NoUsage.lowest_index`'s profile: every count 1, so `order` gives each layer's lowest-index experts (ties go to
+    /// the lower id). Its source is `why`, the reason no usage seed applies.
+    pub fn lowestIndex(a: std.mem.Allocator, layers: u32, experts: u32, why: []const u8) !Profile {
+        const counts = try a.alloc(u64, @as(usize, layers) * experts);
+        errdefer a.free(counts);
+        @memset(counts, 1);
+        const order_buf = try a.alloc(u16, experts);
+        var p: Profile = .{ .a = a, .layers = layers, .experts = experts, .counts = counts, .order_buf = order_buf };
+        p.source_len = @min(why.len, p.source_buf.len);
+        @memcpy(p.source_buf[0..p.source_len], why[0..p.source_len]);
+        return p;
+    }
+
     pub fn source(p: *const Profile) []const u8 {
         return p.source_buf[0..p.source_len];
     }
@@ -422,10 +442,26 @@ pub fn parse(a: std.mem.Allocator, text: []const u8, model_type: []const u8, lay
 }
 
 /// The seed the load installs (`resident_seed` against the pack), decided once: a profile, or null (none) with the
-/// reason. `resident_seed: usage` named without the file is refused by name (`ExpertUsageMissing`).
+/// reason. `resident_seed: usage` named without the file is refused by name (`ExpertUsageMissing`). Under
+/// `NoUsage.lowest_index` a `setting_none` or `no_file` decision takes the lowest-index profile (`fill`).
 pub const Decision = struct {
     profile: ?Profile,
     reason: enum { usage, setting_none, no_file },
+
+    /// `no_usage` applied: a decision without a profile takes the lowest-index fill (`lowest_index`) or stays empty.
+    pub fn fill(d: *Decision, a: std.mem.Allocator, no_usage: NoUsage, layers: u32, experts: u32) !void {
+        if (d.profile != null or no_usage == .empty) return;
+        d.profile = try Profile.lowestIndex(a, layers, experts, d.why());
+    }
+
+    /// Why no usage seed applies (`setting_none`, `no_file`); empty for `usage`.
+    pub fn why(d: *const Decision) []const u8 {
+        return switch (d.reason) {
+            .usage => "",
+            .setting_none => "resident_seed: none",
+            .no_file => "no " ++ file_name,
+        };
+    }
 };
 
 pub fn decide(a: std.mem.Allocator, io: std.Io, settings: *const Settings, pack_dir: []const u8, comptime arch: []const u8, layers: u32, experts: u32) !Decision {
@@ -455,19 +491,16 @@ pub fn decide(a: std.mem.Allocator, io: std.Io, settings: *const Settings, pack_
 }
 
 /// The seed's install line: `<arch> expert residents seeded: <n> of <rows> rows per layer from expert-usage-v1.json
-/// (<source>); <records> records, <bytes> B read in <ms> ms` (n and rows as `a-b` when the layers differ), or `none`.
+/// (<source>); <records> records, <bytes> B read in <ms> ms` (n and rows as `a-b` when the layers differ), the same
+/// with `, the lowest-index experts (<why>)` for the fill, or `none (<why>)`.
 pub fn seedLine(buf: []u8, comptime arch: []const u8, d: *const Decision, r: Seeded, bytes: u64, ms: u64) []const u8 {
-    return switch (d.reason) {
-        .setting_none => arch ++ " expert residents seeded: none (resident_seed: none)",
-        .no_file => arch ++ " expert residents seeded: none (no " ++ file_name ++ ")",
-        .usage => blk: {
-            var nb: [24]u8 = undefined;
-            var rb: [24]u8 = undefined;
-            const n = range(&nb, r.min, r.max);
-            const rows = range(&rb, r.rows_min, r.rows_max);
-            break :blk std.fmt.bufPrint(buf, arch ++ " expert residents seeded: {s} of {s} rows per layer from " ++ file_name ++ " ({s}); {d} records, {d} B read in {d} ms", .{ n, rows, d.profile.?.source(), r.records, bytes, ms }) catch buf[0..0];
-        },
-    };
+    const p = if (d.profile) |*x| x else return std.fmt.bufPrint(buf, arch ++ " expert residents seeded: none ({s})", .{d.why()}) catch buf[0..0];
+    var nb: [24]u8 = undefined;
+    var rb: [24]u8 = undefined;
+    const n = range(&nb, r.min, r.max);
+    const rows = range(&rb, r.rows_min, r.rows_max);
+    if (d.reason != .usage) return std.fmt.bufPrint(buf, arch ++ " expert residents seeded: {s} of {s} rows per layer, the lowest-index experts ({s}); {d} records, {d} B read in {d} ms", .{ n, rows, d.why(), r.records, bytes, ms }) catch buf[0..0];
+    return std.fmt.bufPrint(buf, arch ++ " expert residents seeded: {s} of {s} rows per layer from " ++ file_name ++ " ({s}); {d} records, {d} B read in {d} ms", .{ n, rows, p.source(), r.records, bytes, ms }) catch buf[0..0];
 }
 
 fn range(buf: []u8, lo: u32, hi: u32) []const u8 {
@@ -672,4 +705,34 @@ test "expert usage: the first-form file (one session's source) and the second fo
     try testing.expect(s.sessions[1].requests == 1 and s.sessions[1].prompt_tokens == 4 and s.sessions[1].decode_tokens == 2);
     try testing.expect(s.requests == 66 and s.prompt_tokens == 27270 and s.decode_tokens == 9889);
     try testing.expectEqual(rows[0][0] + 1, strict.value.counts[0][0]);
+}
+
+test "expert usage: without a usage seed an arch's NoUsage keeps the rows empty or fills each layer with its lowest-index experts, and the seed line names which" {
+    const a = testing.allocator;
+    var lb: [512]u8 = undefined;
+    const none_seeded: Seeded = .{ .min = 0, .max = 0, .rows_min = 0, .rows_max = 0, .records = 0 };
+    // `empty`: no profile, the line as before.
+    var e: Decision = .{ .profile = null, .reason = .no_file };
+    try e.fill(a, .empty, 2, 4);
+    try testing.expect(e.profile == null);
+    try testing.expectEqualStrings("glm5_next expert residents seeded: none (no expert-usage-v1.json)", seedLine(&lb, "glm5_next", &e, none_seeded, 0, 0));
+    var n: Decision = .{ .profile = null, .reason = .setting_none };
+    try testing.expectEqualStrings("glm5_next expert residents seeded: none (resident_seed: none)", seedLine(&lb, "glm5_next", &n, none_seeded, 0, 0));
+    // `lowest_index`: every layer's lowest ids first, at most the rows; the line names the fill and its reason.
+    for ([_]Decision{ .{ .profile = null, .reason = .no_file }, .{ .profile = null, .reason = .setting_none } }) |d0| {
+        var d = d0;
+        try d.fill(a, .lowest_index, 2, 4);
+        defer d.profile.?.deinit();
+        try testing.expectEqualSlices(u16, &.{ 0, 1, 2 }, d.profile.?.order(0, 3));
+        try testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3 }, d.profile.?.order(1, 8));
+        const line = seedLine(&lb, "beam", &d, .{ .min = 3, .max = 3, .rows_min = 3, .rows_max = 3, .records = 6 }, 600, 2);
+        const want = if (d.reason == .no_file) "beam expert residents seeded: 3 of 3 rows per layer, the lowest-index experts (no expert-usage-v1.json); 6 records, 600 B read in 2 ms" else "beam expert residents seeded: 3 of 3 rows per layer, the lowest-index experts (resident_seed: none); 6 records, 600 B read in 2 ms";
+        try testing.expectEqualStrings(want, line);
+    }
+    // A decision with a usage profile is never replaced by the fill.
+    var u: Decision = .{ .profile = try Profile.lowestIndex(a, 1, 2, "a usage profile stands in"), .reason = .usage };
+    defer u.profile.?.deinit();
+    const before = u.profile.?.counts.ptr;
+    try u.fill(a, .lowest_index, 1, 2);
+    try testing.expectEqual(before, u.profile.?.counts.ptr);
 }

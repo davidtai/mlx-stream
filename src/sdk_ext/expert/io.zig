@@ -26,6 +26,8 @@ const c = if (builtin.os.tag == .macos) struct {
     pub extern fn q3ld_spec_config(nthreads: i32, bufs: ?[*]const u64, nslots: i32, slot_bytes: i64, rec_len: i64, chunk: i64, counters: ?[*]i64) c_int;
     pub extern fn q3ld_spec_streams(idle_busy: i32) c_int;
     pub extern fn q3ld_direct_config(on: i32) c_int;
+    pub extern fn q3ld_split_config(bytes: i64) c_int;
+    pub extern fn q3ld_split_phase(on: i32) i32;
     pub extern fn q3ld_start(nw: i32, staging_ptrs: [*]const u64, sbytes: i64, psize: i64, res: [*]i64, n_tickets: i64, log: [*]i64, n_log: i64, gauge: *[6]i64) c_int;
     pub extern fn q3ld_submit(fd: i32, file_size: i64, deadline: i64, n: i32, ngu: i32, ndown: i32, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
     pub extern fn q3ld_withdraw(first: i64) c_int;
@@ -64,9 +66,10 @@ pub const test_abi = if (builtin.is_test) struct {
     pub const status_words = res_w;
 } else struct {};
 
-/// The C pool's ABI (`q3ld_abi`): 2026101401, DIRECT reads as a construction-time route (2026101201: the submit-wide
-/// WITHDRAW over the range-job queue).
-pub const abi_version = 2026101401;
+/// The C pool's ABI (`q3ld_abi`): 2026101802, D10's copy SPLIT as a construction-time route behind a phase gate, and its
+/// counter (2026101801: a claimed speculative record's chunks read by every speculative thread, CO-READ; 2026101401:
+/// DIRECT reads as a construction-time route; 2026101201: the submit-wide WITHDRAW over the range-job queue).
+pub const abi_version = 2026101802;
 pub const max_workers = 8;
 /// Records per job (one fill unit).
 pub const max_items = 8;
@@ -161,8 +164,17 @@ pub const Counter = enum(u8) {
     ev_host_released = 69,
     ev_stop_released = 70,
     direct_ranges = 71,
+    /// Claimed chunks started while another speculative thread read the same record (the co-read's second call).
+    co_reads = 72,
+    /// Range copies split into pieces side by side (`Options.split_bytes`, the phase gate open).
+    split_ranges = 73,
 };
-pub const counters_n = 72;
+pub const counters_n = 74;
+
+/// The C pool's piece threads when the split route is on (q3_lookahead4_exl3.c PIECE_THREADS): a bill's read pool term.
+pub const piece_threads = 16;
+/// A piece thread's stack (the platform's default for a secondary thread: 512 KiB), billed whole.
+pub const piece_thread_bytes: u64 = 512 << 10;
 
 /// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
 /// read by `threads` threads in `chunk_bytes` preadv steps.
@@ -189,6 +201,11 @@ pub const Options = struct {
     /// range: the owner proves the alignment once at construction (`checkDirectBlock` + the stream's
     /// `checkDirectReads`), so the uncached preadv takes the drive's direct path.
     direct: bool = false,
+    /// The copies' route, fixed at start: 0 (the default) copies a range's bytes into its rows on the thread that read
+    /// them; > 0 (a multiple of the page) copies more than this many bytes in pieces of at most this many side by side
+    /// (the C pool's piece threads) while the phase gate is open (`Pool.splitPhase`; shut at start): a staged demand
+    /// range, a pre-range after its bind, a range adopted out of a speculative record. The reads are the same.
+    split_bytes: u64 = 0,
     spec: ?Spec = null,
 };
 
@@ -313,7 +330,7 @@ pub const Pool = struct {
     /// here and stay put until `stop`.
     pub fn start(allocator: std.mem.Allocator, opt: Options) !*Pool {
         const page = std.heap.pageSize();
-        if (opt.workers == 0 or opt.workers > max_workers or opt.staging_bytes == 0 or opt.staging_bytes % page != 0 or opt.tickets < 2 * max_items)
+        if (opt.workers == 0 or opt.workers > max_workers or opt.staging_bytes == 0 or opt.staging_bytes % page != 0 or opt.tickets < 2 * max_items or opt.split_bytes % page != 0)
             return error.InvalidOptions;
         if (opt.spec) |s| if (s.threads == 0 or s.threads > max_spec_threads or s.slots == 0 or s.slots > max_spec or s.record_bytes == 0 or
             s.chunk_bytes == 0 or s.chunk_bytes % page != 0 or s.idle_busy > 1) return error.InvalidOptions;
@@ -353,12 +370,20 @@ pub const Pool = struct {
             return error.PoolUnavailable;
         if (opt.spec) |s| if (c.q3ld_spec_streams(@intCast(s.idle_busy)) != 0) return error.PoolUnavailable;
         if (c.q3ld_direct_config(@intFromBool(opt.direct)) != 0) return error.PoolUnavailable;
+        if (c.q3ld_split_config(@intCast(opt.split_bytes)) != 0) return error.PoolUnavailable;
         var ptrs: [max_workers]u64 = undefined;
         for (0..opt.workers) |w| ptrs[w] = @intFromPtr(staging.ptr) + w * opt.staging_bytes;
         const rc = c.q3ld_start(@intCast(opt.workers), &ptrs, @intCast(opt.staging_bytes), @intCast(page), res.ptr, opt.tickets, log_arr.ptr, opt.tickets, &self.gauge);
         if (rc == -2) _ = c.q3ld_stop(); // fewer threads than asked: join the ones that started
         if (rc != 0) return if (rc == -1) error.PoolUnavailable else error.PoolStart;
         return self;
+    }
+
+    /// The split route's phase gate (`Options.split_bytes`; shut at start): open, a copy that starts from now on runs in
+    /// pieces; shut, the stock loop. Returns the gate's previous state. Changes nothing when the route is off.
+    pub fn splitPhase(self: *Pool, on: bool) bool {
+        _ = self;
+        return c.q3ld_split_phase(@intFromBool(on)) != 0;
     }
 
     /// After the owned consumers settle: expire unbound reads and wait for the pool's activity to stop.

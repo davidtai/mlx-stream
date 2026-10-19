@@ -37,7 +37,6 @@ const mimo_draft = @import("../mimo_v2/draft.zig");
 const acc = @import("../../sdk_ext.zig").acceptance;
 /// The plugin's draw for every row handed to the host (`sdk_ext.sampler`): bound per request by `draft_lane.arm`.
 pub const Sampler = @import("../../sdk_ext.zig").sampler.SamplerOf(graph.G);
-const pagecache = @import("../mimo_v2/pagecache.zig");
 /// Profile builds only (glm5_next/profile.zig): the route trace, the prompt timeline, the phase lines, the decode
 /// timers and the serial forwards' GPU timeline; every call compiles to nothing in a served build.
 const gprof = @import("profile.zig");
@@ -46,6 +45,7 @@ const warm = @import("warm.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const expert_tally = @import("../../sdk_ext.zig").expert.tally;
 const expert_usage = @import("../../sdk_ext.zig").expert.usage;
+const residency = @import("../../sdk_ext/expert/residency.zig");
 const builtin = @import("builtin");
 
 const T = mlx.mlx_array;
@@ -106,13 +106,9 @@ pub const Module = struct {
     installed: Installed = undefined,
     /// The request's prompt tail: its prompt length and the parts timed in the prompt pass (the tail line).
     tail: Tail = .{},
-    /// The rate tally's file (`expert_tally.pathOf`; null: none, as in test builds or under `expert_tally_file: off`)
-    /// and the rates each request's end folds in and writes (layers x experts; empty: no tally, ratio 0).
-    tally_path: ?[]u8 = null,
-    tally_rates: []f32 = &.{},
-    /// The usage profile's record (`expert_usage_record`; null: off, the default): each request's end adds its counts
-    /// and writes the file.
-    usage_rec: ?*expert_usage.Recorder = null,
+    /// The rate tally, the usage record and the usage seed (sdk_ext/expert/residency.zig): the tally's file and rates,
+    /// the record (null: off, the default).
+    res: residency.Residency = .{},
 
     const Decode = struct { steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0, s0: @import("../../sdk_ext.zig").expert.Stats = .{}, active: bool = false, prompt_tokens: u64 = 0 };
     const Installed = struct {
@@ -452,131 +448,50 @@ pub const Module = struct {
     /// Once, at construction (every command retired, MLX's cache cleared): the footprint beside the bill's construction
     /// terms at the prompt rows. A report, as MiMo's: an under-bill is the bill's bug for its tests and the window guard.
     fn checkConstruction(self: *Module, b: sdk.MemoryBill, rows: u32) void {
-        _ = mlx.mlx_synchronize(self.g.s);
-        _ = mlx.mlx_clear_cache();
-        const footprint = sdk.memory.footprint().now;
-        var active: usize = 0;
-        var cache: usize = 0;
-        _ = mlx.mlx_get_active_memory(&active);
-        _ = mlx.mlx_get_cache_memory(&cache);
-        const billed = b.constructionBytes(rows);
-        log.info("glm5_next construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B), billed construction terms {d} B, residual {d} B (billed less footprint)\n", .{ footprint, active, cache, footprint -| active -| cache, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(footprint)) });
-        if (footprint > billed + bill.construction_tolerance_bytes)
-            log.warn("glm5_next construction check: the footprint {d} B exceeds the billed construction terms {d} B by more than {d} B (an under-bill: proceeding)\n", .{ footprint, billed, bill.construction_tolerance_bytes });
+        @import("../mimo_v2/route.zig").constructionCheck("glm5_next", self.g.s, b, rows, bill.construction_tolerance_bytes);
     }
 
-    /// The rate tally at construction (glm_moe_dsa's `openTally`): nothing at ratio 0 (no tally: the stream got none);
-    /// else the rates its requests' ends fold in, and the file read (`expert_tally_file` on / pinned) to seed the first
-    /// request's pins; never in test builds (their HOME is the box user's). One line either way.
+    /// The rate tally at construction (residency.zig `openTally`): one line either way.
     fn openTally(self: *Module, dir: []const u8, decode_rows: u32) !void {
-        const t = self.c.tally;
-        if (!t.enabled()) {
-            log.info("glm5_next expert tally: off (expert_resident_ratio 0: no rate tally, no pins, no file)\n", .{});
-            return;
+        switch (self.src) {
+            inline else => |x| try self.res.openTally(self.gpa, self.io, "glm5_next", self.c.tally, dir, decode_rows, x),
         }
-        const shape = self.srcTallyShape();
-        self.tally_rates = try self.gpa.alloc(f32, @as(usize, shape.layers) * shape.experts);
-        @memset(self.tally_rates, 0);
-        errdefer self.closeTally();
-        const pins = @min(expert_tally.pinLimit(t.ratio, shape.experts), decode_rows);
-        var status: []const u8 = "no file (expert_tally_file off): every request after the first pins from the last one's rates";
-        if (!builtin.is_test and t.readsFile()) {
-            const key = try expert_tally.keyOf(self.gpa, "glm5_next", dir);
-            defer self.gpa.free(key);
-            self.tally_path = try expert_tally.pathOf(self.gpa, key);
-            if (self.tally_path) |path| switch (try expert_tally.read(self.gpa, self.io, path, shape.layers, shape.experts)) {
-                .rates => |r| {
-                    defer self.gpa.free(r);
-                    @memcpy(self.tally_rates, r);
-                    switch (self.src) {
-                        inline else => |x| x.seedTally(r),
-                    }
-                    status = "file read: the first request pins from it";
-                },
-                .missing => status = "no file yet: the first request plans as without a tally",
-                .mismatched => {
-                    log.warn("glm5_next expert tally: {s} is not this stream's ({d} layers of {d} experts, version {d}): ignored\n", .{ path, shape.layers, shape.experts, expert_tally.version });
-                    status = "file of another geometry ignored: the first request plans as without a tally";
-                },
-            } else status = "no HOME, no file: every request after the first pins from the last one's rates";
-        }
-        log.info("glm5_next expert tally installed: expert_resident_ratio={d} pins={d} of {d} decode rows a layer, window {d} routes, expert_tally_file={s} path={s}; {s}\n", .{ t.ratio, pins, decode_rows, t.window, @tagName(t.file), if (self.tally_path) |p| p else "none", status });
     }
 
-    /// `expert_usage_record` at construction: off (no recorder, no route counted), or the recorder over the stream's
-    /// layers and experts and the decode routes counted (`countRoutes`). One line.
+    /// `expert_usage_record` at construction (residency.zig `openUsage`).
     fn openUsage(self: *Module) !void {
-        const path = self.c.residency.recordPath() orelse return;
-        const shape = self.srcTallyShape();
-        self.usage_rec = try expert_usage.Recorder.init(self.gpa, self.io, path, "glm5_next", self.c.residency.label(), shape.layers, shape.experts);
         switch (self.src) {
-            inline else => |x| x.countRoutes(),
+            inline else => |x| try self.res.openUsage(self.gpa, self.io, "glm5_next", &self.c.residency, x),
         }
-        log.info("glm5_next expert usage record: on path={s} label={s} ({d} layers x {d} experts; each request's prompt routed ids and decode routes, written at its end; binary {s})\n", .{ path, self.c.residency.label(), shape.layers, shape.experts, self.usage_rec.?.binary_sha256[0..8] });
     }
 
     fn closeUsage(self: *Module) void {
-        if (self.usage_rec) |r| r.deinit();
-        self.usage_rec = null;
+        self.res.closeUsage();
     }
 
-    /// The request's usage (`expert_usage_record` on): its counts added before the tally's end (which zeroes the decode
-    /// counts), then the file written. A failed write is logged; the request is not failed.
+    /// The request's usage (residency.zig `endUsage`): its counts added before the tally's end, the file written.
     fn endUsage(self: *Module, d: Decode) void {
-        const r = self.usage_rec orelse return;
         switch (self.src) {
-            inline else => |x| x.addUsage(r.counts),
+            inline else => |x| self.res.endUsage(self.io, "glm5_next", x, d.prompt_tokens, d.tokens),
         }
-        r.endRequest(self.io, d.prompt_tokens, d.tokens) catch |e| {
-            log.warn("glm5_next expert usage: not written to {s}: {s}\n", .{ r.path, @errorName(e) });
-            return;
-        };
-        log.info("glm5_next expert usage: written to {s} ({d} requests, {d} prompt + {d} decode tokens)\n", .{ r.path, r.requests, r.prompt_tokens, r.decode_tokens });
     }
 
-    /// `resident_seed` at construction (sdk_ext/expert/usage.zig `decide`): `usage` when the pack has
-    /// `expert-usage-v1.json` (or by name), the prompt rows filled from it (`Source.seedResidents`); `none` otherwise.
-    /// A malformed file, or one of another model or geometry, refuses the load by name. One line, with the load's cost.
+    /// `resident_seed` at construction (residency.zig `seedResidents`): one line, with the load's cost.
     fn seedResidents(self: *Module, dir: []const u8) !void {
-        const shape = self.srcTallyShape();
-        var d = try expert_usage.decide(self.gpa, self.io, &self.c.residency, dir, "glm5_next", shape.layers, shape.experts);
-        defer if (d.profile) |*p| p.deinit();
-        var lb: [768]u8 = undefined;
-        const p = if (d.profile) |*x| x else {
-            log.info("{s}\n", .{expert_usage.seedLine(&lb, "glm5_next", &d, .{ .min = 0, .max = 0, .rows_min = 0, .rows_max = 0, .records = 0 }, 0, 0)});
-            return;
-        };
-        const s0 = self.srcStats();
-        const t0 = self.nowNs();
-        const r = switch (self.src) {
-            inline else => |x| try x.seedResidents(p),
-        };
-        const ms = (self.nowNs() - t0) / std.time.ns_per_ms;
-        log.info("{s}\n", .{expert_usage.seedLine(&lb, "glm5_next", &d, r, self.srcStats().expert_bytes_read -| s0.expert_bytes_read, ms)});
+        switch (self.src) {
+            inline else => |x| try residency.seedResidents(self.gpa, self.io, "glm5_next", &self.c.residency, dir, x, .empty),
+        }
     }
 
     fn closeTally(self: *Module) void {
-        if (self.tally_path) |p| self.gpa.free(p);
-        self.tally_path = null;
-        if (self.tally_rates.len > 0) self.gpa.free(self.tally_rates);
-        self.tally_rates = &.{};
+        self.res.closeTally(self.gpa);
     }
 
-    /// The request's end for the tally (glm_moe_dsa's `endTally`): each layer's decode rates folded in (the next request
-    /// pins from them), the file written under `expert_tally_file: on`. A failure is logged; the request is not failed.
+    /// The request's end for the tally (residency.zig `endTally`).
     fn endTally(self: *Module) void {
-        if (self.tally_rates.len == 0) return;
-        const routed = switch (self.src) {
-            inline else => |x| x.endTally(self.tally_rates),
-        };
-        const path = self.tally_path orelse return;
-        if (routed == 0 or !self.c.tally.writesFile()) return;
-        const shape = self.srcTallyShape();
-        expert_tally.write(self.gpa, self.io, path, self.tally_rates, shape.layers, shape.experts, self.c.tally.window) catch |e| {
-            log.warn("glm5_next expert tally: not written to {s}: {s}\n", .{ path, @errorName(e) });
-            return;
-        };
-        log.info("glm5_next expert tally: written to {s} ({d} of {d} layers routed in the decode)\n", .{ path, routed, shape.layers });
+        switch (self.src) {
+            inline else => |x| self.res.endTally(self.gpa, self.io, "glm5_next", self.c.tally, x),
+        }
     }
 
     pub fn deinit(self: *Module) void {
@@ -1134,17 +1049,12 @@ fn roundPassOf(gl: glue.Route, fam: experts.Family) *const fn (*Module, std.mem.
     };
 }
 
-/// The construction config the module fills on: the host's facts, with the fill's baseline the box as the window guard
-/// counts it (MiMo's `pagecache.admissionBaseline`: physical used less the pack's own page cache, evicted here, floored
-/// at the host's non-file baseline).
+/// The construction config the module fills on: the host's facts, with the fill's baseline by glm5_next's route
+/// (`bill.fill_baseline`: MiMo's box baseline, physical used less the pack's own page cache, evicted here, floored at
+/// the host's non-file baseline).
 pub fn admitted(io: std.Io, c: *const settings.Config, facts: *const sdk.LoadFacts) !settings.Config {
     var built = c.withFacts(facts);
-    if (facts.memory_baseline_bytes) |nonfile| if (c.model_dir) |dir| {
-        const physical_used = sdk.memory.physicalUsedBytes(sdk.memory.vmBytes());
-        const pack_cached = try pagecache.packCachedBytes(io, dir, true);
-        built.memory_baseline_bytes = pagecache.baselineOf(physical_used, pack_cached, nonfile);
-        log.info("glm5_next admission baseline: physical_used={d} pack_cached={d} nonfile={d} -> baseline={d}\n", .{ physical_used, pack_cached, nonfile, built.memory_baseline_bytes.? });
-    };
+    built.memory_baseline_bytes = try @import("../mimo_v2/route_bill.zig").admissionBaseline(io, "glm5_next", bill.fill_baseline, c.model_dir, facts);
     return built;
 }
 

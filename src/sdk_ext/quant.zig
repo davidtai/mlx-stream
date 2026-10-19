@@ -58,6 +58,9 @@ pub const Activation = union(enum) {
     swiglu,
     /// silu(min(gate, limit)) * clip(up, -limit, limit) (DeepSeek-V4.1's swiglu_limit)
     swiglu_clamped: f64,
+    /// (silu(f32(gate)) * f32(up)) rounded once to the gate's dtype (Beam's: the transformers reference evaluates the
+    /// SwiGLU and its product in f32)
+    swiglu_f32,
 };
 
 /// What the arch asks of the quant at accept.
@@ -198,7 +201,20 @@ pub fn activation(comptime G: type, g: *G, act: Activation, gate: G.T, up: G.T) 
             const gc = try g.minimum(gate, try g.scalar(lim, g.dtypeOf(gate)));
             return g.mul(try g.silu(gc), uc);
         },
+        .swiglu_f32 => {
+            // MLX's backend: the chain below as one compiled kernel (its f32 values never leave the registers).
+            if (comptime @hasDecl(G, "swigluF32")) return g.swigluF32(gate, up);
+            return swigluF32Chain(G, g, gate, up);
+        },
     }
+}
+
+/// `swiglu_f32` as backend ops: (silu(f32(gate)) * f32(up)) rounded once to the gate's dtype. A backend without casts
+/// (the CPU trace hosts) cannot take it: refused by name, never a silent route.
+pub fn swigluF32Chain(comptime G: type, g: *G, gate: G.T, up: G.T) !G.T {
+    if (comptime !@hasDecl(G, "astype")) return error.ActivationNotFused;
+    const dt = g.dtypeOf(gate);
+    return g.astype(try g.mul(try g.silu(try g.astype(gate, .float32)), try g.astype(up, .float32)), dt);
 }
 
 // ── FromGatherMatmul: the stock path as a C2 client ──

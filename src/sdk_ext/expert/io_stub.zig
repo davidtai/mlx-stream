@@ -71,6 +71,12 @@ pub const q3ld = struct {
     pub fn q3ld_direct_config(_: i32) c_int {
         return -1;
     }
+    pub fn q3ld_split_config(_: i64) c_int {
+        return -1;
+    }
+    pub fn q3ld_split_phase(_: i32) i32 {
+        return 0;
+    }
     pub fn q3ld_abi() i32 {
         return 0;
     }

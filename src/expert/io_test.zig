@@ -1633,3 +1633,304 @@ test "glm io: with direct reads every range lands straight in its rows (aligned 
     try testing.expectEqual(@as(i64, 2 * n), pool.counter(.direct_ranges));
     try testing.expectEqual(@as(i64, 2), pool.result(first + 1).preadv_calls);
 }
+
+/// The co-read test's pool event log (a static buffer: the pool writes it until the test detaches it).
+const CoReadLog = struct {
+    var buf: [5 * 64]i64 = undefined;
+    var off: [5]i64 = undefined;
+};
+
+fn landed1(p: *Pool) bool {
+    return p.counter(.landed) >= 1;
+}
+
+test "beam io M1: a claimed record's chunks that no thread started are read by both speculative threads at once; an unclaimed record parks to help, and its settle drops it" {
+    // Each chunk of the records sleeps 150 ms in the pool (one injected rule per chunk offset), so the claims below come
+    // while the records' first chunks are in flight. The counters prove the schedule; the bytes prove the copy. A box that
+    // stalls the test thread past a chunk skips the step, never asserts on a race.
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(64 * page);
+    defer f.deinit();
+    const fd = f.ufd.fd;
+    const size: i64 = @intCast(f.ufd.size);
+    const pg: i64 = @intCast(page);
+    const rec: u64 = 4 * page;
+    const gu_len: i64 = 3 * pg - 100;
+    const down_len: i64 = pg + 100;
+    const hold: i64 = 150 * std.time.ns_per_ms;
+    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 4 * page, .tickets = 128, .spec = .{ .threads = 2, .slots = 4, .record_bytes = rec, .chunk_bytes = page } });
+    defer pool.stop();
+    defer clearFaults();
+    const buf = try testing.allocator.alloc(u8, rec);
+    defer testing.allocator.free(buf);
+
+    // A: one record of four chunks, claimed by a demand submit while its first chunk reads.
+    const A: i64 = 10 * pg;
+    var o4: [4]i64 = undefined;
+    for (&o4, 0..) |*o, k| o.* = A + @as(i64, @intCast(k)) * pg;
+    injectFaults(&o4, &@as([4]i64, @splat(5)), &@as([4]i64, @splat(hold)));
+    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 1, &.{A}, rec));
+    try waitFor(pool, specStarted(1).f);
+    if (pool.counter(.spec_chunks) >= 2) {
+        std.debug.print("SPECPROBE skipped: A read two chunks before its claim (box loaded)\n", .{});
+        return error.SkipZigTest;
+    }
+    @memset(buf, 0xAA);
+    _ = q3raw.q3ld_test_events(&CoReadLog.buf, 64);
+    defer _ = q3raw.q3ld_test_events(&CoReadLog.off, 0);
+    const evs = &CoReadLog.buf;
+    const t0 = c.q3ld_monotonic_ns();
+    try testing.expectEqual(@as(c_int, 0), rawSubmit(pool, fd, size, -1, @intCast(A), @intCast(A + gu_len), &.{gu_len}, &.{down_len}, buf, 0));
+    try pool.wait(0, 2, 10 * std.time.ns_per_s);
+    const ms = @as(f64, @floatFromInt(c.q3ld_monotonic_ns() - t0)) / 1e6;
+    // The pool's event log (kind 7: a claimed record's chunk start): the joiner's chunk at the claim, then two at once.
+    const n_ev: usize = @intCast(q3raw.q3ld_test_events(null, 0));
+    var starts: [8]f64 = undefined;
+    var n_starts: usize = 0;
+    for (0..@min(n_ev, 64)) |i| {
+        const e = evs[5 * i ..][0..5];
+        if (e[0] == 7 and n_starts < starts.len) {
+            starts[n_starts] = @as(f64, @floatFromInt(e[3] - t0)) / 1e6;
+            n_starts += 1;
+        }
+    }
+    std.debug.print("BEAM_M1_COREAD A: claimed chunk starts at {any} ms after the claim\n", .{starts[0..n_starts]});
+    for (0..2) |k| {
+        try testing.expectEqual(Status.ok, pool.result(@intCast(k)).status);
+        try testing.expectEqual(@as(i64, 0), pool.result(@intCast(k)).preadv_calls);
+    }
+    try testing.expectEqualSlices(u8, f.image[@intCast(A)..][0..rec], buf);
+    try testing.expectEqual(@as(i64, 1), pool.counter(.claimed));
+    try testing.expectEqual(@as(i64, 1), pool.counter(.claimed_inflight));
+    try waitFor(pool, landed1);
+    try testing.expectEqual(@as(i64, 4), pool.counter(.spec_chunks));
+    try testing.expect(pool.counter(.co_reads) >= 1);
+    std.debug.print("BEAM_M1_COREAD A: claim to served {d:.1} ms (chunks of {d} ms: one reader takes 3 to 4, two readers 2 to 3), co_reads={d}\n", .{ ms, @divTrunc(hold, std.time.ns_per_ms), pool.counter(.co_reads) });
+
+    // B and C: two records issued together, a thread each; C is claimed during its first chunk, B is not. At B's next
+    // boundary its thread parks B and reads C's open chunks beside C's own reader; the next call's settle drops B.
+    clearFaults();
+    const B: i64 = 30 * pg;
+    const C: i64 = 40 * pg;
+    var o8: [8]i64 = undefined;
+    for (0..4) |k| {
+        o8[k] = B + @as(i64, @intCast(k)) * pg;
+        o8[4 + k] = C + @as(i64, @intCast(k)) * pg;
+    }
+    injectFaults(&o8, &@as([8]i64, @splat(5)), &@as([8]i64, @splat(hold)));
+    const co0 = pool.counter(.co_reads);
+    const parks0 = pool.counter(.parks);
+    const chunks0 = pool.counter(.spec_chunks);
+    try testing.expectEqual(@as(u32, 2), try pool.specStep(f.ufd, 2, &.{ B, C }, rec));
+    try waitFor(pool, specStarted(3).f);
+    if (pool.counter(.spec_chunks) != chunks0) {
+        std.debug.print("SPECPROBE skipped: a first chunk of B or C ended before C's claim (box loaded)\n", .{});
+        return error.SkipZigTest;
+    }
+    @memset(buf, 0xAA);
+    try testing.expectEqual(@as(c_int, 0), rawSubmit(pool, fd, size, -1, @intCast(C), @intCast(C + gu_len), &.{gu_len}, &.{down_len}, buf, 2));
+    try pool.wait(2, 2, 10 * std.time.ns_per_s);
+    try testing.expectEqualSlices(u8, f.image[@intCast(C)..][0..rec], buf);
+    for (2..4) |k| {
+        try testing.expectEqual(Status.ok, pool.result(@intCast(k)).status);
+        try testing.expectEqual(@as(i64, 0), pool.result(@intCast(k)).preadv_calls);
+    }
+    try testing.expect(pool.counter(.parks) > parks0);
+    try testing.expect(pool.counter(.co_reads) > co0);
+    // B is unclaimed: the next call's settle drops it (parked: at once; resumed meanwhile: at its next boundary).
+    const ab0 = pool.counter(.abandoned);
+    _ = try pool.specStep(f.ufd, 3, &.{}, rec);
+    var t: u32 = 0;
+    while (pool.counter(.abandoned) < ab0 + 1) : (t += 1) {
+        if (t > 10_000) return error.Timeout;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(!specStateIs(B, 2));
+    std.debug.print("BEAM_M1_COREAD B/C: parks={d} co_reads={d}\n", .{ pool.counter(.parks) - parks0, pool.counter(.co_reads) - co0 });
+}
+
+test "beam io M1b: a demand range of a claimed record copies its landed chunks while the rest is read; a record that fails after a part was copied leaves the range to the stock read" {
+    // Each chunk sleeps 150 ms in the pool (injected rules), so the first chunks land well before the record does.
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(64 * page);
+    defer f.deinit();
+    const fd = f.ufd.fd;
+    const size: i64 = @intCast(f.ufd.size);
+    const pg: i64 = @intCast(page);
+    const rec: u64 = 4 * page;
+    const gu_len: i64 = 3 * pg - 100;
+    const down_len: i64 = pg + 100;
+    const hold: i64 = 150 * std.time.ns_per_ms;
+    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 4 * page, .tickets = 128, .spec = .{ .threads = 2, .slots = 4, .record_bytes = rec, .chunk_bytes = page } });
+    defer pool.stop();
+    defer clearFaults();
+    const buf = try testing.allocator.alloc(u8, rec);
+    defer testing.allocator.free(buf);
+    _ = q3raw.q3ld_test_events(&CoReadLog.buf, 64);
+    defer _ = q3raw.q3ld_test_events(&CoReadLog.off, 0);
+
+    // A: the gate/up range (chunks 1-3) copies chunks 1 and 2 when they land, before the record lands (event 5 before 4).
+    const A: i64 = 10 * pg;
+    var o4: [4]i64 = undefined;
+    for (&o4, 0..) |*o, k| o.* = A + @as(i64, @intCast(k)) * pg;
+    injectFaults(&o4, &@as([4]i64, @splat(5)), &@as([4]i64, @splat(hold)));
+    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 1, &.{A}, rec));
+    try waitFor(pool, specStarted(1).f);
+    if (pool.counter(.spec_chunks) >= 1) {
+        std.debug.print("SPECPROBE skipped: A's first chunk landed before its claim (box loaded)\n", .{});
+        return error.SkipZigTest;
+    }
+    _ = q3raw.q3ld_test_events(&CoReadLog.buf, 64);
+    @memset(buf, 0xAA);
+    try testing.expectEqual(@as(c_int, 0), rawSubmit(pool, fd, size, -1, @intCast(A), @intCast(A + gu_len), &.{gu_len}, &.{down_len}, buf, 0));
+    try pool.wait(0, 2, 10 * std.time.ns_per_s);
+    try testing.expectEqualSlices(u8, f.image[@intCast(A)..][0..rec], buf);
+    for (0..2) |k| {
+        try testing.expectEqual(Status.ok, pool.result(@intCast(k)).status);
+        try testing.expectEqual(@as(i64, 0), pool.result(@intCast(k)).preadv_calls);
+    }
+    try waitFor(pool, landed1);
+    const n_ev: usize = @intCast(q3raw.q3ld_test_events(null, 0));
+    var t_adopt: ?i64 = null;
+    var t_end: ?i64 = null;
+    for (0..@min(n_ev, 64)) |i| {
+        const e = CoReadLog.buf[5 * i ..][0..5];
+        if (e[0] == 5 and t_adopt == null) t_adopt = e[3];
+        if (e[0] == 4 and e[4] == A and t_end == null) t_end = e[3];
+    }
+    try testing.expect(t_adopt != null and t_end != null);
+    try testing.expect(t_adopt.? < t_end.?);
+    std.debug.print("BEAM_M1B_ADOPT A: the first adopt copy {d:.1} ms before the record landed\n", .{@as(f64, @floatFromInt(t_end.? - t_adopt.?)) / 1e6});
+
+    // B: chunk 3 fails (EIO) after the gate/up range copied chunks 1 and 2: both ranges are read the stock way.
+    clearFaults();
+    const B: i64 = 30 * pg;
+    injectFaults(&[_]i64{ B, B + pg, B + 2 * pg, B + 3 * pg }, &[_]i64{ 5, 5, 2, 5 }, &[_]i64{ hold, hold, 0, hold });
+    const failed0 = pool.counter(.failed);
+    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 2, &.{B}, rec));
+    try waitFor(pool, specStarted(2).f);
+    @memset(buf, 0xAA);
+    try testing.expectEqual(@as(c_int, 0), rawSubmit(pool, fd, size, -1, @intCast(B), @intCast(B + gu_len), &.{gu_len}, &.{down_len}, buf, 2));
+    try pool.wait(2, 2, 10 * std.time.ns_per_s);
+    try testing.expectEqualSlices(u8, f.image[@intCast(B)..][0..rec], buf);
+    for (2..4) |k| {
+        try testing.expectEqual(Status.ok, pool.result(@intCast(k)).status);
+        try testing.expect(pool.result(@intCast(k)).preadv_calls >= 1);
+    }
+    // The record ends FAILED when its last reader leaves (chunk 4's, after the stock reads served the ranges).
+    var t: u32 = 0;
+    while (pool.counter(.failed) < failed0 + 1) : (t += 1) {
+        if (t > 10_000) return error.Timeout;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(specStateIs(B, 4));
+}
+
+// M2a, D10's copy split behind the decode phase gate: Beam's part shapes scaled to pages (the words whole pages and a
+// tail, the scales a few hundred bytes, each global scale 4 B), so the pieces' bounds fall inside parts and every part
+// boundary inside a piece.
+const split_lens = [n_components]u64{ 3 * 16384 + 1000, 900, 4, 3 * 16384 + 1000, 900, 4, 2 * 16384 + 500, 300, 4 };
+const split_gu_len: u64 = 2 * (3 * 16384 + 1000 + 900 + 4);
+const split_rec_len: u64 = split_gu_len + 2 * 16384 + 500 + 300 + 4;
+
+fn splitPool(workers: u32, split: u64) !*Pool {
+    const page = std.heap.pageSize();
+    return Pool.start(testing.allocator, .{ .workers = workers, .staging_bytes = 16 * page, .tickets = 128, .split_bytes = split, .spec = .{
+        .threads = 1,
+        .slots = 2,
+        .record_bytes = split_rec_len,
+        .chunk_bytes = page,
+    } });
+}
+
+test "beam io M2a: with the split route and its phase gate open a range's copy into its rows runs in pieces side by side; one read a span; the gate shut copies as the stock loop; the bytes are the stock loop's" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(96 * 16384 + page);
+    defer f.deinit();
+    const n = 3;
+    var gu: [n]u64 = undefined;
+    var down: [n]u64 = undefined;
+    for (0..n) |i| {
+        gu[i] = (2 + 11 * i) * 16384 + 37 * i + 5;
+        down[i] = gu[i] + split_gu_len;
+    }
+    // Per pool: the gate shut (the start's), then open, then shut again; the counter after each submit.
+    const Case = struct { split: u64, want: [3]i64 };
+    for ([_]Case{ .{ .split = 0, .want = .{ 0, 0, 0 } }, .{ .split = page, .want = .{ 0, 2 * n, 2 * n } }, .{ .split = 2 * page, .want = .{ 0, 2 * n, 2 * n } } }) |cs| {
+        var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 16 * page, .tickets = 64, .split_bytes = cs.split });
+        defer pool.stop();
+        for (cs.want, [_]?bool{ null, true, false }) |want, gate| {
+            // The gate's previous state: shut at start, then open.
+            if (gate) |on| try testing.expectEqual(!on, pool.splitPhase(on));
+            var d = try Dests.initPages(n, &split_lens, 3);
+            defer d.deinit();
+            const first = try R96.submit(pool, f.ufd, &gu, &down, d.rows[0..n], &split_lens);
+            try pool.wait(first, 2 * n, 10 * std.time.ns_per_s);
+            for (0..n) |i| {
+                try d.expectRecord(i, f.image, gu[i], down[i], &split_lens);
+                for ([_]u32{ @intCast(i), @intCast(n + i) }) |k| {
+                    const r = pool.result(first + k);
+                    try testing.expectEqual(Status.ok, r.status);
+                    try testing.expectEqual(@as(i64, 1), r.preadv_calls);
+                }
+                try testing.expectEqual(@as(i64, @intCast(split_gu_len)), pool.result(first + @as(u32, @intCast(i))).payload);
+            }
+            try testing.expectEqual(want, pool.counter(.split_ranges));
+        }
+    }
+    // The gate open: a failed read fails its range before any copy; the other ranges land.
+    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 16 * page, .tickets = 64, .split_bytes = page });
+    defer pool.stop();
+    defer clearFaults();
+    _ = pool.splitPhase(true);
+    var d = try Dests.initPages(n, &split_lens, 0);
+    defer d.deinit();
+    injectFault(gu[1] / page * page, 2, 0);
+    const first = try R96.submit(pool, f.ufd, &gu, &down, d.rows[0..n], &split_lens);
+    try pool.wait(first, 2 * n, 10 * std.time.ns_per_s);
+    try testing.expectEqual(Status.os_error, pool.result(first + 1).status);
+    try testing.expectEqual(Status.ok, pool.result(first).status);
+    try d.expectRecord(0, f.image, gu[0], down[0], &split_lens);
+    try d.expectRecord(2, f.image, gu[2], down[2], &split_lens);
+}
+
+test "beam io M2a: with the split route's gate open a pre-range's copy runs in pieces after its bind, and an adopted range's out of its speculative record; an unbound pre-range copies nothing" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(96 * 16384 + page);
+    defer f.deinit();
+    var pool = try splitPool(4, page);
+    defer pool.stop();
+    _ = pool.splitPhase(true);
+    try R96.armPreRead(pool, &split_lens);
+    const recs = [2]u64{ 5 * 16384 + 11, 31 * 16384 + 13 };
+    try testing.expectEqual(@as(u32, 4), try R96.preRead(pool, f.ufd, 1, &.{ @intCast(recs[0]), @intCast(recs[1]) }, &split_lens));
+    try waitFor(pool, preCount);
+    var d = try Dests.init(2, &split_lens);
+    defer testing.allocator.free(d.buf);
+    const first = try R96.submit(pool, f.ufd, &recs, &.{ recs[0] + split_gu_len, recs[1] + split_gu_len }, d.rows[0..2], &split_lens);
+    try pool.wait(first, 4, 10 * std.time.ns_per_s);
+    for (0..2) |i| try d.expectRecord(i, f.image, recs[i], recs[i] + split_gu_len, &split_lens);
+    try testing.expectEqual(@as(i64, 4), pool.counter(.pre_served));
+    try testing.expectEqual(@as(i64, 4), pool.counter(.split_ranges));
+    _ = try pool.specStep(f.ufd, 1, &.{}, 0);
+    // Unbound: pre-read, never demanded; the settle expires both ranges before any copy.
+    const lone: u64 = 60 * 16384 + 5;
+    try testing.expectEqual(@as(u32, 2), try R96.preRead(pool, f.ufd, 2, &.{@intCast(lone)}, &split_lens));
+    try waitFor(pool, preCount6);
+    _ = try pool.specStep(f.ufd, 2, &.{}, 0);
+    try waitFor(pool, preIdle);
+    try testing.expectEqual(@as(i64, 2), pool.counter(.pre_expired));
+    try testing.expectEqual(@as(i64, 4), pool.counter(.split_ranges));
+    // Adopted: a landed speculative record serves both ranges of its demand read, each copy in pieces (no preadv).
+    const base: u64 = 70 * 16384 + 100;
+    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 3, &.{@intCast(base)}, 0));
+    try waitFor(@as(i64, @intCast(base)), landedAt);
+    var e = try Dests.init(1, &split_lens);
+    defer testing.allocator.free(e.buf);
+    const second = try R96.submit(pool, f.ufd, &.{base}, &.{base + split_gu_len}, e.rows[0..1], &split_lens);
+    try pool.wait(second, 2, 10 * std.time.ns_per_s);
+    try e.expectRecord(0, f.image, base, base + split_gu_len, &split_lens);
+    for (0..2) |k| try testing.expectEqual(@as(i64, 0), pool.result(second + @as(u32, @intCast(k))).preadv_calls);
+    try testing.expectEqual(@as(i64, 2), pool.counter(.adopt_ranges));
+    try testing.expectEqual(@as(i64, 6), pool.counter(.split_ranges));
+}

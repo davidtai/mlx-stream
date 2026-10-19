@@ -913,10 +913,8 @@ pub const Live = struct {
 };
 
 /// The rest of the box the bill sits beside: the reading `rest`, at least `floor`
-/// (`settings.Config.rest_of_box_floor_bytes`; null: the reading).
-pub fn restOfBox(rest: u64, floor: ?u64) u64 {
-    return @max(rest, floor orelse 0);
-}
+/// (`settings.Config.rest_of_box_floor_bytes`; null: the reading). The shared machinery's (`phase_memory.zig`).
+pub const restOfBox = phase_mem.restOfBox;
 
 /// `rows` at most `cap` units in each phase (`settings.Config.expert_units_cap`; null: as they are).
 pub fn capRows(rows: sdk.Rows, cap: ?u32) sdk.Rows {

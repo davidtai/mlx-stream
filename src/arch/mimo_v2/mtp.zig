@@ -27,13 +27,13 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
-const io_util = sdk.io_util;
 const mimo = @import("config.zig");
 const tm = @import("module.zig");
 const Array = mlx.mlx_array;
 const Stream = mlx.mlx_stream;
 const QLinear = tm.QLinear;
 const fp8_linear = @import("fp8_linear.zig");
+const sidecar = @import("../../sdk_ext/sidecar.zig");
 const drop = tm.drop;
 
 pub const manifest_file = "mtp-manifest.json";
@@ -245,17 +245,6 @@ pub const Manifest = struct {
         if (total != out.payload_bytes or out.payload_bytes != n_heads * headPayloadBytes(c, out.storage)) return error.MimoMtpManifestGeometry;
         return out;
     }
-
-    /// Entries in file order (the payload is contiguous from offset 0: no gaps, no overlaps).
-    fn sorted(m: *const Manifest) [n_heads * tensors_per_head]Entry {
-        var e = m.entries;
-        std.mem.sort(Entry, e[0..m.count], {}, struct {
-            fn lt(_: void, x: Entry, y: Entry) bool {
-                return x.offset < y.offset;
-            }
-        }.lt);
-        return e;
-    }
 };
 
 fn expectString(o: std.json.ObjectMap, k: []const u8, want: []const u8) !void {
@@ -297,75 +286,42 @@ fn readManifest(a: std.mem.Allocator, io: std.Io, dir: []const u8) ![]u8 {
     };
 }
 
-/// Every tensor's bytes, verified, in file order: the header's entries must be the manifest's (dtype, shape, offsets),
-/// the file exactly header + payload, each tensor's sha256 and the file's sha256 as stated. `sink.take(head, suffix,
-/// shape, bytes)` receives each tensor only after its hash matched (the bytes are reused after it returns).
+/// Every tensor's bytes, verified, in file order (the shared sidecar reader, `sdk_ext/sidecar.zig`): the header's entries
+/// must be the manifest's (dtype, shape, offsets), the file exactly header + payload, each tensor's sha256 and the file's
+/// sha256 as stated. `sink.take(head, suffix, shape, bytes)` receives each tensor only after its hash matched (the bytes
+/// are reused after it returns).
 pub fn verifySidecar(a: std.mem.Allocator, io: std.Io, dir: []const u8, c: mimo.Config, sink: anytype) !Manifest {
     const text = try readManifest(a, io, dir);
     defer a.free(text);
     const m = try Manifest.parse(a, text, c);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, data_file }, 0);
-    defer a.free(path);
-    const fd = io_util.openNoCache(path.ptr, .{}) catch |e| return if (e == error.FileNotFound) error.MimoMtpSidecarMissing else e;
-    defer _ = std.c.close(fd);
-    const size_i = std.c.lseek(fd, 0, std.c.SEEK.END);
-    if (size_i < 8 or @as(u64, @intCast(size_i)) != m.data_size) return error.MimoMtpSidecarSize;
-    var prefix: [8]u8 = undefined;
-    try io_util.readAligned(fd, &prefix, 0);
-    const hlen = std.mem.readInt(u64, &prefix, .little);
-    if (hlen < 2 or hlen > header_limit or 8 + hlen + m.payload_bytes != m.data_size) return error.MimoMtpSidecarHeader;
-    const header = try a.alloc(u8, @intCast(hlen));
-    defer a.free(header);
-    try io_util.readAligned(fd, header, 8);
-    try checkHeader(a, header, &m, c);
-    var file_hash = std.crypto.hash.sha2.Sha256.init(.{});
-    file_hash.update(&prefix);
-    file_hash.update(header);
-    var widest: u64 = 0;
-    for (m.entries[0..m.count]) |e| widest = @max(widest, e.length);
-    const buf = try std.heap.page_allocator.alloc(u8, @intCast(widest));
-    defer std.heap.page_allocator.free(buf);
-    var next: u64 = 0;
-    const ordered = m.sorted();
-    for (ordered[0..m.count]) |e| {
-        if (e.offset != next) return error.MimoMtpSidecarLayout;
-        const bytes = buf[0..@intCast(e.length)];
-        try io_util.readAligned(fd, bytes, 8 + hlen + e.offset);
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-        if (!std.mem.eql(u8, &digest, &e.sha256)) return error.MimoMtpTensorSha;
-        file_hash.update(bytes);
-        try sink.take(e.head, e.suffix, expectedShape(c, suffixes[e.suffix], m.storage), bytes);
-        next = e.offset + e.length;
-    }
-    var whole: [32]u8 = undefined;
-    file_hash.final(&whole);
-    if (!std.mem.eql(u8, &whole, &m.data_sha256)) return error.MimoMtpSidecarSha;
-    return m;
-}
-
-fn checkHeader(a: std.mem.Allocator, header: []const u8, m: *const Manifest, c: mimo.Config) !void {
-    const parsed = std.json.parseFromSlice(std.json.Value, a, header, .{}) catch return error.MimoMtpSidecarHeader;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.MimoMtpSidecarHeader;
-    var count: usize = 0;
-    var it = parsed.value.object.iterator();
-    while (it.next()) |kv| count += @intFromBool(!std.mem.eql(u8, kv.key_ptr.*, "__metadata__"));
-    if (count != m.count) return error.MimoMtpSidecarHeader;
-    var name_buf: [128]u8 = undefined;
-    for (m.entries[0..m.count]) |e| {
-        const s = suffixes[e.suffix];
-        const name = try std.fmt.bufPrint(&name_buf, "model.mtp.layers.{d}.{s}", .{ e.head, s.name });
-        const t = parsed.value.object.get(name) orelse return error.MimoMtpSidecarHeader;
-        if (t != .object) return error.MimoMtpSidecarHeader;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const entries = try arena.allocator().alloc(sidecar.Entry, m.count);
+    for (entries, m.entries[0..m.count]) |*e, me| {
+        const s = suffixes[me.suffix];
         const sh = expectedShape(c, s, m.storage);
-        const dt = t.object.get("dtype") orelse return error.MimoMtpSidecarHeader;
-        if (dt != .string or !std.mem.eql(u8, dt.string, @tagName(sh.dtype))) return error.MimoMtpSidecarHeader;
-        expectDims(t.object.get("shape"), sh) catch return error.MimoMtpSidecarHeader;
-        const off = t.object.get("data_offsets") orelse return error.MimoMtpSidecarHeader;
-        if (off != .array or off.array.items.len != 2 or off.array.items[0] != .integer or off.array.items[1] != .integer or
-            off.array.items[0].integer != e.offset or off.array.items[1].integer != e.offset + e.length) return error.MimoMtpSidecarHeader;
+        e.* = .{ .name = try std.fmt.allocPrint(arena.allocator(), "model.mtp.layers.{d}.{s}", .{ me.head, s.name }), .dtype = @tagName(sh.dtype), .rank = sh.rank, .offset = me.offset, .length = me.length, .sha256 = me.sha256 };
+        for (sh.dims[0..sh.rank], 0..) |d, i| e.dims[i] = d;
     }
+    const Take = struct {
+        m: *const Manifest,
+        c: mimo.Config,
+        inner: @TypeOf(sink),
+        pub fn take(self: @This(), i: usize, bytes: []const u8) !void {
+            const me = self.m.entries[i];
+            try self.inner.take(me.head, me.suffix, expectedShape(self.c, suffixes[me.suffix], self.m.storage), bytes);
+        }
+    };
+    sidecar.verify(a, dir, data_file, entries, m.data_size, m.data_sha256, m.payload_bytes, header_limit, Take{ .m = &m, .c = c, .inner = sink }) catch |e| return switch (e) {
+        error.SidecarMissing => error.MimoMtpSidecarMissing,
+        error.SidecarSize => error.MimoMtpSidecarSize,
+        error.SidecarHeader => error.MimoMtpSidecarHeader,
+        error.SidecarLayout => error.MimoMtpSidecarLayout,
+        error.SidecarTensorSha => error.MimoMtpTensorSha,
+        error.SidecarSha => error.MimoMtpSidecarSha,
+        else => e,
+    };
+    return m;
 }
 
 /// One head's arrays (owned).

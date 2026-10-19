@@ -318,10 +318,14 @@ fn phaseRowsBoundary(prompt_rows: [2]u32, decode_rows: [2]u32) !void {
     opts.max_route_ids = 8;
     opts.transient_rows = 16;
     opts.transient_release = true; // the route `Source.initBank` installs with decode rows
+    opts.pool.split_bytes = std.heap.pageSize(); // M2a: the copy split, its phase gate shut in the prompt phase
     const stream = try Stream.init(a, &side.bank, opts);
     defer stream.deinit();
+    try testing.expect(!stream.pool.splitPhase(false));
     try testing.expectEqual(@as(u64, 16 * geom.record_bytes), try stream.releaseTransient());
     try stream.grow(&decode_rows);
+    // The grow opened the split's gate (the previous state, read back by setting it again).
+    try testing.expect(stream.pool.splitPhase(true));
     for (stream.layers, decode_rows, prompt_rows) |*ls, d, p| {
         // The growth request: decode - prompt rows per layer, the residents' base rows unmoved.
         try testing.expectEqual(d - p, ls.ext.?.rows);
@@ -335,6 +339,7 @@ fn phaseRowsBoundary(prompt_rows: [2]u32, decode_rows: [2]u32) !void {
     var grown: u64 = 0;
     for (decode_rows, prompt_rows) |d, p| grown += d - p;
     try testing.expectEqual(@as(u64, (grown + 8) * geom.record_bytes), try stream.shrink(&prompt_rows, .forget));
+    try testing.expect(!stream.pool.splitPhase(false));
     try testing.expectEqual(@as(u64, 16 * geom.record_bytes), try stream.regrowTransient());
     for (stream.layers, prompt_rows) |*ls, p| {
         try testing.expect(ls.ext == null);
@@ -1644,6 +1649,83 @@ test "mimo hitpass: install on the fused route: the hit wave is committed behind
         // hitpass: the barrier's arrays, then the device hit wave; the fused control: nothing before the host read.
         try std.testing.expectEqual(@as(usize, 2), d);
         try std.testing.expectEqual(@as(usize, 0), h);
+    }
+}
+
+/// The routing barrier's hold as the scheduler drives it (`StreamSource.barrier_warm`): each change and the trace's node
+/// count at it.
+const HoldLog = struct {
+    g: *const HitTraceMath.Tr,
+    on: [8]bool = undefined,
+    at: [8]usize = undefined,
+    n: usize = 0,
+    fn arm(self: *HoldLog) gpu_warm.Arm {
+        return .{ .ctx = self, .f = armed, .h = held };
+    }
+    fn armed(_: *anyopaque, _: u64) void {}
+    fn held(p: *anyopaque, on: bool) void {
+        const self: *HoldLog = @ptrCast(@alignCast(p));
+        self.on[self.n] = on;
+        self.at[self.n] = self.g.nodes.items.len;
+        self.n += 1;
+    }
+};
+
+test "mimo stream source: the routing barrier's hold (beam's host-built hit wave) spans the ids' host read to the hit wave's commit; a device hit wave holds nothing" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const Tr = HitTraceMath.Tr;
+    for ([_]bool{ false, true }) |hitpass| {
+        const rows = [_]u32{ 4, 4 };
+        const f = try a.create(HitFixture);
+        defer a.destroy(f);
+        try f.init(a, &rows);
+        defer f.deinit(a);
+        var ss = StreamSource.init(f.stream);
+        var g = Tr.init(a);
+        defer g.deinit();
+        g.record_host = true;
+        var hold: HoldLog = .{ .g = &g };
+        ss.barrier_warm = hold.arm();
+        const Ex = @import("../deepseek_v41/experts.zig").ExpertsWith(Tr, StreamSource, HitTraceMath, .{});
+        const c: @import("config.zig").Config = .{ .hidden_size = 32, .moe_intermediate_size = 32, .n_layers = 3, .n_routed_experts = 64, .n_experts_per_tok = 8 };
+        var ex = try Ex.initWith(a, &g, &ss, .{ .hidden = 32, .inter = 32 }, &c, .{ .banked = true, .devroute = hitpass });
+        defer ex.deinit();
+        try ex.grow(&g, &rows);
+        // Call 1: every expert a miss (no hit wave); call 2: four hits.
+        var script: HitScript = .{ .calls = &.{ &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, &.{ 0, 1, 2, 3, 8, 9, 10, 11 } } };
+        g.host_values = script.values();
+        const xf = try g.input(&.{ 1, 32 }, .bfloat16);
+        const idx = try g.input(&.{ 1, 8 }, .int32);
+        for (0..2) |call_i| {
+            const n0 = hold.n;
+            const start = g.nodes.items.len;
+            _ = try ex.at(1).routed(&g, xf, idx);
+            if (hitpass) {
+                try testing.expectEqual(n0, hold.n);
+                continue;
+            }
+            try testing.expectEqual(n0 + 2, hold.n);
+            try testing.expect(hold.on[n0] and !hold.on[n0 + 1]);
+            // The ids' host read, then (call 2) the hit wave's commit: the first commit after the read.
+            var read: ?usize = null;
+            var commit: ?usize = null;
+            for (g.nodes.items[start..], start..) |nd, i| switch (nd.op) {
+                .host_read => if (read == null) {
+                    read = i;
+                },
+                .async_eval => if (read != null and commit == null) {
+                    commit = i;
+                },
+                else => {},
+            };
+            try testing.expect(hold.at[n0] <= read.?);
+            if (call_i == 1) {
+                // Released right behind the hit wave's commit, before any miss part's wave.
+                try testing.expectEqual(commit.? + 1, hold.at[n0 + 1]);
+            } else try testing.expectEqual(read.? + 1, hold.at[n0 + 1]);
+        }
+        try ex.flush();
     }
 }
 // ── end HITPASS CPU tests ──

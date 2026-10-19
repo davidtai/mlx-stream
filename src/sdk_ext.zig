@@ -22,6 +22,8 @@ pub const ops = @import("sdk_ext/ops.zig");
 pub const acceptance = @import("sdk_ext/acceptance.zig");
 /// The serial sampler: the plugin's position-keyed token for every row it hands the host (one stream with the lanes').
 pub const sampler = @import("sdk_ext/sampler.zig");
+/// A pack's verified sidecar (the draft lanes' weights): the header against the manifest, every tensor's sha256.
+pub const sidecar = @import("sdk_ext/sidecar.zig");
 /// The KV seam: lane storage, routes and bounded caps for a module-owned decode state.
 pub const kv = @import("sdk_ext/kv.zig");
 /// `kv`'s conformance helpers (CPU lane).

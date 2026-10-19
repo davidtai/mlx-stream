@@ -138,6 +138,14 @@ pub const fill_max_tokens: u64 = 1024;
 /// The fill's floor: fewer persistent rows per routed layer refuse the load by name.
 pub const min_fill_rows: u32 = 16;
 
+/// The rest of the box a bill sits beside: the reading `rest` (the host's non-file baseline at the load: wired +
+/// anonymous - purgeable + compressor, `LoadFacts.memory_baseline_bytes`), at least `floor` (null: the reading). Other
+/// files' page cache is not in it: the kernel reclaims those pages when the fill needs them. GLM-5.3's bill and the
+/// route arches that bill on the non-file baseline (`route_bill.Baseline.non_file`) take it from here.
+pub fn restOfBox(rest: u64, floor: ?u64) u64 {
+    return @max(rest, floor orelse 0);
+}
+
 /// The longest prompt a module serves: its `max_context_tokens`, else the standard request's.
 pub fn servedContext(max_context_tokens: ?u32) u64 {
     return max_context_tokens orelse fill_prompt_tokens;

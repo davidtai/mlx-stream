@@ -8,37 +8,21 @@ per-request line, the rung's DONE line and the chain's last LADDER_ROW line. `--
 tables from results.json. Needs matplotlib.
 """
 
-import argparse
 import hashlib
 import json
-import math
 import re
+import sys
 from pathlib import Path
 
-GIB = 1024**3
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sweep_charts import GIB, RUNGS, Sweep, agree, main  # noqa: E402
+
 OUT = Path(__file__).resolve().parent.parent / "docs" / "benchmarks" / "mimo-v26-flash"
 LADDER = "ladder3-20261011"
 BINARY = "746e7da9"
 HOST_COMMIT = "2c041af6"
 PLUGIN_COMMIT = "8e7d186"
 LABEL = "746e7da9: attention kernels at every context"
-COLOR = "#2563eb"
-RUNGS = (("r01-1k", "1K"), ("r02-2k", "2K"), ("r03-4k", "4K"), ("r04-8k", "8K"), ("r05-16k", "16K"),
-         ("r06-32k", "32K"), ("r07-64k", "64K"), ("r08-128k", "128K"), ("r09-256k", "256K"),
-         ("r10-512k", "512K"), ("r11-1m", "1M"))
-CONTEXTS = [context for _, context in RUNGS]
-METRICS = {  # also the summary grid, row by row
-    "decode_tok_s": ("Decode (tokens/s)", "decode_tok_s"),
-    "prefill_tok_s": ("Prefill (tokens/s)", "prefill_tok_s"),
-    "ttft_s": ("Time to first token (s, log scale)", "ttft_s"),
-    "peak_memory_gb": ("MLX allocator peak (GiB)", "mlx_peak_gib"),
-    "peak_footprint_gb": ("Process footprint peak (GiB)", "footprint_peak_gib"),
-    "completion_tokens": ("Completion tokens", "completion_tokens"),
-}
-Y_TOP = {"decode_tok_s": 35, "prefill_tok_s": 1100}  # other linear panels run from 0 to 1.15 x their maximum
-TABLES = (("Decode (tok/s)", "decode_tok_s", 1), ("Prefill (tok/s)", "prefill_tok_s", 1), ("TTFT (s)", "ttft_s", 2),
-          ("MLX allocator peak (GiB)", "mlx_peak_gib", 2), ("Process footprint peak (GiB)", "footprint_peak_gib", 2),
-          ("Completion tokens", "completion_tokens", 0))
 
 SERVER_LINE = re.compile(r"<- (\d+)\+(\d+) tokens \((\d+)ms\) \[prefill: ([\d.]+) tok/s, decode: ([\d.]+) tok/s\] "
                          r"\[(\w+)\]")
@@ -46,13 +30,6 @@ MEMORY_LINE = re.compile(r"MiMo decode memory: footprint=(\d+) mlx_active=(\d+) 
 ROUTE_LINE = re.compile(r"MiMo (decode_attention|prefill_attention)=(\w+)")
 DONE_LINE = re.compile(r"MIMO_CELL \S+ prefill=([\d.]+) ttft=([\d.]+) decode=([\d.]+) peak_gb=([\d.]+) rows=(\d+) "
                        r"tokens=(\d+) finish=(\w+)")
-
-
-def agree(where, pairs):
-    """Refuse a cell whose sources disagree: (name, receipt value, other value) triples."""
-    bad = [f"{name}: {a!r} != {b!r}" for name, a, b in pairs if a != b]
-    if bad:
-        raise ValueError(f"{where}: " + "; ".join(bad))
 
 
 def ladder_rows(chain_log: Path) -> dict:
@@ -142,94 +119,9 @@ def extract(cells_root: Path) -> list:
     return [extract_cell(ladder, rung, context, passes[rung]) for rung, context in RUNGS]
 
 
-def complete(rows: list) -> list:
-    """Refuse a partial or reordered sweep."""
-    if [r["context"] for r in rows] != CONTEXTS:
-        raise ValueError("results.json must hold one row per rung, 1K to 1M")
-    return rows
-
-
-def one(rows: list, key: str):
-    values = {r[key] for r in rows}
-    if len(values) != 1:
-        raise ValueError(f"rows disagree on {key}: {sorted(values)}")
-    return values.pop()
-
-
-def plot_metric(ax, rows: list, key: str) -> None:
-    from matplotlib.ticker import FuncFormatter, NullFormatter
-
-    title, field = METRICS[key]
-    values = [r[field] for r in rows]
-    ax.set_title(title)
-    ax.plot(range(len(CONTEXTS)), values, marker="o", linewidth=2, label=LABEL, color=COLOR)
-    ax.set_xticks(range(len(CONTEXTS)), CONTEXTS)
-    ax.set_xlim(-0.5, len(CONTEXTS) - 0.5)
-    ax.set_xlabel("Requested context")
-    if key == "ttft_s":
-        ax.set_yscale("log")
-        ax.set_ylim(top=10 ** math.ceil(math.log10(max(values))))
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
-        ax.yaxis.set_minor_formatter(NullFormatter())
-    else:
-        top = Y_TOP.get(key, max(values) * 1.15)
-        if max(values) > top:
-            raise ValueError(f"{key}: {max(values)} is above the panel's {top}")
-        ax.set_ylim(0, top)
-        ax.ticklabel_format(axis="y", style="plain", useOffset=False)
-    ax.grid(alpha=.25)
-
-
-def render(rows: list) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    rows = complete(rows)
-    title = (f"mlx-stream MiMo-V2.6-Flash 1K–1M sweep; card sampling (temp {one(rows, 'temperature')}, "
-             f"top-p {one(rows, 'top_p')}), thinking {one(rows, 'thinking')}; n=1 per rung")
-    for key in METRICS:
-        fig, ax = plt.subplots(figsize=(8.4, 4.8), layout="constrained")
-        plot_metric(ax, rows, key)
-        fig.suptitle(title, fontsize=10)
-        fig.savefig(OUT / f"{key}.png", dpi=130)
-        plt.close(fig)
-    fig, axs = plt.subplots(2, 3, figsize=(16, 8.8), layout="constrained")
-    for ax, key in zip(axs.flat, METRICS):
-        plot_metric(ax, rows, key)
-    fig.suptitle(title, fontsize=12)
-    fig.savefig(OUT / "summary.png", dpi=130)
-    plt.close(fig)
-    print(f"plotted {len(rows)} cells into {OUT}")
-
-
-def tables(rows: list) -> str:
-    """The README's tables: Requested context | Actual input | Rows P/D | value."""
-    out = []
-    for header, field, digits in TABLES:
-        lines = [f"| Requested context | Actual input | Rows P/D | {header} |", "| ---: | ---: | ---: | ---: |"]
-        lines += [f"| {r['context']} | {r['input_tokens']:,} | {r['prompt_rows']}/{r['decode_rows']} | "
-                  f"{r[field]:,.{digits}f} |" for r in complete(rows)]
-        out.append(header + "\n\n" + "\n".join(lines))
-    return "\n\n".join(out)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--cells-root", type=Path, help="rebuild results.json from the ladder's cells under this dir")
-    parser.add_argument("--tables", action="store_true", help="print the README's Markdown tables and exit")
-    args = parser.parse_args()
-    results = OUT / "results.json"
-    if args.cells_root is not None:
-        OUT.mkdir(parents=True, exist_ok=True)
-        results.write_text(json.dumps(extract(args.cells_root), indent=2) + "\n")
-        print(f"extracted {results}")
-    rows = json.loads(results.read_text())
-    if args.tables:
-        print(tables(rows))
-        return
-    render(rows)
+SWEEP = Sweep(model="MiMo-V2.6-Flash", out=OUT, label=LABEL, extract=extract,
+              y_top={"decode_tok_s": 35, "prefill_tok_s": 1100})
 
 
 if __name__ == "__main__":
-    main()
+    main(SWEEP, __doc__)

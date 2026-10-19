@@ -2683,6 +2683,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     ls.policy.refreshPins();
                 }
                 self.phase = .decode;
+                // The read pool's copy split (`expert_io.Options.split_bytes`) serves the decode phase only.
+                _ = self.pool.splitPhase(true);
                 // Decode routes take one window: no decode plan ever runs beside a live route's held slots (the decode
                 // policy has no held set; `shrink` restores the prompt's depth).
                 self.wide_depth = 1;
@@ -2745,6 +2747,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     self.transient_released = true;
                 }
                 self.phase = .prefill;
+                _ = self.pool.splitPhase(false);
                 self.route_lookahead = false;
                 self.route_preread = false;
                 if (self.memory == .mlx and before -| mlxActive() < bytes) {
@@ -2873,6 +2876,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .{ "spec_expired", .expired },      .{ "spec_abandoned", .abandoned }, .{ "spec_discarded", .discarded },
                     .{ "spec_cancelled", .cancelled_by_demand }, .{ "direct_ranges", .direct_ranges },
                     .{ "spec_claimed_inflight", .claimed_inflight }, .{ "spec_abandoned_bytes", .abandoned_bytes },
+                    .{ "spec_co_reads", .co_reads },     .{ "split_ranges", .split_ranges },
                 };
                 inline for (pairs) |pr| @field(s, pr[0]) = @intCast(@max(p.counter(pr[1]), 0));
                 return s;
