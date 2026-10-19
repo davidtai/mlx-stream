@@ -146,6 +146,52 @@ test "dsv41 policy: a read-ahead admits predicted experts to empty slots, unprot
     try testing.expectEqual(@as(?u32, null), p.slotOf(1));
 }
 
+test "beam policy: a prompt call's admission never evicts a resident the call routes (a later route of the call would read it back); an unrouted resident's row is taken" {
+    const a = testing.allocator;
+    var p = try LayerPolicy.init(a, 16, 4);
+    defer p.deinit(a);
+    p.keep_call_routed = true;
+    var buf: [8]LayerPolicy.ReadAhead = undefined;
+    try testing.expectEqual(@as(usize, 4), p.admitReadAhead(&.{ 5, 9, 1, 12 }, &buf).len);
+    // The call routes 5 x3, 3 x2, 12 x2, 1 x1, 9 x1: its top four (5, 3, 12, 1) re-protect the residents 5, 12, 1 and seed
+    // 3; 9 stays probationary, but the call routes it.
+    p.prepareSeed(&.{ 5, 5, 5, 3, 3, 12, 12, 1, 9 });
+    try testing.expect(p.seed.isSet(3) and !p.protected.isSet(9) and p.slotOf(9) != null);
+    // The first route: 5 and 12 hit; the seed 3 finds no victim (9 is the call's) and loads transient.
+    var first: Plan = .{};
+    p.plan(&.{ 5, 12, 3 }, .prefill, &first);
+    try testing.expectEqual(@as(u32, 2), first.n_hits);
+    try testing.expectEqual(@as(u32, 0), first.n_persistent);
+    try testing.expectEqual(@as(u32, 1), first.n_loads);
+    try testing.expect(p.slotOf(9) != null);
+    // The call's last route: 9 and 1 are still resident, both hits, nothing read.
+    var last: Plan = .{};
+    p.plan(&.{ 9, 1 }, .prefill, &last);
+    try testing.expectEqual(@as(u32, 2), last.n_hits);
+    try testing.expectEqual(@as(u32, 0), last.n_loads);
+    // The next call routes 3 and 7 only: 9 is no longer the call's, so the seed 3 takes its row.
+    p.prepareSeed(&.{ 3, 3, 7 });
+    const slot9 = p.slotOf(9).?;
+    var next: Plan = .{};
+    p.plan(&.{ 3, 7 }, .prefill, &next);
+    try testing.expectEqual(@as(u32, 1), next.n_persistent);
+    try testing.expectEqual(slot9, next.loads[0].slot);
+    try testing.expectEqual(@as(?u32, null), p.slotOf(9));
+    // The control (off): the same call's seed takes 9's row, and the call's last route reads 9 back.
+    var q = try LayerPolicy.init(a, 16, 4);
+    defer q.deinit(a);
+    try testing.expectEqual(@as(usize, 4), q.admitReadAhead(&.{ 5, 9, 1, 12 }, &buf).len);
+    q.prepareSeed(&.{ 5, 5, 5, 3, 3, 12, 12, 1, 9 });
+    var q_first: Plan = .{};
+    q.plan(&.{ 5, 12, 3 }, .prefill, &q_first);
+    try testing.expectEqual(@as(u32, 1), q_first.n_persistent);
+    try testing.expectEqual(@as(?u32, null), q.slotOf(9));
+    var q_last: Plan = .{};
+    q.plan(&.{ 9, 1 }, .prefill, &q_last);
+    try testing.expectEqual(@as(u32, 1), q_last.n_hits);
+    try testing.expectEqual(@as(u32, 1), q_last.n_loads);
+}
+
 test "dsv41 policy: P1's predicted counts rank as the seed ranks (count descending, ties by id), the same from any count order" {
     const a = testing.allocator;
     // Counts: 7 x4, 2 x3, 9 x3, 4 x1, 11 x1, 0 x1; never predicted: every other expert.
