@@ -34,7 +34,7 @@ The supported models:
   (`expert-manifest-v2.json`); [docs/glm5-next.md](docs/glm5-next.md) gives the arch and its settings,
   [docs/benchmarks/glm53-flash/](docs/benchmarks/glm53-flash/README.md) its benchmark record.
 - a Reflection Beam 1.0 pack (`"model_type": "beam"`) with an NVFP4 expert bank; [docs/beam.md](docs/beam.md) gives the
-  arch and its settings.
+  arch and its settings, [docs/benchmarks/beam-flash/](docs/benchmarks/beam-flash/README.md) its benchmark record.
 
 No weights are included in this repository.
 
@@ -596,7 +596,7 @@ csrc/                      the C read pool, the MLX event / alloc shims (with Mi
                            and the profile-only timeline and power sources
 src/refusals.zig           the compile-fail cases of the sdk_ext contracts (`zig build refusals`)
 docs/                      design notes and the path map from the in-tree layout
-docs/benchmarks/           the benchmark records (glm53-flash/, mimo-v26-flash/)
+docs/benchmarks/           the benchmark records (beam-flash/, glm53-flash/, mimo-v26-flash/)
 scripts/                   test_dsv41.sh, compile_kernels_offline.py, compile_mimo_kernels_offline.py,
                            prepare_mimo_pack.py   the pack builder (docs/mimo-pack.md)
                            glm_moe_dsa_goldens.py, glm_moe_dsa_mtp_goldens.py, glm_split_k3_table.py,

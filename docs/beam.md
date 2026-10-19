@@ -8,7 +8,8 @@ of BF16, or 9.44 GB in the q8 residents tier (see [The residents](#the-residents
 Terms are as in [mimo.md](mimo.md): **pack**, **residents**, **rows** (prompt rows, decode rows), **bill**, **fill**,
 **prompt pass**, **route** (a choice made one time at construction), **control**.
 
-Code: `src/arch/beam/`.
+Code: `src/arch/beam/`. The benchmark record (the context sweep, HumanEval, the time to first token):
+[benchmarks/beam-flash](benchmarks/beam-flash/README.md).
 
 | File | What it holds |
 |---|---|
@@ -750,7 +751,6 @@ token change from run to run. At seed 4321 the two fills read about the same byt
 
 - A Beam reading of the host runtime and the compiled kernels. The bill uses MiMo's declared values.
 - The lookahead selector's top-k is the bank's fixed 8 (`routed_top_k`). It only selects reads.
-- A profile build and the benchmark record.
 - The q8 tier at more than one row a step (a draft lane's verify window). MLX's qmv reads a projection's weights one
   time for each row: at 8 rows the trunk's GEMVs take 12.64 ms against 8.36 ms at one row. A GEMV that reads each
   weight one time for all rows is not done.
