@@ -458,6 +458,7 @@ at 173 / 183 rows, temperature 0.7, top_p 0.99, seeds 1234 and 4321. Each seed g
 | `request`, `request_wiring` | The prompt wave at the widest call, the decode wave, and their wiring. |
 | `prompt_view` | The q8 tier only, prompt phase: the BF16 weights of the widest layer's projections (a dense layer: 838,860,800 B) and their wiring. |
 | `sampler`, `gpu_warm` | The plugin's sampler. MiMo's keep-warm engine when it is on. |
+| `read_pieces` | The read pool's 16 piece threads (`settings.read_split_bytes`, 2 MiB): in the decode phase a range's copy into its rows runs in pieces side by side. Their stacks, 16 x 512 KiB, from construction. |
 | `decode_kernels` | The fused texts' set, its pipelines and prepared launches under `decode_moe: hitpass` and `fused`: 20 MiB declared. At the pack's load the fused route's construction footprint is 18.6 MB more than the stock route's (host side 416.1 MB against 397.5 MB; MLX active the same). |
 | `hitpass_luts` | Under `decode_moe: hitpass`: a LUT pair for each model layer, each LUT a page (52 x 2 x 16 KiB). |
 | `glue_kernels` | Under `decode_glue: fused`: the glue's texts, their pipelines and launch configurations (`glue.zig`): 8 MiB declared, from construction. |
