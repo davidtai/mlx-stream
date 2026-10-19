@@ -479,7 +479,9 @@ context 32,768 and the 255.55 GB target, on the quiet M5 Ultra after the evictio
 Each pair of rows bills 1.085 GB. At the non-file fill the target still leaves about 7 GB of RAM free beside 11.5 GB
 of other users' file cache. On the 256 GB M5 Ultra (ceiling 240 GiB, margin 2 GiB, baseline 12.6 GB, context 32,768) the bill test prints
 the fill's rows (`BEAM BILL fixture`). `BEAM_BANK=<pack>` prints every term and the rows at the served contexts (the
-bill tool).
+bill tool). The tool takes the server's settings: the pack's `expert_streaming.settings`, then `BEAM_BILL_SETTINGS` (the
+host's per-model settings, the same keys). At the defaults it bills the draft lane, so a pack without the drafter's
+sidecar refuses by name; `BEAM_BILL_SETTINGS='{"mtp_lane":false}'` bills the serial path.
 
 ## Parity
 

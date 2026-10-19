@@ -648,10 +648,39 @@ test "beam bill: the attention tile bills the fused attention's working set and 
     };
 }
 
+/// The bill tool's settings, by the server's rule: the pack's `expert_streaming.settings`, then the host's per-model
+/// settings (BEAM_BILL_SETTINGS: a JSON object of the same keys), each refused by name for a key that is not a beam
+/// setting, then `validate`. The defaults are the server's (the draft lane on). The caller frees the parsed objects.
+fn toolSettings(a: std.mem.Allocator, cfg: *settings.Config, config_text: []const u8, keep: *[2]?std.json.Parsed(std.json.Value)) !void {
+    keep.* = .{ null, null };
+    const pack = try std.json.parseFromSlice(std.json.Value, a, config_text, .{});
+    keep[0] = pack;
+    const block = if (pack.value == .object) pack.value.object.get("expert_streaming") else null;
+    if (block) |b| if (b == .object) if (b.object.get("settings")) |raw| try toolApply(cfg, raw, "expert_streaming.settings");
+    const host = std.c.getenv("BEAM_BILL_SETTINGS") orelse return;
+    const h = try std.json.parseFromSlice(std.json.Value, a, std.mem.span(host), .{});
+    keep[1] = h;
+    try toolApply(cfg, h.value, "BEAM_BILL_SETTINGS");
+}
+
+fn toolApply(cfg: *settings.Config, raw: std.json.Value, what: []const u8) !void {
+    if (raw != .object) {
+        std.debug.print("bill tool: {s} is not a JSON object\n", .{what});
+        return error.BeamSettingsBlock;
+    }
+    if (settings.unknownSetting(raw.object)) |k| {
+        std.debug.print("bill tool: {s}: \"{s}\" is not a beam setting\n", .{ what, k });
+        return error.BeamSettingUnknown;
+    }
+    cfg.applySettings(raw);
+}
+
 // BEAM_BANK=<pack> (headers only, no payload): the bill tool. Every term in bytes and the filled rows at the served
 // contexts (`tool_contexts`), at BEAM_BILL_BASELINES_GB (comma list; default 12.6) and BEAM_BILL_CEILING (bytes; default
-// the 256 GB box's 240 GiB) less the pinned 2 GiB margin. It bills the serial path (`mtp_lane = false`: the q8 and BF16
-// packs hold no drafter sidecar); the lane's terms are the `lane depth` test's.
+// the 256 GB box's 240 GiB) less the pinned 2 GiB margin. It takes the server's settings and defaults (`toolSettings`):
+// with the draft lane on (the default) it bills the lane on a pack with the drafter's sidecar, and a pack without it
+// refuses by name (`BeamDrafterMissing`), as its load does; `{"mtp_lane":false}` in BEAM_BILL_SETTINGS bills the serial
+// path.
 test "beam bill: the bill tool prints every term and the rows per context (BEAM_BANK)" {
     const dir = std.mem.span(std.c.getenv("BEAM_BANK") orelse return error.SkipZigTest);
     const a = testing.allocator;
@@ -670,10 +699,14 @@ test "beam bill: the bill tool prints every term and the rows per context (BEAM_
         std.debug.print("config refused: {s}\n", .{diag.message()});
         return e;
     };
-    var cfg: settings.Config = .{ .model = model, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = false };
-    std.debug.print("\nBEAM BILL pack={s} ceiling={d} stop={d} target={d} min_rows={d}\n", .{ dir, ceiling, box_stop, ceiling -| box_stop, min_rows });
+    var cfg: settings.Config = .{ .model = model, .model_dir = dir, .wired_margin_bytes = box_stop };
+    var keep: [2]?std.json.Parsed(std.json.Value) = .{ null, null };
+    defer for (&keep) |*k| if (k.*) |*v| v.deinit();
+    try toolSettings(a, &cfg, config_text, &keep);
+    std.debug.print("\nBEAM BILL pack={s} ceiling={d} stop={d} target={d} min_rows={d} mtp_lane={}\n", .{ dir, ceiling, box_stop, ceiling -| box_stop, min_rows, cfg.mtp_lane });
     for (tool_contexts) |ctx| {
         cfg.effective_context = ctx;
+        try cfg.validate();
         const b = try completeBill(a, io, &cfg, cfg.reserveTokens());
         defer b.free(a);
         std.debug.print("\nkv=bf16 ctx={d} reserve={d} per_row={d}\n  {s:<22} {s:>15} {s:>15} {s}\n", .{ ctx, cfg.reserveTokens(), b.per_row, "term", "prompt B", "decode B", "construction" });
