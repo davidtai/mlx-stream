@@ -28,7 +28,7 @@ pub const decode_window: mimo_stream.DecodeWindow = .verify;
 pub const prompt_relocate = true;
 /// P7 `pooled`: MLX's cache limit through the prompt pass, purged at a prompt layer's end once half full; decode keeps
 /// its own limit.
-pub const prompt_cache_bytes: usize = 2 << 30;
+pub const prompt_cache_bytes: usize = 4 << 30; // diag (perf/beam-misspath): the prompt-phase buffer cache probe, 2 GiB in the served build
 pub const decode_cache_bytes: usize = 256 << 20;
 
 /// The stream's construction options over a bank's bridge `Bp` (pure: the CPU tests read them): MiMo's event gates and
