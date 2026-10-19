@@ -227,13 +227,28 @@ pub const Module = struct {
     pub fn prefill(self: *Module, ids: []const u32, req: sdk.RequestShape) !T {
         self.requestEnd();
         if (req.prompt_tokens != ids.len) return error.BeamPrefixNotKept;
+        const t0 = self.nowNs();
         if (self.lane) |l| l.begin();
         try self.beginPrompt(ids);
+        const s0 = self.src.stats();
         errdefer self.state_lost = true;
         const logits = try self.promptCalls(ids, .last, {});
         errdefer self.g.release(logits);
+        self.promptLine(ids.len, t0, &s0);
         try self.enterDecode(ids.len);
         return logits;
+    }
+
+    /// The request's prompt pass (`beam prompt`, the `beam decode` line's twin): its wall from the request's start to the
+    /// last call's logits, its rate, its SSD bytes, the records it read (a load that found its record in its row reads
+    /// none) and the distinct ones (a record read twice counts once).
+    fn promptLine(self: *Module, tokens: usize, t0: u64, s0: *const sdk_ext.expert.Stats) void {
+        const s1 = self.src.stats();
+        const wall_ns = self.nowNs() -| t0;
+        const tok_s: f64 = if (wall_ns > 0) @as(f64, @floatFromInt(tokens)) * 1e9 / @as(f64, @floatFromInt(wall_ns)) else 0;
+        const loads1 = s1.persistent_loads + s1.transient_loads -| s1.loads_skipped;
+        const loads0 = s0.persistent_loads + s0.transient_loads -| s0.loads_skipped;
+        log.info("beam prompt: tokens={d} wall_s={d:.3} tok_s={d:.2} ssd_bytes={d} records={d} distinct_experts={d}\n", .{ tokens, @as(f64, @floatFromInt(wall_ns)) / 1e9, tok_s, s1.expert_bytes_read -| s0.expert_bytes_read, loads1 -| loads0, s1.prompt_records_distinct });
     }
 
     /// The checks and the source's prompt phase of a new request (the parity test's entry as well as `prefill`'s).

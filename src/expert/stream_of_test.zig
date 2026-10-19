@@ -236,3 +236,45 @@ test "dsv41 bank contract: host slot rows of a bank of 4 records per routed id: 
     }
     try s.flush();
 }
+
+test "dsv41 bank contract: the prompt's distinct records count a (layer, expert) read once, and a request's start clears them" {
+    var layers = [_]MxBank.Layer{ MxBank.layerOf(256, 128), MxBank.layerOf(256, 128) };
+    const rec = layers[0].logical_bytes;
+    const n_experts: u32 = 24;
+    const image = try testing.allocator.alloc(u8, rec * n_experts * layers.len);
+    defer testing.allocator.free(image);
+    for (image, 0..) |*b, k| b.* = @truncate(k *% 2654435761 >> 9);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "experts.bin", .data = image });
+    var root: [512]u8 = undefined;
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/experts.bin", .{root[0..try tmp.dir.realPath(testing.io, &root)]}, 0);
+    defer testing.allocator.free(path);
+    const fd = try sdk_ext.expert.openUncached(path.ptr, null);
+    defer fd.close();
+    const bank: MxBank.Bank = .{ .layers = &layers, .n_experts = n_experts, .sidecar = fd, .record_bytes = rec };
+
+    const s = try MxStream.init(testing.allocator, &bank, .{ .rows = &.{ 4, 3 }, .max_route_ids = 8, .transient_rows = 8, .pool = .{ .workers = 2, .staging_bytes = 65536, .tickets = 256 } });
+    defer s.deinit();
+    try testing.expectEqual(@as(u64, 0), s.stats().prompt_records_distinct);
+    // Nothing is resident at the construction: the three records are read.
+    const first = [_]u16{ 1, 2, 3 };
+    var r = try s.serve(0, &first);
+    try s.expectServed(r, &first, image);
+    s.release(r);
+    try testing.expectEqual(@as(u64, 3), s.stats().prompt_records_distinct);
+    // The same ids again (served from their rows or read again): no new record.
+    r = try s.serve(0, &first);
+    try s.expectServed(r, &first, image);
+    s.release(r);
+    try testing.expectEqual(@as(u64, 3), s.stats().prompt_records_distinct);
+    // Layer 1's expert 1 is another record than layer 0's.
+    const second = [_]u16{ 1, 5 };
+    r = try s.serve(1, &second);
+    try s.expectServed(r, &second, image);
+    s.release(r);
+    try testing.expectEqual(@as(u64, 5), s.stats().prompt_records_distinct);
+    // A request's start clears the set.
+    s.resetPromptCounts();
+    try testing.expectEqual(@as(u64, 0), s.stats().prompt_records_distinct);
+}
