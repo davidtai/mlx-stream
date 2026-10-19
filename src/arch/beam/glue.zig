@@ -1270,7 +1270,7 @@ const q8_plans = [_]Q8Plan{ .{ .rows = 4, .spt = 2, .pf = false }, .{ .rows = 4,
 /// The trunk's q8 projections a decode step runs through the text (graph.zig `projectRow`): the fused q / k / v / gate,
 /// o, a dense layer's gate and up, its down. The head keeps MLX's qmv (1,132 GB/s in situ: the fold-7 inventory).
 pub const Q8Site = enum { qkvg, o, dense_in, dense_out };
-pub const q8_sites = @typeInfo(Q8Site).@"enum".fields.len;
+pub const q8_sites = @typeInfo(Q8Site).@"enum".field_names.len;
 
 /// A site's (N, K) at the model's geometry.
 pub fn q8ShapeOf(c: *const beam.Config, site: Q8Site) [2]u32 {
