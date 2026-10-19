@@ -144,7 +144,7 @@ test "beam lane: the lane's greedy ids are the serial greedy ids; an oracle draf
     pack_dir.close(io);
     defer a.free(text);
     const model = try beam.Config.parse(a, text, null);
-    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off, .mtp_lane = true, .draft_depth = 7 };
+    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off, .mtp_lane = true, .mtp_acceptance = .exact, .draft_depth = 7 };
     try cfg.validate();
     var weights = try sdk.loader.dir(io, a, dir, .{});
     defer weights.deinit();
@@ -200,7 +200,7 @@ test "beam lane: a seeded sampled request draws the same ids through the lane as
     pack_dir.close(io);
     defer a.free(text);
     const model = try beam.Config.parse(a, text, null);
-    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off, .mtp_lane = true, .draft_depth = 7 };
+    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off, .mtp_lane = true, .mtp_acceptance = .exact, .draft_depth = 7 };
     var weights = try sdk.loader.dir(io, a, dir, .{});
     defer weights.deinit();
     const m = try module.Module.init(a, io, &cfg, &weights, s, 64 << 30, 2 << 30);

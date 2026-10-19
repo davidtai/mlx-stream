@@ -8,13 +8,13 @@
 //! `prompt_residents` (keep, the default, or forget), MiMo's X12 keep-warm (`gpu_keep_warm`: waits, the default, or
 //! off), the decode lane's expert route (`decode_moe`: hitpass, the default, fused or stock) and its glue
 //! (`decode_glue`: fused, the default, or ops). The draft lane (lane.zig, Reflection's DFlash2 drafter from the pack's
-//! sidecar, drafter.zig) takes glm5_next's keys: `mtp_lane` installs it (on by default: `exact`, depth 3, sampled
+//! sidecar, drafter.zig) takes glm5_next's keys: `mtp_lane` installs it (on by default: `typical` 0.2, depth 3, greedy
 //! drafts; `false` is the serial control, and a pack without the drafter's sidecar refuses the load until it is named),
 //! `draft_depth` is its drafts a round (1 .. the drafter's block less one, default `default_draft_depth`), `draft_gate`
-//! its confidence gate (theta in [0, 1), default 0: off), `mtp_acceptance` its rule (`exact`, the default, or `typical`:
-//! lossy, an opt-in), `mtp_typical_delta` typical's delta ((0, 1], default `default_typical_delta`, named only with
-//! `typical`) and `draft_path` the drafter's path on a sampled request (`sampled`, the default under `exact`, or `greedy`:
-//! `DraftPath`).
+//! its confidence gate (theta in [0, 1), default 0: off), `mtp_acceptance` its rule (`typical`, the default and lossy,
+//! or `exact`: lossless; `default_acceptance`), `mtp_typical_delta` typical's delta ((0, 1], default
+//! `default_typical_delta`; with `exact` named it refuses) and `draft_path` the drafter's path on a sampled request
+//! (`sampled`, the default under `exact`, or `greedy`, the path under `typical`: `DraftPath`).
 //! A draft key with `mtp_lane: false` refuses: an inert knob is a lie.
 
 const std = @import("std");
@@ -77,11 +77,14 @@ pub const default_draft_depth: u32 = 3;
 /// The most drafts a round names: the acceptance graphs' rows less the bonus row and one (`acceptance.max_rows` 17), the
 /// trained block's 15. The lane refuses a depth past its drafter's own block less one (`BeamDraftDepthOverBlock`).
 pub const max_draft_depth: u32 = acc.max_rows - 2;
-/// Typical acceptance's default delta: 0.6, the measured opt-in (docs/beam.md, the draft lane: +13.7 % decode at equal
-/// memory on the 240 GB pin; 0.2 is 8 % faster at 2.8 times the excess surprisal a token). glm5_next's is 0.5.
-pub const default_typical_delta: f32 = 0.6;
+/// Typical acceptance's default delta: 0.2, David's ruling of 2026-10-19 (docs/beam.md, serving: on the fold-10 stack at
+/// 193 / 203 rows, 37.0 / 39.0 tok/s decode against `exact`'s 31.8 / 33.0, prefill unchanged). glm5_next's is 0.5.
+pub const default_typical_delta: f32 = 0.2;
 /// The lane's acceptance rule (`mtp_acceptance`), installed at construction.
 pub const MtpAcceptance = enum { exact, typical };
+/// The lane's default rule: `typical` (lossy), David's ruling of 2026-10-19 for Beam ("lets keep it at .2, 37 tps is good
+/// enough"). Beam's own default, not the other arches': `exact` stays a setting, lossless.
+pub const default_acceptance: MtpAcceptance = .typical;
 /// The drafter's path on a sampled request (`draft_path`), installed at construction: `sampled` (the default under the
 /// exact rule: the measured and kept path, docs/beam.md) each draft drawn from the selector's distribution q over its
 /// candidates (the softmax of the scores at the request's temperature, drafter.zig `sampledPathOf`), verified by
@@ -156,7 +159,7 @@ pub const Config = struct {
     draft_depth: u32 = default_draft_depth,
     /// The draft gate's theta (`draft_gate`); NaN marks a value outside [0, 1) or not a number.
     draft_gate: f32 = 0,
-    mtp_acceptance: MtpAcceptance = .exact,
+    mtp_acceptance: MtpAcceptance = default_acceptance,
     mtp_typical_delta: f32 = default_typical_delta,
     mtp_typical_delta_set: bool = false,
     draft_path: DraftPath = .sampled,
@@ -324,10 +327,10 @@ pub const Config = struct {
         if (c.malformed.mtp_acceptance) return error.BeamMtpAcceptanceSetting;
         if (c.malformed.mtp_typical_delta) return error.BeamMtpTypicalDeltaSetting;
         if (c.malformed.draft_path) return error.BeamDraftPathSetting;
-        if (c.draft_path_set and c.draft_path == .sampled and c.mtp_acceptance == .typical) return error.BeamDraftPathTypical;
         if (c.draft_depth == 0) return error.BeamDraftDepthRange;
         if (!(c.draft_gate >= 0 and c.draft_gate < 1)) return error.BeamDraftGateRange;
         if (c.draft_named and !c.mtp_lane) return error.BeamDraftSettingWithoutLane;
+        if (c.draft_path_set and c.draft_path == .sampled and c.mtp_acceptance == .typical) return error.BeamDraftPathTypical;
         if (c.mtp_typical_delta_set and c.mtp_acceptance != .typical) return error.BeamMtpTypicalDeltaWithoutTypical;
         try c.tally.check("beam");
         try c.residency.check("beam");
@@ -485,12 +488,28 @@ test "beam settings: the decode glue is fused by default on Beam's router and a 
     try testing.expectError(error.BeamDecodeGlueUnregistered, named.validate());
 }
 
-test "beam settings: the draft lane's keys (on by default; exact the default rule; typical opt-in), each bad value refused by name" {
+test "beam settings: the draft lane's keys (on by default; typical 0.2 the default rule; exact named), each bad value refused by name" {
+    // The defaults: the lane on, typical at delta 0.2 (David, 2026-10-19), depth 3, the greedy path.
     const d: Config = .{};
+    try d.validate();
     try testing.expect(d.mtp_lane);
-    try testing.expectEqual(acc.Rule.exact, d.draftRule());
+    try testing.expectEqual(acc.Rule{ .typical = .{ .delta = 0.2 } }, d.draftRule());
     try testing.expectEqual(@as(u32, 3), d.draft_depth);
-    try testing.expectEqual(DraftPath.sampled, d.draftPath());
+    try testing.expectEqual(DraftPath.greedy, d.draftPath());
+    const none = try parseSettings("{}");
+    try none.validate();
+    try testing.expectEqual(acc.Rule{ .typical = .{ .delta = 0.2 } }, none.draftRule());
+    try testing.expectEqual(DraftPath.greedy, none.draftPath());
+    // `exact` named: lossless, the sampled path (fold 9's default).
+    const exact_named = try parseSettings("{\"mtp_acceptance\":\"exact\"}");
+    try exact_named.validate();
+    try testing.expect(exact_named.mtp_lane);
+    try testing.expectEqual(acc.Rule.exact, exact_named.draftRule());
+    try testing.expectEqual(DraftPath.sampled, exact_named.draftPath());
+    // The delta named alone takes the default rule, typical.
+    const delta = try parseSettings("{\"mtp_typical_delta\":0.1}");
+    try delta.validate();
+    try testing.expectEqual(acc.Rule{ .typical = .{ .delta = 0.1 } }, delta.draftRule());
     // A draft key alone takes the default lane; `mtp_lane: false` alone is the serial control.
     const depth2 = try parseSettings("{\"draft_depth\":2}");
     try depth2.validate();
@@ -498,7 +517,7 @@ test "beam settings: the draft lane's keys (on by default; exact the default rul
     const serial = try parseSettings("{\"mtp_lane\":false}");
     try serial.validate();
     try testing.expect(!serial.mtp_lane);
-    const greedy = try parseSettings("{\"mtp_lane\":true,\"draft_path\":\"greedy\"}");
+    const greedy = try parseSettings("{\"mtp_lane\":true,\"mtp_acceptance\":\"exact\",\"draft_path\":\"greedy\"}");
     try greedy.validate();
     try testing.expectEqual(DraftPath.greedy, greedy.draftPath());
     try testing.expectEqual(acc.Rule.exact, greedy.draftRule());
@@ -506,8 +525,8 @@ test "beam settings: the draft lane's keys (on by default; exact the default rul
     const typ = try parseSettings("{\"mtp_lane\":true,\"mtp_acceptance\":\"typical\"}");
     try typ.validate();
     try testing.expectEqual(DraftPath.greedy, typ.draftPath());
-    // typical's delta, when not named, is the measured opt-in's 0.6.
-    try testing.expectEqual(acc.Rule{ .typical = .{ .delta = 0.6 } }, typ.draftRule());
+    // typical's delta, when not named, is the ruled 0.2.
+    try testing.expectEqual(acc.Rule{ .typical = .{ .delta = 0.2 } }, typ.draftRule());
     const on = try parseSettings("{\"mtp_lane\":true,\"draft_depth\":15,\"draft_gate\":0.5,\"mtp_acceptance\":\"typical\",\"mtp_typical_delta\":0.2}");
     try on.validate();
     try testing.expectEqual(@as(u32, 15), on.draft_depth);
@@ -530,7 +549,8 @@ test "beam settings: the draft lane's keys (on by default; exact the default rul
         .{ .text = "{\"mtp_lane\":false,\"draft_path\":\"sampled\"}", .err = error.BeamDraftSettingWithoutLane },
         .{ .text = "{\"mtp_lane\":true,\"mtp_acceptance\":\"typical\",\"draft_path\":\"sampled\"}", .err = error.BeamDraftPathTypical },
         .{ .text = "{\"mtp_lane\":true,\"mtp_acceptance\":\"typical\",\"mtp_typical_delta\":0}", .err = error.BeamMtpTypicalDeltaSetting },
-        .{ .text = "{\"mtp_lane\":true,\"mtp_typical_delta\":0.3}", .err = error.BeamMtpTypicalDeltaWithoutTypical },
+        .{ .text = "{\"mtp_lane\":true,\"mtp_acceptance\":\"exact\",\"mtp_typical_delta\":0.3}", .err = error.BeamMtpTypicalDeltaWithoutTypical },
+        .{ .text = "{\"draft_path\":\"sampled\"}", .err = error.BeamDraftPathTypical },
         .{ .text = "{\"mtp_lane\":false,\"draft_depth\":3}", .err = error.BeamDraftSettingWithoutLane },
         .{ .text = "{\"mtp_lane\":false,\"mtp_acceptance\":\"typical\"}", .err = error.BeamDraftSettingWithoutLane },
     }) |case| try testing.expectError(case.err, (try parseSettings(case.text)).validate());

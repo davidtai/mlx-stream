@@ -240,7 +240,8 @@ instead of about 1,100.
 
 ## The draft lane
 
-The draft lane is on by default (`mtp_lane`; `false` is the serial control). It runs Reflection's DFlash2 drafter
+The draft lane is on by default (`mtp_lane`; `false` is the serial control). Its default rule is `typical` at delta
+0.2, which is lossy ([The shipped acceptance](#the-shipped-acceptance)). It runs Reflection's DFlash2 drafter
 (`reflection/Beam-1.0-501B-A23B-DFlash2` at 163b276b; the reference is z-lab/dflash `DFlash2DraftModel` at 07ebd93d).
 The drafter is a sidecar in the pack: `drafter.safetensors` (the release's file, byte for byte) and
 `drafter-manifest.json` (format `mlx-stream-dflash2-drafter-v1`, written by the converter's `drafter` step), both in
@@ -262,10 +263,14 @@ A round at trunk length p (t1, the next token, at p):
 3. Commit: the rejected rows leave the KV lanes. The captures of t1 and the accepted drafts go into the drafter's
    context. The host gets t1, the accepted drafts and the next token.
 
-The rule (`mtp_acceptance`) is a construction value. `exact` is the default and is lossless: on a greedy request a
-draft is kept when it is its verify row's argmax; on a sampled request each row's token is the target's seeded draw
-at its position, and a draft is kept when it is that draw. `typical` (Medusa's typical acceptance) also keeps a draft
-that the target gives enough probability. It is lossy: an opt-in.
+The rule (`mtp_acceptance`) is a construction value. `typical` (Medusa's typical acceptance) is Beam's default, at
+delta 0.2 (`mtp_typical_delta`). It also keeps a draft that the target gives enough probability, so it is lossy: its
+tokens are not distributed as the target's, on greedy and on sampled requests. `exact` is lossless: on a greedy
+request a draft is kept when it is its verify row's argmax; on a sampled request each row's token is the target's
+seeded draw at its position, and a draft is kept when it is that draw. `exact` is a setting:
+`{"mtp_acceptance":"exact"}`. For the other arches `typical` is a per-model opt-in and `exact` is the default (David,
+2026-10-07). For Beam, David's ruling of 2026-10-19 makes `typical` 0.2 the default. Before fold 11 Beam's default was
+`exact`, and `typical` was an opt-in with a default delta of 0.6.
 
 `draft_path` sets the drafter's path on a sampled request. With `sampled` (the default under `exact`: the measured and
 kept path) the lane draws each draft from the selector's distribution q over its 16 candidates (the softmax of their
@@ -276,7 +281,7 @@ distributed as the target, and a draft is kept with probability sum min(p, q). A
 its tokens are not the serial path's draws. `greedy` is the selector's greedy walk (a point mass), and the verify is
 sample-then-verify: each emitted token is the target's draw at its position. `sampled` takes the `exact` rule only:
 under `typical` the path is `greedy` unless named, and `sampled` named with `typical` refuses (`BeamDraftPathTypical`).
-A greedy request takes the greedy walk.
+The default rule is `typical`, so the default path is `greedy`. A greedy request takes the greedy walk.
 
 A request's end adds two lines: `[spec-stats] lane=... rounds= drafted= accepted= tokens_per_round= ...
 draft_ms_per_round= verify_ms_per_round= commit_ms_per_round=` and `beam draft lane: lane=... rounds=
@@ -385,10 +390,11 @@ sampling and the seeds above and both arms seeded, two ABBAs on the bundle of fo
 29.25 -> 33.26 tok/s (+13.7 %) and prefill -4.0 %, and 101 tokens a 1,024 are not the target's own draw. `typical` 0.2
 gives 29.31 -> 35.93 tok/s (+22.6 %) and prefill -3.7 %, with 130.5 tokens a 1,024.
 
-The recommended opt-in is `typical` at delta 0.6, the default of `mtp_typical_delta`: +13.7 % decode at equal memory
-(33.3 tok/s). Delta 0.2 is 8 % faster (35.9 tok/s), but its excess surprisal a token is 2.8 times that of 0.6, 74 of its
-6,144 tokens are more than 2 nats below the top choice (0.6: none), and its second half repeats more. The lane is on
-by default with `exact`; `typical` stays an opt-in.
+On fold 7 the recommended opt-in was `typical` at delta 0.6 (then the default of `mtp_typical_delta`): +13.7 % decode
+at equal memory (33.3 tok/s). Delta 0.2 was 8 % faster (35.9 tok/s), but its excess surprisal a token was 2.8 times
+that of 0.6, 74 of its 6,144 tokens were more than 2 nats below the top choice (0.6: none), and its second half
+repeated more. From fold 11 the default is `typical` at delta 0.2 (David's ruling, 2026-10-19). The measurements on
+the fold-10 stack are in [The shipped acceptance](#the-shipped-acceptance).
 
 ## Settings
 
@@ -410,17 +416,19 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 | `mtp_lane` | `true`, `false` (the serial control) | `true`: the pack holds the drafter's sidecar, or the load refuses (`BeamDrafterMissing`) |
 | `draft_depth` | drafts a round, 1 .. 15 (the drafter's block of 16 less one) | 3 (the measured depth) |
 | `draft_gate` | theta in [0, 1): verify the leading drafts whose cumulative drafter probability stays at theta or more | 0 (off) |
-| `mtp_acceptance` | `exact`, `typical` (lossy) | `exact` |
-| `mtp_typical_delta` | (0, 1], named only with `typical` | 0.6 |
-| `draft_path` | `sampled` (drafts drawn from q, speculative sampling), `greedy`: the drafter's path on a sampled request | `sampled` (`greedy` under `typical`) |
+| `mtp_acceptance` | `typical` (lossy), `exact` (lossless) | `typical` (David's ruling, 2026-10-19) |
+| `mtp_typical_delta` | (0, 1]; refused with `exact` | 0.2 |
+| `draft_path` | `sampled` (drafts drawn from q, speculative sampling), `greedy`: the drafter's path on a sampled request | `greedy` under `typical` (the default); `sampled` under `exact` |
 
 One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV quantization must be off
 (`BeamKvQuantUnsupported`). `decode_moe: hitpass` or `fused` named for a model where the texts are not registered
 refuses the load (`BeamDecodeMoeUnregistered`); named on a CPU stream it refuses at construction
 (`BeamDecodeMoeNeedsGpu`). `decode_glue: fused` named for a model whose router the texts do not register refuses the
 load (`BeamDecodeGlueUnregistered`); named on a CPU stream it refuses at construction (`BeamDecodeGlueNeedsGpu`).
-A draft key with `mtp_lane: false` refuses (`BeamDraftSettingWithoutLane`). The default depth, 3, is the measured
-and kept depth ([The draft lane](#the-draft-lane)).
+A draft key with `mtp_lane: false` refuses (`BeamDraftSettingWithoutLane`). `mtp_typical_delta` with `exact` refuses
+(`BeamMtpTypicalDeltaWithoutTypical`). `draft_path: sampled` without `"mtp_acceptance":"exact"` refuses
+(`BeamDraftPathTypical`), because the default rule is `typical`. The default depth, 3, is the measured and kept depth
+([The draft lane](#the-draft-lane)).
 
 `expert_rows_by_layer` moves decode rows between the routed layers. The prompt rows and the decode total stay the
 plan's, so the bill does not change. Each offset adds to the plan's decode rows of one routed layer (model layer 3
@@ -463,7 +471,7 @@ at 173 / 183 rows, temperature 0.7, top_p 0.99, seeds 1234 and 4321. Each seed g
 | `hitpass_luts` | Under `decode_moe: hitpass`: a LUT pair for each model layer, each LUT a page (52 x 2 x 16 KiB). |
 | `glue_kernels` | Under `decode_glue: fused`: the glue's texts, their pipelines and launch configurations (`glue.zig`): 8 MiB declared, from construction. |
 | `drafter_residents`, `drafter_context` | With `mtp_lane`: the drafter's 81 tensors and its split base kernels (121 arrays, 3,855,460,864 B, page-rounded), and its context rings (5 layers x K and V x 2 slots x 4,624 rows x 8 heads x 128 x 2 B = 189,399,040 B), from construction. |
-| `draft_round` | With `mtp_lane`: the prompt's captures (5 target layers x the call's last 4,095 rows, and a 512-row context tile) and, in decode, a round's draft and verify arrays at the block (under `draft_path: sampled` four more f32 rows of the vocabulary a chunk row: the speculative verify's rows of q, the difference, the residual and its cumulative sum). The decode wave is billed at the verify chunk's 4 rows. At depth 7 the lane bills 4.14 GB more in decode and 4.34 GB more in the prompt phase: the fixture's fill goes from 194 / 204 to 190 / 200 rows. |
+| `draft_round` | With `mtp_lane`: the prompt's captures (5 target layers x the call's last 4,095 rows, and a 512-row context tile) and, in decode, a round's draft and verify arrays at the block (under `draft_path: sampled` four more f32 rows of the vocabulary a chunk row: the speculative verify's rows of q, the difference, the residual and its cumulative sum; at the defaults, `typical` on the greedy path, the bill does not have these rows: 9,723,904 B less in decode). The decode wave is billed at the verify chunk's 4 rows. At depth 7 the lane bills 4.14 GB more in decode and 4.34 GB more in the prompt phase: the fixture's fill goes from 194 / 204 to 190 / 200 rows. |
 
 The fill gives the most decode rows and prompt rows that fit the host's ceiling less its wired margin. The floor is 8
 rows. The fill bills the rows beside the host's non-file baseline (wired + anonymous - purgeable + compressor, the
@@ -481,8 +489,9 @@ Each pair of rows bills 1.085 GB. At the non-file fill the target still leaves a
 of other users' file cache. On the 256 GB M5 Ultra (ceiling 240 GiB, margin 2 GiB, baseline 12.6 GB, context 32,768) the bill test prints
 the fill's rows (`BEAM BILL fixture`). `BEAM_BANK=<pack>` prints every term and the rows at the served contexts (the
 bill tool). The tool takes the server's settings: the pack's `expert_streaming.settings`, then `BEAM_BILL_SETTINGS` (the
-host's per-model settings, the same keys). At the defaults it bills the draft lane, so a pack without the drafter's
-sidecar refuses by name; `BEAM_BILL_SETTINGS='{"mtp_lane":false}'` bills the serial path.
+host's per-model settings, the same keys). At the defaults it bills the draft lane (`typical`, the greedy path), so a
+pack without the drafter's sidecar refuses by name; `BEAM_BILL_SETTINGS='{"mtp_lane":false}'` bills the serial path,
+and `BEAM_BILL_SETTINGS='{"mtp_acceptance":"exact"}'` bills the lane on the sampled path.
 
 ## Parity
 
@@ -598,6 +607,8 @@ The serving pack is the q8 pack with the drafter's sidecar: `drafter.safetensors
 pack root (the converter's drafter step), beside `expert-usage-v1.json`. The draft lane is on by default, so a pack
 without the sidecar refuses the load until its settings name `"mtp_lane": false` (the serial path). With the lane, pin
 193 prompt / 203 decode rows: the drafter's 4.1 GB takes 4 rows of the 240 GB target. The serial path pins 197 / 207.
+The lane's shipped rule is `typical` at delta 0.2, which is lossy. `{"mtp_acceptance":"exact"}` serves the lossless
+rule at the same rows ([The shipped acceptance](#the-shipped-acceptance)).
 
 This recipe served the full pack (`Beam-1.0-501B-A23B-NVFP4-mlx-stream`, BF16, no sidecar: today it needs
 `"mtp_lane": false`) on the 256 GB M5 Ultra (mac-studio-m5u, `iogpu.wired_limit_mb` 245760). The host is mlx-serve
@@ -648,6 +659,30 @@ The seed reads 8,477 records (187.5 GB) in 13.3 s at the load. The hit rate is 1
 / 392 routes a token. A short request (53 prompt tokens, cold rows) decodes at 9.3 tok/s. With feat/beam-tools the
 reasoning goes to `reasoning_content` and the final channel to `content`. Tool calls come back parsed, with JSON
 arguments, on `/v1/chat/completions` and `/v1/messages`, streamed and not streamed.
+
+### The shipped acceptance
+
+The shipped rule of the draft lane is `typical` at delta 0.2, depth 3, on the greedy draft path. David ruled it on
+2026-10-19: "lets keep it at .2, 37 tps is good enough". The rule is lossy: the tokens are not distributed as the
+target's, on greedy and on sampled requests. To serve the lossless rule, add `"mtp_acceptance":"exact"` to the model's
+settings, for example `{"mtp_acceptance":"exact","expert_prefill_rows":193,"expert_rows":203}`. Both rules use the
+same rows and the same memory. To serve another delta, set `mtp_typical_delta`, for example `{"mtp_typical_delta":0.1}`.
+
+Measured on the fold-10 stack (e6f48f0), the q8 pack with the drafter's sidecar, 193 / 203 rows, seeded, depth 3, on
+the coding workload at the card's sampling (temperature 0.7, top_p 0.99), 1,024 generated tokens, a fresh server for
+each run. The `exact` rows are arm B of fold 10's sum check. The `typical` rows are one run a seed.
+
+| Rule | Decode, seed 1234 / 4321 | Rounds for 1,024 tokens | Prefill, seed 1234 / 4321 | TTFT | SSD read a decode token | Peak footprint |
+|---|---|---|---|---|---|---|
+| `exact` | 31.80 / 32.98 tok/s | 411 / 402 | 1,022.1 / 1,051.4 tok/s | 16.53 / 15.89 s | 156.1 / 147.3 MB | 236.7 / 236.6 GB |
+| `typical` 0.2 (the default) | 36.98 / 38.97 tok/s | 338 / 328 | 1,061.2 / 1,060.3 tok/s | 15.90 / 15.92 s | 148.8 / 135.2 MB | 236.7 GB |
+| `typical` 0.1 | 38.80 / 39.22 tok/s | 304 / 307 | 1,067.4 / 1,036.2 tok/s | 15.81 / 16.28 s | 156.5 / 149.9 MB | 236.7 GB |
+| `typical` 0.05 | 41.05 / 40.33 tok/s | 299 / 297 | 1,067.8 / 1,065.8 tok/s | 15.81 / 15.84 s | 139.8 / 146.1 MB | 236.7 GB |
+
+The rule does not change the prompt pass: the prefill is about 1,060 tok/s in every arm. The `exact` values come from
+runs 2 and 3 of an ABBA. In the last four ABBAs, run 2 read 1.7 to 4.2 % less prefill than run 1, with no change in
+the prompt's code. Delta 0.2 gives 16 to 18 % more decode than `exact` (mean 37.98 against 32.39 tok/s). Smaller
+deltas are faster and less faithful.
 
 ### The q8 pack
 
