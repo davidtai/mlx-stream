@@ -38,6 +38,10 @@ pub const compilation_bytes: u64 = 512 << 20;
 /// The reader's staging per worker: at least the bank's widest span, page-rounded, plus a page. Beam's gate/up span
 /// (2 x (2,560 x 5,120 / 2 + 2,560 x 5,120 / 16) + 8 = 14,745,608 B) and its alignment: 16 MiB.
 pub const reader_staging_bytes: u64 = 16 << 20;
+/// M2a: in the decode phase the read pool copies a range into its rows (gate/up 14,745,608 B, down 7,372,804 B, an
+/// adopted chunk 5,554,176 B) in pieces of at most this many bytes side by side (`expert_io.Options.split_bytes`; 0
+/// copies on the worker that read the range). A miss's gate opens after the copy of its last byte.
+pub const read_split_bytes: u64 = 2 << 20;
 /// The rate tally's default ratio on Beam: 0 (off), glm5_next's (no Beam measurement yet).
 pub const default_tally_ratio: f64 = 0;
 
