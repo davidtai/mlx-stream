@@ -1,6 +1,7 @@
 //! beam's parity test against the numpy reference (scripts/beam_reference_logits.py): a Beam pack served end to end
 //! on the GPU stream (the module's construction, its prompt pass, its serial decode steps) beside the reference's
-//! logits for the same token ids.
+//! logits for the same token ids. The fixture and the slice hold no drafter sidecar: they load with `mtp_lane = false`
+//! (the serial control; the draft lane's own parity is lane_test.zig's).
 //!
 //!   BEAM_PARITY=<pack dir> BEAM_PARITY_REF=<prefix>[,<prefix>...]               (the fill's rows)
 //!   BEAM_PARITY_SLICE=<pack dir> BEAM_PARITY_SLICE_REF=<prefix>[,<prefix>...]   (64 rows a routed layer)
@@ -320,7 +321,7 @@ fn parityRun(dir: []const u8, refs: []const u8, rows: ?u32) !void {
     };
     // Every reference runs; the first failure is the test's.
     var first_err: ?anyerror = null;
-    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off, .expert_rows = rows, .expert_prefill_rows = rows };
+    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off, .mtp_lane = false, .expert_rows = rows, .expert_prefill_rows = rows };
     try cfg.validate();
     var weights = try sdk.loader.dir(io, a, dir, .{});
     defer weights.deinit();
@@ -380,7 +381,7 @@ fn servedLogits(a: std.mem.Allocator, dir: []const u8, prefix: []const u8, rows:
     defer a.free(text);
     var diag: beam.Diag = .{};
     const model = try beam.Config.parse(a, text, &diag);
-    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off, .expert_rows = rows, .expert_prefill_rows = rows, .decode_moe = decode_moe, .decode_moe_requested = true };
+    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off, .mtp_lane = false, .expert_rows = rows, .expert_prefill_rows = rows, .decode_moe = decode_moe, .decode_moe_requested = true };
     try cfg.validate();
     var weights = try sdk.loader.dir(io, a, dir, .{});
     defer weights.deinit();
@@ -445,7 +446,7 @@ fn gluedLogits(a: std.mem.Allocator, dir: []const u8, prefix: []const u8, rows: 
     defer a.free(text);
     var diag: beam.Diag = .{};
     const model = try beam.Config.parse(a, text, &diag);
-    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off, .expert_rows = rows, .expert_prefill_rows = rows, .decode_glue = decode_glue, .decode_glue_requested = true };
+    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off, .mtp_lane = false, .expert_rows = rows, .expert_prefill_rows = rows, .decode_glue = decode_glue, .decode_glue_requested = true };
     try cfg.validate();
     var weights = try sdk.loader.dir(io, a, dir, .{});
     defer weights.deinit();

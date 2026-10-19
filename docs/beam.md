@@ -93,9 +93,9 @@ has no model work. Then MiMo's keep-warm engine (`gpu_keep_warm: waits`) runs fr
 and the hit wave starts beside a running warm chunk, not on an idle GPU. The step commits its logits and does not wait
 for them. The host's read of the drawn token
 is the step's last synchronization, and the sampler runs on the GPU right behind the head. The `beam decode` line
-times each step from its start to the next step's start (the last step to the request's end). Without `mtp_lane`
-there is no draft lane: `draft_lane.arm` binds the plugin's sampler and answers `off`. With it, a clean request
-decodes in rounds ([The draft lane](#the-draft-lane)).
+times each step from its start to the next step's start (the last step to the request's end). With `mtp_lane: false`
+there is no draft lane: `draft_lane.arm` binds the plugin's sampler and answers `off`. With the lane (the default), a
+clean request decodes in rounds ([The draft lane](#the-draft-lane)).
 
 The module keeps no prefix. A prompt longer than the billed context refuses with `ContextOverBill`.
 
@@ -240,12 +240,14 @@ instead of about 1,100.
 
 ## The draft lane
 
-`mtp_lane: true` installs a draft lane on Reflection's DFlash2 drafter (`reflection/Beam-1.0-501B-A23B-DFlash2` at
-163b276b; the reference is z-lab/dflash `DFlash2DraftModel` at 07ebd93d). The drafter is a sidecar in the pack:
-`drafter.safetensors` (the release's file, byte for byte) and `drafter-manifest.json` (format
-`mlx-stream-dflash2-drafter-v1`, written by the converter's `drafter` step). Construction checks the manifest against
-the trunk, then every tensor's sha256 and the file's, before the bytes become arrays (`sdk_ext/sidecar.zig`). A pack
-without the sidecar refuses `mtp_lane: true` by name.
+The draft lane is on by default (`mtp_lane`; `false` is the serial control). It runs Reflection's DFlash2 drafter
+(`reflection/Beam-1.0-501B-A23B-DFlash2` at 163b276b; the reference is z-lab/dflash `DFlash2DraftModel` at 07ebd93d).
+The drafter is a sidecar in the pack: `drafter.safetensors` (the release's file, byte for byte) and
+`drafter-manifest.json` (format `mlx-stream-dflash2-drafter-v1`, written by the converter's `drafter` step), both in
+the pack root. Construction checks the manifest against the trunk, then every tensor's sha256 and the file's, before
+the bytes become arrays (`sdk_ext/sidecar.zig`). A pack without the sidecar refuses the load by name
+(`BeamDrafterMissing`), and its log line names the fix: the two files in the pack root, or `"mtp_lane": false` for the
+serial path.
 
 The drafter has 5 layers and 1.93 B parameters (3.855 GB, BF16). It reads the trunk's residual stream at the end of
 layers 4, 16, 28, 40 and 46. It uses the trunk's embedding and lm_head. Its attention sees the newest 4,095 context
@@ -324,12 +326,27 @@ b113ef6 over fold 5 (88d903e), means of the two seeds:
 | 2 | `typical` 0.2, depth 3 (lossy) | 31.45 tok/s (+21.3 %) | 3.26, 3.11 | 87.9 / 72.9 / 58.3 % | 925.0 tok/s (-5.7 %) | 18.28 s | 212 MB | 221.5 GB |
 
 `exact` gains +1.9 % and +4.1 % (the seeds) and loses prefill: it does not meet the keep bar (+2 % decode on both seeds,
-prefill within noise), so `mtp_lane` stays off by default and the defaults serve no change. `typical` 0.2 gains +22.0 %
+prefill within noise), so at that pin `mtp_lane` stayed off by default. `typical` 0.2 gains +22.0 %
 and +20.6 %; 262 of its 1,405 accepted drafts are not the target's own draw (lossy: an opt-in). The prefill loss is the
 4 prompt rows (at equal rows the lane's prompt pass costs +0.2 %); the lane does the same prompt work in both ABBAs, so
 the difference between -3.0 % and -5.7 % is the box's variance. The lane reads more from the SSD a token (the 4 fewer
-rows and the verify's 4-row union of experts), so its value rises with the expert hit rate. At the 240 GB pin (more
-rows a layer) `exact` has no ABBA; `typical` has two (below).
+rows and the verify's 4-row union of experts), so its value rises with the expert hit rate.
+
+The lane at equal memory on the 240 GB pin (the lane-on ABBA, 2026-10-18, on the bundle of fold 7): the control at
+197 / 207 rows, the lane (`exact`, depth 3, `draft_path: sampled`) at 193 / 203 on the q8 pack with the drafter's
+sidecar, both arms seeded, the same workload and sampling:
+
+| Arm | Seed | Decode | Prefill | TTFT | Tokens a round | SSD read a decode token | Peak footprint |
+|---|---|---|---|---|---|---|---|
+| serial, 197 / 207 | 1234 | 29.55 tok/s | 1,082.2 tok/s | 15.61 s | 1 | 119.0 MB | 236.8 GB |
+| lane, 193 / 203 | 1234 | 30.47 tok/s (+3.1 %) | 1,036.9 tok/s | 16.33 s | 2.49 | 156.1 MB | 236.7 GB |
+| lane, 193 / 203 | 4321 | 31.62 tok/s (+9.9 %) | 1,075.2 tok/s | 15.56 s | 2.55 | 147.3 MB | 236.6 GB |
+| serial, 197 / 207 | 4321 | 28.78 tok/s | 1,036.0 tok/s | 16.29 s | 1 | 123.5 MB | 236.8 GB |
+
+Both seeds are faster (mean +6.4 %), and the prefill is within noise (-4.2 / +3.8 %). So the lane is on by default
+(`mtp_lane: true`, `exact`, depth 3, `draft_path: sampled`). Each arm samples its own text: the lane's tokens are
+distributed as the target's, but they are not the serial path's draws. Depth 2 against depth 3 at 193 / 203 (the same
+bundle and pack): +1.6 / +0.0 % decode, so depth 3 stays. `typical` has two ABBAs at this pin (below).
 
 Depth and delta, on the lane over the stack's fold 1 (5df1fc9), the BF16 pack, 168 / 178 rows, seed 1234: `exact`
 depth 3 is the fastest exact depth (18.97 tok/s against 15.58 serial; depths 1 to 8, 11 and 15 measured);
@@ -370,8 +387,8 @@ gives 29.31 -> 35.93 tok/s (+22.6 %) and prefill -3.7 %, with 130.5 tokens a 1,0
 
 The recommended opt-in is `typical` at delta 0.6, the default of `mtp_typical_delta`: +13.7 % decode at equal memory
 (33.3 tok/s). Delta 0.2 is 8 % faster (35.9 tok/s), but its excess surprisal a token is 2.8 times that of 0.6, 74 of its
-6,144 tokens are more than 2 nats below the top choice (0.6: none), and its second half repeats more. The lane stays
-off by default (`mtp_lane: false`), and `exact` stays its default rule.
+6,144 tokens are more than 2 nats below the top choice (0.6: none), and its second half repeats more. The lane is on
+by default with `exact`; `typical` stays an opt-in.
 
 ## Settings
 
@@ -390,7 +407,7 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 | `gpu_keep_warm` | `waits`, `off` | `waits` on a GPU stream |
 | `decode_moe` | `hitpass`, `fused`, `stock` | `hitpass` where registered, on a GPU stream |
 | `decode_glue` | `fused`, `ops` | `fused` where the texts register the model's router, on a GPU stream |
-| `mtp_lane` | `true`, `false` | `false` (the serial control) |
+| `mtp_lane` | `true`, `false` (the serial control) | `true`: the pack holds the drafter's sidecar, or the load refuses (`BeamDrafterMissing`) |
 | `draft_depth` | drafts a round, 1 .. 15 (the drafter's block of 16 less one) | 3 (the measured depth) |
 | `draft_gate` | theta in [0, 1): verify the leading drafts whose cumulative drafter probability stays at theta or more | 0 (off) |
 | `mtp_acceptance` | `exact`, `typical` (lossy) | `exact` |
@@ -402,7 +419,7 @@ One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV qua
 refuses the load (`BeamDecodeMoeUnregistered`); named on a CPU stream it refuses at construction
 (`BeamDecodeMoeNeedsGpu`). `decode_glue: fused` named for a model whose router the texts do not register refuses the
 load (`BeamDecodeGlueUnregistered`); named on a CPU stream it refuses at construction (`BeamDecodeGlueNeedsGpu`).
-A draft key without `mtp_lane: true` refuses (`BeamDraftSettingWithoutLane`). The default depth, 3, is the measured
+A draft key with `mtp_lane: false` refuses (`BeamDraftSettingWithoutLane`). The default depth, 3, is the measured
 and kept depth ([The draft lane](#the-draft-lane)).
 
 `expert_rows_by_layer` moves decode rows between the routed layers. The prompt rows and the decode total stay the
@@ -479,6 +496,9 @@ python3 -B -I scripts/beam_reference_logits.py --pack PACK --out PREFIX --prompt
 ```sh
 BEAM_PARITY=<pack> BEAM_PARITY_REF=<prefix>[,<prefix>...]
 ```
+
+The fixture and the slice hold no drafter sidecar, so the test serves them with `mtp_lane = false` (the serial path;
+the lane's own parity is `lane_test.zig`'s).
 
 The test runs the prompt pass (every prompt row) and each decode step (teacher-forced with the reference's tokens).
 The test pack is the converter's fixture (`scripts/beam_fixture.py` on feat/beam-pack: 7 layers, hidden 256, 8
@@ -571,9 +591,15 @@ slot.
 
 ## Serve on the M5 Ultra box
 
-This recipe served the full pack (`Beam-1.0-501B-A23B-NVFP4-mlx-stream`) on the 256 GB M5 Ultra (mac-studio-m5u,
-`iogpu.wired_limit_mb` 245760). The host is mlx-serve with `plugin.beam` (branch feat/beam-tools, 0c1802e7: it also
-splits the Harmony channels and parses Beam's tool calls).
+The serving pack is the q8 pack with the drafter's sidecar: `drafter.safetensors` and `drafter-manifest.json` in the
+pack root (the converter's drafter step), beside `expert-usage-v1.json`. The draft lane is on by default, so a pack
+without the sidecar refuses the load until its settings name `"mtp_lane": false` (the serial path). With the lane, pin
+193 prompt / 203 decode rows: the drafter's 4.1 GB takes 4 rows of the 240 GB target. The serial path pins 197 / 207.
+
+This recipe served the full pack (`Beam-1.0-501B-A23B-NVFP4-mlx-stream`, BF16, no sidecar: today it needs
+`"mtp_lane": false`) on the 256 GB M5 Ultra (mac-studio-m5u, `iogpu.wired_limit_mb` 245760). The host is mlx-serve
+with `plugin.beam` (branch feat/beam-tools, 0c1802e7: it also splits the Harmony channels and parses Beam's tool
+calls).
 
 1. Get the GPU lock.
 2. Remove the page cache of each large file that is not the pack. You can use `msync(MS_INVALIDATE)` on each file
@@ -583,7 +609,9 @@ splits the Harmony channels and parses Beam's tool calls).
    host's non-file baseline, so the cache no longer takes rows; the eviction still frees RAM for the run.
 3. Pin the rows. Set `expert_prefill_rows` and `expert_rows` (in `expert_streaming.settings`, or in the host's model
    settings) so that the process is near 240 GB of memory. The published recipe pins them explicitly: the fill decides
-   only an unpinned load, and its rows move with the box's other memory.
+   only an unpinned load, and its rows move with the box's other memory. The sidecar pack:
+   `{"expert_prefill_rows":193,"expert_rows":203}`. A pack without the sidecar:
+   `{"mtp_lane":false,"expert_prefill_rows":197,"expert_rows":207}`.
 4. Start the server with a fresh `~/.mlx-serve`:
 
 ```sh
@@ -621,7 +649,8 @@ arguments, on `/v1/chat/completions` and `/v1/messages`, streamed and not stream
 ### The q8 pack
 
 `Beam-1.0-501B-A23B-NVFP4-q8-mlx-stream` (`--residents q8 --bank-from <the BF16 pack>`: `experts.bin` and its
-manifest are hard links) serves with the same flags. The lines of a load at the fill:
+manifest are hard links) serves with the same flags (without the sidecar, with `"mtp_lane": false`). The lines of a
+load at the fill:
 
 ```text
 beam routes: residents=affine8_g64 prompt_combine=inplace read_schedule=early_whole_trim drain=pipelined bank_view=window decode_moe=stock call_rows=16384 tile_rows=512 gpu_keep_warm=waits expert_resident_ratio=0 expert_tally_file=on

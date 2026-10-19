@@ -650,7 +650,8 @@ test "beam bill: the attention tile bills the fused attention's working set and 
 
 // BEAM_BANK=<pack> (headers only, no payload): the bill tool. Every term in bytes and the filled rows at the served
 // contexts (`tool_contexts`), at BEAM_BILL_BASELINES_GB (comma list; default 12.6) and BEAM_BILL_CEILING (bytes; default
-// the 256 GB box's 240 GiB) less the pinned 2 GiB margin.
+// the 256 GB box's 240 GiB) less the pinned 2 GiB margin. It bills the serial path (`mtp_lane = false`: the q8 and BF16
+// packs hold no drafter sidecar); the lane's terms are the `lane depth` test's.
 test "beam bill: the bill tool prints every term and the rows per context (BEAM_BANK)" {
     const dir = std.mem.span(std.c.getenv("BEAM_BANK") orelse return error.SkipZigTest);
     const a = testing.allocator;
@@ -669,7 +670,7 @@ test "beam bill: the bill tool prints every term and the rows per context (BEAM_
         std.debug.print("config refused: {s}\n", .{diag.message()});
         return e;
     };
-    var cfg: settings.Config = .{ .model = model, .model_dir = dir, .wired_margin_bytes = box_stop };
+    var cfg: settings.Config = .{ .model = model, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = false };
     std.debug.print("\nBEAM BILL pack={s} ceiling={d} stop={d} target={d} min_rows={d}\n", .{ dir, ceiling, box_stop, ceiling -| box_stop, min_rows });
     for (tool_contexts) |ctx| {
         cfg.effective_context = ctx;

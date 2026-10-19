@@ -289,12 +289,19 @@ fn float(o: std.json.ObjectMap, k: []const u8) Error!f64 {
     };
 }
 
+/// The refusal of a pack without one of the drafter's two files. The lane is on by default (`mtp_lane`), so the line
+/// names both fixes: the two files in the pack root (the converter's drafter step), or `mtp_lane: false`.
+fn missing(file: []const u8) error{BeamDrafterMissing} {
+    log.err("beam draft lane: the pack has no {s}. The lane is on by default: put {s} and {s} in the pack root (the converter's drafter step), or set {{\"mtp_lane\":false}} for the serial path (BeamDrafterMissing)\n", .{ file, data_file, manifest_file });
+    return error.BeamDrafterMissing;
+}
+
 /// The pack's drafter manifest (pure host: no tensor read): `BeamDrafterMissing` when the pack has none.
 pub fn readManifest(a: std.mem.Allocator, io: std.Io, dir: []const u8, trunk: *const beam.Config) !Manifest {
     var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
     defer d.close(io);
     const text = d.readFileAlloc(io, manifest_file, a, .limited(manifest_limit)) catch |e| return switch (e) {
-        error.FileNotFound => error.BeamDrafterMissing,
+        error.FileNotFound => missing(manifest_file),
         else => e,
     };
     defer a.free(text);
@@ -481,7 +488,7 @@ pub const Drafter = struct {
             }
         };
         sidecar.verify(a, dir, data_file, m.entries, m.data_size, m.data_sha256, m.payload_bytes, header_limit, Take{ .m = &m, .w = &self.w }) catch |e| return switch (e) {
-            error.SidecarMissing => error.BeamDrafterMissing,
+            error.SidecarMissing => missing(data_file),
             error.SidecarSize, error.SidecarHeader, error.SidecarLayout => error.BeamDrafterSidecar,
             error.SidecarTensorSha => error.BeamDrafterTensorSha,
             error.SidecarSha => error.BeamDrafterSidecarSha,

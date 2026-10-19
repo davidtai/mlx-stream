@@ -146,12 +146,13 @@ pub const Module = struct {
         if (self.src.warm != null) log.info("beam gpu keep-warm installed: gpu_keep_warm=waits source={s} (MiMo X12: the gated waits and every decode routing barrier; bill {d} B)\n", .{ if (self.c.gpu_keep_warm_requested) "setting" else "default", gpu_warm.bill_bytes });
         self.cache = try graph.Cache.init(gpa, &self.g, &self.c.model, @intCast(plan.reserve));
         errdefer self.cache.deinit(&self.g);
-        // The draft lane: the drafter's sidecar verified tensor by tensor and its context rings, only with `mtp_lane`.
+        // The draft lane (`mtp_lane`, on by default): the drafter's sidecar verified tensor by tensor and its context
+        // rings. A pack without the sidecar refuses here or in the bill (drafter.zig `missing` names the fix).
         if (self.c.mtp_lane) {
             self.lane = try lane_mod.Lane.init(gpa, io, dir, &self.c, s);
             const l = self.lane.?;
             log.info("beam draft lane installed: lane=\"{s}\" drafter={s} payload_bytes={d} sha256_verified={d}+file read_s={d:.2} block={d} targets={any} window={d} verify_chunk_rows={d}\n", .{ l.name(), drafter.format, l.dr.payload_bytes, l.dr.c.layers * 15 + 6, @as(f64, @floatFromInt(l.dr.read_ns)) / 1e9, l.dr.c.block, l.dr.c.targetSlice(), l.dr.c.window, lane_mod.chunk_rows });
-        } else log.info("beam draft lane: off (serial; set {{\"mtp_lane\":true}} with the drafter's sidecar in the pack)\n", .{});
+        } else log.info("beam draft lane: off (mtp_lane=false: the serial control)\n", .{});
         errdefer if (self.lane) |l| l.deinit();
         // The usage seed (`resident_seed`): before the first request; one line. Without one (no file, or
         // `resident_seed: none`) each layer's prompt rows take its lowest-index experts: Beam never loads empty rows.

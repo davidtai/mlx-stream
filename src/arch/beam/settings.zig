@@ -8,13 +8,14 @@
 //! `prompt_residents` (keep, the default, or forget), MiMo's X12 keep-warm (`gpu_keep_warm`: waits, the default, or
 //! off), the decode lane's expert route (`decode_moe`: hitpass, the default, fused or stock) and its glue
 //! (`decode_glue`: fused, the default, or ops). The draft lane (lane.zig, Reflection's DFlash2 drafter from the pack's
-//! sidecar, drafter.zig) takes glm5_next's keys: `mtp_lane` installs it (off, the serial control, by default),
+//! sidecar, drafter.zig) takes glm5_next's keys: `mtp_lane` installs it (on by default: `exact`, depth 3, sampled
+//! drafts; `false` is the serial control, and a pack without the drafter's sidecar refuses the load until it is named),
 //! `draft_depth` is its drafts a round (1 .. the drafter's block less one, default `default_draft_depth`), `draft_gate`
 //! its confidence gate (theta in [0, 1), default 0: off), `mtp_acceptance` its rule (`exact`, the default, or `typical`:
 //! lossy, an opt-in), `mtp_typical_delta` typical's delta ((0, 1], default `default_typical_delta`, named only with
 //! `typical`) and `draft_path` the drafter's path on a sampled request (`sampled`, the default under `exact`, or `greedy`:
 //! `DraftPath`).
-//! A draft key without `mtp_lane: true` refuses: an inert knob is a lie.
+//! A draft key with `mtp_lane: false` refuses: an inert knob is a lie.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -143,8 +144,10 @@ pub const Config = struct {
     decode_moe_requested: bool = false,
     decode_glue: DecodeGlue = .fused,
     decode_glue_requested: bool = false,
-    /// The draft lane (`mtp_lane`): installed at construction from the pack's sidecar, or absent (the serial control).
-    mtp_lane: bool = false,
+    /// The draft lane (`mtp_lane`): installed at construction from the pack's sidecar (the default), or absent with
+    /// `false` (the serial control). On by default since the lane-on ABBA at equal memory (2026-10-18: the lane at
+    /// 193 / 203 rows against the serial control at 197 / 207, decode +3.1 / +9.9 %, prefill within noise).
+    mtp_lane: bool = true,
     /// Drafts a round (`draft_depth`); 0 marks a value outside 1 .. `max_draft_depth` or not an integer.
     draft_depth: u32 = default_draft_depth,
     /// The draft gate's theta (`draft_gate`); NaN marks a value outside [0, 1) or not a number.
@@ -478,12 +481,19 @@ test "beam settings: the decode glue is fused by default on Beam's router and a 
     try testing.expectError(error.BeamDecodeGlueUnregistered, named.validate());
 }
 
-test "beam settings: the draft lane's keys (off by default; exact the default rule; typical opt-in), each bad value refused by name" {
+test "beam settings: the draft lane's keys (on by default; exact the default rule; typical opt-in), each bad value refused by name" {
     const d: Config = .{};
-    try testing.expect(!d.mtp_lane);
+    try testing.expect(d.mtp_lane);
     try testing.expectEqual(acc.Rule.exact, d.draftRule());
     try testing.expectEqual(@as(u32, 3), d.draft_depth);
     try testing.expectEqual(DraftPath.sampled, d.draftPath());
+    // A draft key alone takes the default lane; `mtp_lane: false` alone is the serial control.
+    const depth2 = try parseSettings("{\"draft_depth\":2}");
+    try depth2.validate();
+    try testing.expect(depth2.mtp_lane and depth2.draft_depth == 2);
+    const serial = try parseSettings("{\"mtp_lane\":false}");
+    try serial.validate();
+    try testing.expect(!serial.mtp_lane);
     const greedy = try parseSettings("{\"mtp_lane\":true,\"draft_path\":\"greedy\"}");
     try greedy.validate();
     try testing.expectEqual(DraftPath.greedy, greedy.draftPath());
@@ -513,11 +523,11 @@ test "beam settings: the draft lane's keys (off by default; exact the default ru
         .{ .text = "{\"mtp_lane\":true,\"mtp_acceptance\":\"tokenv3\"}", .err = error.BeamMtpAcceptanceSetting },
         .{ .text = "{\"mtp_lane\":true,\"draft_path\":\"beam\"}", .err = error.BeamDraftPathSetting },
         .{ .text = "{\"mtp_lane\":true,\"draft_path\":true}", .err = error.BeamDraftPathSetting },
-        .{ .text = "{\"draft_path\":\"sampled\"}", .err = error.BeamDraftSettingWithoutLane },
+        .{ .text = "{\"mtp_lane\":false,\"draft_path\":\"sampled\"}", .err = error.BeamDraftSettingWithoutLane },
         .{ .text = "{\"mtp_lane\":true,\"mtp_acceptance\":\"typical\",\"draft_path\":\"sampled\"}", .err = error.BeamDraftPathTypical },
         .{ .text = "{\"mtp_lane\":true,\"mtp_acceptance\":\"typical\",\"mtp_typical_delta\":0}", .err = error.BeamMtpTypicalDeltaSetting },
         .{ .text = "{\"mtp_lane\":true,\"mtp_typical_delta\":0.3}", .err = error.BeamMtpTypicalDeltaWithoutTypical },
-        .{ .text = "{\"draft_depth\":3}", .err = error.BeamDraftSettingWithoutLane },
+        .{ .text = "{\"mtp_lane\":false,\"draft_depth\":3}", .err = error.BeamDraftSettingWithoutLane },
         .{ .text = "{\"mtp_lane\":false,\"mtp_acceptance\":\"typical\"}", .err = error.BeamDraftSettingWithoutLane },
     }) |case| try testing.expectError(case.err, (try parseSettings(case.text)).validate());
 }
