@@ -753,7 +753,7 @@ const testing = std.testing;
 
 test "beam glue: the embedded manifest and texts are the pinned ones" {
     try checkPins();
-    try kset.expectManifestPins(texts.manifest, &text_pins, 6);
+    try kset.expectManifestPins(texts.manifest, &text_pins, 10);
 }
 
 test "beam glue: Beam 1.0's and the fixture's routers are the texts'; another is refused by name" {
