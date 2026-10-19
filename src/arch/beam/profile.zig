@@ -335,12 +335,13 @@ fn endPhase(src: anytype) void {
         after.adopt_bytes - before.adopt_bytes, after.pre_issued - before.pre_issued,     after.pre_served - before.pre_served,
         after.pre_expired - before.pre_expired, after.gates - before.gates,               after.gates_forced - before.gates_forced,
     });
-    // perf/beam-misspath (diag): the speculative class's schedule, M1's co-read included.
-    log.info(tag ++ "_SPEC phase={s} claimed_inflight={d} co_reads={d} abandoned={d} abandoned_bytes={d} cancelled={d} expired={d} discarded={d}\n", .{
+    // perf/beam-misspath (diag): the speculative class's schedule, M1's co-read included; M2a's split copies.
+    log.info(tag ++ "_SPEC phase={s} claimed_inflight={d} co_reads={d} abandoned={d} abandoned_bytes={d} cancelled={d} expired={d} discarded={d} split_ranges={d}\n", .{
         name,                                                       after.spec_claimed_inflight - before.spec_claimed_inflight,
         after.spec_co_reads - before.spec_co_reads,                 after.spec_abandoned - before.spec_abandoned,
         after.spec_abandoned_bytes - before.spec_abandoned_bytes,   after.spec_cancelled - before.spec_cancelled,
         after.spec_expired - before.spec_expired,                   after.spec_discarded - before.spec_discarded,
+        after.split_ranges - before.split_ranges,
     });
     log.info(tag ++ "_IO phase={s} bytes={d} planned_loads={d} skipped_loads={d} hits={d} misses={d} read_range_sum_s={d:.6} read_inflight_wall_s={d:.6}\n", .{
         name,                                                                                                  after.expert_bytes_read - before.expert_bytes_read,
