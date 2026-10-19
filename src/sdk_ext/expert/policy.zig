@@ -76,8 +76,12 @@ pub const LayerPolicy = struct {
     prefill_freq: []u32,
     seed: std.DynamicBitSetUnmanaged,
     protected: std.DynamicBitSetUnmanaged,
-    /// The last `prepareSeed` call's routed rows per expert (P1's barrier tally reads them).
+    /// The last `prepareSeed` call's routed rows per expert (P1's barrier tally reads them; under `keep_call_routed` a
+    /// resident the call routes is no victim of its admissions: `probationVictim`).
     call_counts: []u32,
+    /// A prompt call's admissions never take the row of a resident the call routes (the stream's
+    /// `Options.prompt_keep_routed`); off: such a resident is a victim like any probationer.
+    keep_call_routed: bool = false,
     /// The last `prepareSeed`'s chosen ranks: the call's hottest `seed_ranks` experts (count desc, ties by id).
     seed_ranks: u32 = 0,
     /// Pool clock stamp of each resident expert (0 = none).
@@ -602,12 +606,14 @@ pub const LayerPolicy = struct {
     }
 
     /// The coldest probationary resident (lowest (recency, slot)) that this
-    /// route does not hold; prefill never evicts a protected expert.
+    /// route does not hold; prefill never evicts a protected expert, nor under `keep_call_routed` a resident the call
+    /// routes (the last `prepareSeed`'s ids: a later route of the same call would read it back).
     fn probationVictim(p: *const LayerPolicy) ?u32 {
         var best: ?u32 = null;
         var best_recency: u64 = 0;
         for (p.slot_to_expert[0..p.capacity], 0..) |e, s| {
             if (e == no_expert or p.in_route.isSet(e) or p.protected.isSet(e) or p.held.isSet(s) or p.pinned.isSet(e)) continue;
+            if (p.keep_call_routed and p.call_counts[e] > 0) continue;
             if (best == null or p.recency[e] < best_recency) {
                 best = @intCast(s);
                 best_recency = p.recency[e];

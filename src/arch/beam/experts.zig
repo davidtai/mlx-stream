@@ -143,6 +143,8 @@ pub const Source = struct {
         var opts = try route.streamOptionsOf(B, self.rows, .{ .mlx = stream }, event, tally, false);
         // M2a: the decode phase's copies into rows in pieces side by side (settings.zig `read_split_bytes`).
         opts.pool.split_bytes = settings.read_split_bytes;
+        // A prompt call's admissions take no row of a resident the call routes (the stream's `prompt_keep_routed`).
+        opts.prompt_keep_routed = true;
         self.sdk_stream = try Stream.init(a, &self.sdk_bank, opts);
         errdefer self.sdk_stream.deinit();
         self.stream_source = StreamSource.init(self.sdk_stream);
