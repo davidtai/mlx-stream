@@ -140,7 +140,10 @@ pub const Source = struct {
         // The reader's staging holds the bank's widest span plus its page alignment and a page: refused here, once.
         if (B.S.stagingBytes(&self.sdk_bank) > settings.reader_staging_bytes) return error.BeamReaderStaging;
         const event = try expert_event.createMetal();
-        self.sdk_stream = try Stream.init(a, &self.sdk_bank, try route.streamOptionsOf(B, self.rows, .{ .mlx = stream }, event, tally, false));
+        var opts = try route.streamOptionsOf(B, self.rows, .{ .mlx = stream }, event, tally, false);
+        // M2a: the decode phase's copies into rows in pieces side by side (settings.zig `read_split_bytes`).
+        opts.pool.split_bytes = settings.read_split_bytes;
+        self.sdk_stream = try Stream.init(a, &self.sdk_bank, opts);
         errdefer self.sdk_stream.deinit();
         self.stream_source = StreamSource.init(self.sdk_stream);
         try self.stream_source.installReadSchedule(route.read_schedule, mimo_stream.default_read_schedule_threshold);
