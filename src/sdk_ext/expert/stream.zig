@@ -487,6 +487,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// record and reads nothing: the record is read once, not twice. Needs `overlap` and one slot geometry (every
             /// layer's rows interchangeable with the transient rows); off (the control): every such record is read again.
             prompt_relocate: bool = false,
+            /// A prompt call's admissions never take the row of a resident the call routes (`LayerPolicy.keep_call_routed`;
+            /// perf/beam-misspath). Without it a group's admission can evict a resident that a later group of the same
+            /// call routes (each group holds only its neighbours' rows), and that group reads it back: Beam's 1K prompt
+            /// read 3,979 records against 2,891 non-resident ones. Off (the control): such a resident is a probationer.
+            prompt_keep_routed: bool = false,
             /// The rate tally (`expert.tally`, `LayerPolicy.setTally`) on every layer: null, off.
             tally: ?Tally = null,
         };
@@ -915,6 +920,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (layers, opt.rows, bank.layers, 0..) |*ls, rows, *geom, li| {
                     var policy = try LayerPolicy.init(a, bank.n_experts, rows);
                     errdefer policy.deinit(a);
+                    policy.keep_call_routed = opt.prompt_keep_routed;
                     if (opt.tally) |t| {
                         const experts = if (t.layer_experts) |le| le[li] else bank.n_experts;
                         policy.setTally(expert.tally.pinLimit(t.ratio, experts), expert.tally.alphaOf(t.window));
