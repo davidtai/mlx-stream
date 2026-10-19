@@ -157,6 +157,14 @@ pub const Module = struct {
             log.info("beam draft lane installed: lane=\"{s}\" drafter={s} payload_bytes={d} sha256_verified={d}+file read_s={d:.2} block={d} targets={any} window={d} verify_chunk_rows={d}\n", .{ l.name(), drafter.format, l.dr.payload_bytes, l.dr.c.layers * 15 + 6, @as(f64, @floatFromInt(l.dr.read_ns)) / 1e9, l.dr.c.block, l.dr.c.targetSlice(), l.dr.c.window, lane_mod.chunk_rows });
         } else log.info("beam draft lane: off (mtp_lane=false: the serial control)\n", .{});
         errdefer if (self.lane) |l| l.deinit();
+        // The prompt path's warm-up (graph.zig `warmup`): the residents' first GPU use and the prompt pass's pipelines at
+        // the load, not in the first request; the expert source untouched (no read, no plan, no usage count), before the
+        // seed.
+        const tw = std.Io.Timestamp.now(io, .awake);
+        const wrows = @min(graph.warmup_rows, @as(u32, @intCast(plan.reserve)));
+        try graph.warmup(&self.g, gpa, &self.c.model, &self.w, self.routes, wrows, &self.cache);
+        self.g.clearCache();
+        log.info("beam warm-up: rows={d} wall_s={d:.3} (a prompt-shaped trunk pass, the routed experts left out)\n", .{ wrows, @as(f64, @floatFromInt(tw.untilNow(io, .awake).nanoseconds)) / 1e9 });
         // The usage seed (`resident_seed`): before the first request; one line. Without one (no file, or
         // `resident_seed: none`) each layer's prompt rows take its lowest-index experts: Beam never loads empty rows.
         try residency.seedResidents(gpa, io, "beam", &self.c.residency, dir, self.src, .lowest_index);

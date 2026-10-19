@@ -1072,6 +1072,74 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
     return g.keep(try logitsOf(g, c, w, last));
 }
 
+/// The construction's warm-up rows: two attention tiles (the prompt call's tile loop, its slices and its join).
+pub const warmup_rows: u32 = 2 * tile_rows;
+
+/// The construction's warm-up (perf/beam-misspath): one prompt-shaped call of `rows` placeholder ids through every
+/// layer's trunk as `forward` runs a prompt call (the q8 prompt views, the attention tiles, the boundaries, the dense
+/// layers' MLP tiles, the routers, each layer evaluated, the head), with each routed layer's experts left out (the MoE
+/// output taken as its input). Nothing reaches the expert source (no read, no plan, no count), and the KV rows it writes
+/// are dropped at the next request's `Cache.restart`. The first request's prompt pass then finds the GPU's first use of
+/// the residents and the prompt's pipelines done: on 10/18 layer 0's attention of a first request started on the GPU
+/// 1.4 s after its commit, against 24 ms for layers 1 and 2 and for a second request.
+pub fn warmup(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Weights, routes: Routes, rows: u32, cache: *Cache) !void {
+    if (rows == 0 or rows > experts.call_rows) return error.BeamCallRows;
+    if (rows > cache.cap) return error.ContextOverBill;
+    const m0 = g.mark();
+    defer g.resetTo(m0);
+    const hidden: c_int = @intCast(c.hidden_size);
+    const ids = try a.alloc(u32, rows);
+    defer a.free(ids);
+    @memset(ids, 0);
+    var x: T = blk: {
+        const idx = try g.hostArray(std.mem.sliceAsBytes(ids), &.{@intCast(rows)}, .uint32);
+        break :blk g.keep(try g.take(w.embed, idx, 0));
+    };
+    defer g.release(x);
+    const n_tiles: usize = (rows + tile_rows - 1) / tile_rows;
+    const outs = try a.alloc(T, n_tiles);
+    defer a.free(outs);
+    for (w.layers, 0..) |*stored, li| {
+        const l: u32 = @intCast(li);
+        const m = g.mark();
+        defer g.resetTo(m);
+        const view = try promptView(g, stored);
+        const lw = &view;
+        const xn = try rmsNorm(g, x, lw.input_norm, c.rms_norm_eps);
+        var n_kept: usize = 0;
+        defer for (outs[0..n_kept]) |o| g.release(o);
+        for (0..n_tiles) |i| {
+            const lo: u32 = @intCast(i * tile_rows);
+            const hi: u32 = @min(rows, lo + tile_rows);
+            const ms = g.mark();
+            const tile = if (n_tiles == 1) xn else try g.slice(xn, &.{ @intCast(lo), 0 }, &.{ @intCast(hi), hidden }, &.{ 1, 1 });
+            outs[i] = g.keep(try attention(g, a, c, lw, tile, lo, cache, routes.glue));
+            n_kept += 1;
+            g.resetTo(ms);
+            try g.asyncEval(&.{outs[i]});
+            if (i > 0) try g.evalAll(&.{outs[i - 1]});
+        }
+        const attn = if (n_tiles == 1) outs[0] else try g.concat(outs[0..n_tiles], 0);
+        const b1 = try boundaryStock(g, c, attn, x, lw.post_attn_norm, lw.pre_ff_norm, beam.Config.residualIndex(l, false));
+        const f = if (lw.dense) |d| try mlpTiles(g, a, c, d, b1.out, rows) else blk: {
+            // The router as a prompt call routes; its ids go nowhere.
+            const r = try routeOf(g, c, routes, lw.router.?, b1.out, false);
+            try g.evalAll(&.{ r.indices, r.weights });
+            break :blk b1.out;
+        };
+        const next = g.keep(try depthAdd(g, c, try rmsNorm(g, f, lw.post_ff_norm, c.rms_norm_eps), b1.res, beam.Config.residualIndex(l, true)));
+        g.release(x);
+        x = next;
+        g.resetTo(m);
+        for (outs[0..n_kept]) |o| g.release(o);
+        n_kept = 0;
+        try g.evalAll(&.{x});
+    }
+    const last = try g.slice(x, &.{ @intCast(rows - 1), 0 }, &.{ @intCast(rows), hidden }, &.{ 1, 1 });
+    try g.evalAll(&.{try logitsOf(g, c, w, last)});
+    cache.restart();
+}
+
 /// The head over `x` [r, hidden]: the final norm, lm_head (its output bf16), then the soft cap in f32:
 /// cap * tanh(logits / cap), one compiled kernel (`Softcap`).
 pub fn logitsOf(g: *G, c: *const beam.Config, w: *const Weights, x: T) !T {
