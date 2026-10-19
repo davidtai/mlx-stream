@@ -128,6 +128,9 @@ pub const Stats = struct {
     spec_co_reads: u64 = 0,
     /// Range copies split into pieces side by side (`io.Options.split_bytes`, in the decode phase).
     split_ranges: u64 = 0,
+    /// The distinct records (a layer's expert) the request's prompt phase read since the request's start: a record read
+    /// twice counts once (not a counter: `resetPromptCounts` clears it).
+    prompt_records_distinct: u64 = 0,
     direct_ranges: u64 = 0,
     adopt_ranges: u64 = 0,
     adopt_bytes: u64 = 0,

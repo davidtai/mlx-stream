@@ -755,6 +755,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// (`resetPromptCounts` clears it). `setPromptAhead` refuses once it is set. Residents do not set it: a kept or
             /// seeded resident is not a started prompt.
             prompt_started: bool = false,
+            /// The records the request's prompt phase read, a bit a (layer, expert) (`Stats.prompt_records_distinct`;
+            /// `resetPromptCounts` clears it).
+            prompt_read: []u64 = &.{},
             /// P7 (`Options.prompt_reads`, `prompt_ahead`, `ahead_cap`).
             prompt_reads: PromptReads = .stock,
             prompt_ahead: AheadPost = .head,
@@ -962,6 +965,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const ahead_job: []u8 = if (opt.prompt_reads == .overlap) try a.alloc(u8, bank.n_experts) else &.{};
                 errdefer if (ahead_job.len > 0) a.free(ahead_job);
                 @memset(ahead_job, no_job);
+                const prompt_read = try a.alloc(u64, std.math.divCeil(usize, @as(usize, n_layers) * bank.n_experts, 64) catch unreachable);
+                errdefer a.free(prompt_read);
+                @memset(prompt_read, 0);
                 const pool = try expert_io.Pool.start(a, pool_opt);
                 errdefer pool.stop();
                 if (opt.lookahead) |la| if (la.preread) try B.Records.armPreRead(pool, &layers[widest].lens);
@@ -1004,6 +1010,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .prompt_relocate = opt.prompt_relocate,
                     .p7_rows = p7_rows,
                     .ahead_job = ahead_job,
+                    .prompt_read = prompt_read,
                 };
                 // Relocation's copies (`p7Relocate`): at most every persistent row's components per call, reserved once.
                 if (opt.prompt_relocate) try self.promote_copies.ensureTotalCapacity(a, @as(usize, n_components) * bank.n_experts);
@@ -1042,6 +1049,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 a.free(self.ahead.landed);
                 if (self.p7_rows.len > 0) a.free(self.p7_rows);
                 if (self.ahead_job.len > 0) a.free(self.ahead_job);
+                a.free(self.prompt_read);
                 a.destroy(self);
             }
 
@@ -1362,6 +1370,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// policy's rank tie-break reads them too, so request 1 (zeroed by the construction's forget) is unchanged.
             pub fn resetPromptCounts(self: *Stream) void {
                 self.prompt_started = false;
+                @memset(self.prompt_read, 0);
                 for (self.layers) |*ls| {
                     @memset(ls.policy.prefill_freq, 0);
                     // The prompt's pins at the rows it has (the tally's rates as the last request left them).
@@ -1823,6 +1832,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     if (!r.reads[li]) continue;
                     const l = r.plan.loads[li];
                     self.locate(r.layer, l.slot).meta.state = if (ok) .ready else .failed;
+                    if (ok) self.markPromptRead(r.layer, l.expert);
                     if (!ok and l.persistent) ls.policy.invalidate(l.expert);
                     // The recorder: a gate/up range that ran no preadv was copied out of a lookahead record.
                     if (comptime recording) if (self.recorder) |rec| if (ok) {
@@ -1964,6 +1974,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     for (ah.loads[p.first..][0..p.n], ah.reads[p.first..][0..p.n]) |l, rd| if (rd) {
                         self.locate(ah.layer, l.slot).meta.state = if (ok) .ready else .failed;
                         if (!ok) policy.invalidate(l.expert);
+                        if (ok) self.markPromptRead(ah.layer, l.expert);
                     };
                     if (!ok) failure = if (waited) |_| error.ReadFailed else |e| e;
                 }
@@ -2862,8 +2873,16 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (res.preadv_calls == 0 and res.payload > 0) self.copy_only_ns += ns;
             }
 
+            /// A record the prompt phase read landed (`prompt_read`; the decode phase's reads are not marked).
+            fn markPromptRead(self: *Stream, layer: u32, e: u32) void {
+                if (self.phase != .prefill) return;
+                const bit = @as(usize, layer) * self.bank.n_experts + e;
+                self.prompt_read[bit >> 6] |= @as(u64, 1) << @intCast(bit & 63);
+            }
+
             pub fn stats(self: *Stream) Stats {
                 var s = self.counters;
+                for (self.prompt_read) |w| s.prompt_records_distinct += @popCount(w);
                 s.expert_read_seconds = @as(f64, @floatFromInt(self.read_ns)) / 1e9;
                 s.adopt_copy_seconds = @as(f64, @floatFromInt(self.copy_only_ns)) / 1e9;
                 s.read_wall_ns = @intCast(@max(self.pool.readGauge()[4], 0));
