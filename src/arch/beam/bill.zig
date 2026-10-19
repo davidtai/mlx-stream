@@ -26,6 +26,7 @@ const route_bill = @import("../mimo_v2/route_bill.zig");
 const dsv_bill = @import("../deepseek_v41/bill.zig");
 const shared_experts = @import("../deepseek_v41/experts.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
+const expert_io = @import("../../sdk_ext.zig").expert.io;
 const drafter = @import("drafter.zig");
 const draft_lane = @import("lane.zig");
 const bank = experts.bank;
@@ -302,6 +303,8 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         // The plugin's sampler on a row it hands the host (`sdk_ext.sampler.chosen`): eight f32 vocab rows at most.
         .{ .name = "sampler", .bytes = @splat(8 * @as(u64, c.vocab_size) * f32b), .at_construction = false },
         .{ .name = "gpu_warm", .bytes = @splat(if (in.gpu_keep_warm == .waits) gpu_warm.bill_bytes else 0), .at_construction = in.gpu_keep_warm == .waits },
+        // M2a: the read pool's piece threads (the decode copy split, settings.zig `read_split_bytes`): their stacks.
+        .{ .name = "read_pieces", .bytes = @splat(if (settings.read_split_bytes > 0) expert_io.piece_threads * expert_io.piece_thread_bytes else 0), .at_construction = true },
         // `decode_moe: hitpass`: every model layer's LUT pair (the shared scheduler's DEVROUTE), from the first decode on.
         .{ .name = "hitpass_luts", .bytes = @splat(if (in.decode_moe == .hitpass) hitpassLutBytes(in) else 0), .at_construction = false },
         // `decode_glue: fused`: the glue's texts, pipelines and configs (glue.zig), declared; 0 under ops.

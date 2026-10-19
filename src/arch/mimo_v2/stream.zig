@@ -318,10 +318,14 @@ fn phaseRowsBoundary(prompt_rows: [2]u32, decode_rows: [2]u32) !void {
     opts.max_route_ids = 8;
     opts.transient_rows = 16;
     opts.transient_release = true; // the route `Source.initBank` installs with decode rows
+    opts.pool.split_bytes = std.heap.pageSize(); // M2a: the copy split, its phase gate shut in the prompt phase
     const stream = try Stream.init(a, &side.bank, opts);
     defer stream.deinit();
+    try testing.expect(!stream.pool.splitPhase(false));
     try testing.expectEqual(@as(u64, 16 * geom.record_bytes), try stream.releaseTransient());
     try stream.grow(&decode_rows);
+    // The grow opened the split's gate (the previous state, read back by setting it again).
+    try testing.expect(stream.pool.splitPhase(true));
     for (stream.layers, decode_rows, prompt_rows) |*ls, d, p| {
         // The growth request: decode - prompt rows per layer, the residents' base rows unmoved.
         try testing.expectEqual(d - p, ls.ext.?.rows);
@@ -335,6 +339,7 @@ fn phaseRowsBoundary(prompt_rows: [2]u32, decode_rows: [2]u32) !void {
     var grown: u64 = 0;
     for (decode_rows, prompt_rows) |d, p| grown += d - p;
     try testing.expectEqual(@as(u64, (grown + 8) * geom.record_bytes), try stream.shrink(&prompt_rows, .forget));
+    try testing.expect(!stream.pool.splitPhase(false));
     try testing.expectEqual(@as(u64, 16 * geom.record_bytes), try stream.regrowTransient());
     for (stream.layers, prompt_rows) |*ls, p| {
         try testing.expect(ls.ext == null);
