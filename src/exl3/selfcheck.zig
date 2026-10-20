@@ -188,7 +188,7 @@ fn checkFormTwin(h: *H, k: Kernel) !void {
     const id_arr = try fromHost(&sc, std.mem.sliceAsBytes(ids[0..n]), &shape, .uint32);
     var bad: u64 = 0;
     var words: u64 = 0;
-    if (k == .dsv41_exl3_pair_k3_5120) {
+    if (k == .dsv41_exl3_pair_k3_5120 or k == .dsv41_exl3_pair_k2_5120) {
         ins[1] = id_arr;
         sins[0] = ins[0];
         sins[1] = id_arr;
@@ -1721,7 +1721,7 @@ fn k36F64(h: *H, sc: *Scope, k: Kernel) !void {
 const dig_rows = [_]u32{ 70, 37, 20, 17 };
 
 fn isGateUp(k: Kernel) bool {
-    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut;
+    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk2_m128;
 }
 
 /// One DIG GEMM launch over `wave` with the A rows `xs` (f16 [rows, 1, K], one per operand); `rout` for the fused
