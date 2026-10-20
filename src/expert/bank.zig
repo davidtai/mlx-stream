@@ -36,6 +36,10 @@ pub const Component = enum(u8) {
 };
 pub const n_components = 9;
 pub const gu_components = 6;
+/// A bank of K = 3 and K = 2 layers keeps a transient scratch per geometry (`sdk_ext.expert.stream`): a K = 2 layer's
+/// rows land in K = 2-shaped slots in every bank (base, grown, transient), so the kernels read one tile width per
+/// launch and a code array's tile width names its layer's K.
+pub const per_geometry_transients = true;
 
 pub const Dtype = enum { I16, F16 };
 

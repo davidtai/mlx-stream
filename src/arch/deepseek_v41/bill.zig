@@ -409,6 +409,12 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
     defer p.bank.deinit();
     defer if (p.draft_subset) |*x| x.deinit();
     const rec = p.inputs.record_bytes;
+    // The second geometry's transient scratch (`expert_bank.per_geometry_transients`: the 2.9 bpw banks' K = 2 layers):
+    // its own transient rows beside the widest geometry's, in the prompt phase and in decode (its window 0).
+    var alt_rec: u64 = 0;
+    for (p.bank.layers) |l| if (l.logical_bytes != rec) {
+        alt_rec = @max(alt_rec, l.logical_bytes);
+    };
     // The stream's transient bank, allocated whole at construction: one window of max_route_ids rows per wide
     // read the stream holds in flight (the arm's `.transient_rows = wide_depth x max_route_ids`). Billing one
     // window left 48 records (0.64 GB) of device memory unbilled after c47001e folded the second window's named
@@ -448,9 +454,9 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
         .n_experts = c.n_routed_experts,
         .prefill_rows = p.prefill_rows,
         .decode_rows = p.decode_rows,
-        .slot_prefill = (@as(u64, c.n_layers) * p.prefill_rows + transient) * rec,
+        .slot_prefill = (@as(u64, c.n_layers) * p.prefill_rows + transient) * rec + transient * alt_rec,
         .decode_extra_records = ov.decode_extra_records orelse 0,
-        .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + (ov.decode_extra_records orelse 0) + transient_decode) * rec,
+        .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + (ov.decode_extra_records orelse 0) + transient_decode) * rec + transient_decode * alt_rec,
         // The host side is billed as measured (`measured_host_side_bytes`, in host_reserve).
         .lookahead_staging = 0,
         .residents = m.totalBytes() - droppedResidentBytes(&m, headRoute(ov)) + builtResidentBytes(&c, headRoute(ov)),
