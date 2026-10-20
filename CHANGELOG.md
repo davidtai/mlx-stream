@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- DeepSeek-V4.1 reference fixtures (src/arch/deepseek_v41/reference_test.zig): the Engram hashing checked against
+  the official `NgramHashState.forward` (hermetic, on by default) and the stored FP8 Engram rows and FP4 decoding
+  checked against independent Torch casts (opt-in: a GPU-lock-held run under `DSV41_PHASE0B_MLX` or
+  `_GPU_WINDOW_LOCKED`).
 - MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
   as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
   DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the
