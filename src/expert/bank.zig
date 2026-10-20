@@ -1095,7 +1095,7 @@ test "dsv41 bank: every bankv2 refusal refuses, by name" {
 }
 
 // DSV41_BANK=<bank dir> [DSV41_PHASE0_FIXTURE=<json from the reference runtime's dump_phase0_reader_fixture.py>]
-test "dsv41 bank: the real 3.0 bank opens" {
+test "dsv41 bank: the real bank opens (the 3.0 bpw bank or the 1017 2.9 bpw bank)" {
     const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var diag: Diag = .{};
     var bank = Bank.open(testing.allocator, std.testing.io, dir, dsv41, &diag) catch |e| {
@@ -1105,11 +1105,23 @@ test "dsv41 bank: the real 3.0 bank opens" {
     defer bank.deinit();
     try testing.expectEqual(@as(usize, 40 * 384), bank.digests.len);
     try testing.expectEqual(bank.sidecar_size, bank.sidecar.size);
-    try testing.expectEqual(@as(u64, 204_535_234_560), bank.sidecar_size);
+    // the 3.0 bpw bank (K = 3 everywhere): 204,535,234,560 bytes; the 1017 2.9 bpw bank (layers 18-22 at K = 2):
+    // 196,041,768,960; either way the sidecar is the layer table's span and a record's spans are its segments'
+    const last = bank.layers[bank.layers.len - 1];
+    try testing.expectEqual(last.base_offset + 384 * last.record_bytes, bank.sidecar_size);
     for (bank.layers) |l| try testing.expect(l.k == 3 or l.k == 2);
+    const l13 = bank.layers[13];
+    try testing.expectEqual(@as(u32, 3), l13.k);
     const s = bank.spans(13, 17);
-    try testing.expectEqual(@as(u64, 66_700_324_864), s.gu_offset);
-    try testing.expectEqual(@as(u64, 66_700_324_864 + 8_877_056), s.down_offset);
+    try testing.expectEqual(l13.base_offset + 17 * l13.record_bytes, s.gu_offset);
+    try testing.expectEqual(s.gu_offset + 8_877_056, s.down_offset);
+    if (bank.layers[18].k == 2) {
+        const l18 = bank.layers[18];
+        const s2 = bank.spans(18, 5);
+        try testing.expectEqual(@as(u64, 8_892_416), l18.record_bytes);
+        try testing.expectEqual(l18.base_offset + 5 * l18.record_bytes, s2.gu_offset);
+        try testing.expectEqual(s2.gu_offset + 5_927_936, s2.down_offset);
+    }
     const fixture = std.mem.span(std.c.getenv("DSV41_PHASE0_FIXTURE") orelse return);
     const Rec = struct { layer: u32, expert: u32, gu: [2]u64, down: [2]u64 };
     const Fixture = struct { layer_set: []const Rec, pick_set: []const Rec };

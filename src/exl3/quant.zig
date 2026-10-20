@@ -2667,7 +2667,7 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
     }
     // checkBank: the moved per-projection check's refusals, through the quant's entry
     for ([_]struct { cap: c_int, last: c_int, rin_dt: Dtype, what: []const u8 }{
-        .{ .cap = 1, .last = 32, .rin_dt = .float16, .what = "input code" },
+        .{ .cap = 1, .last = 40, .rin_dt = .float16, .what = "input code" },
         .{ .cap = 64, .last = 48, .rin_dt = .float32, .what = "input rg" },
         .{ .cap = 5000, .last = 48, .rin_dt = .float16, .what = "a bank of 5000 slots" },
     }) |c| {

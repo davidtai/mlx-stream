@@ -131,7 +131,7 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
             unreachable;
         }
     };
-    // the EXL3 quant: exactly its construction plan, the decode routes prepared (GEMV 2 x 48, rin 4 x 48)
+    // the EXL3 quant: exactly its construction plan, the decode routes prepared (GEMV 2 x 48 + the K = 2 pair, rin 4 x 48)
     const acc = try eq.accept(Trace, a, &t, .{ .kernels = set.ref() }, v41_spec, &diag);
     const exl3_plan = Plan.count(&set.reg, &eq.checked_at_accept);
     try testing.expectEqual(exl3_plan, acc.report.results.items.len);
@@ -139,7 +139,7 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try testing.expectEqual(eq.checked_at_accept.len, exl3_plan);
     const ex = ks.subsetOf(&eq.kernels);
     for (acc.report.results.items) |r| try testing.expect(ex.contains(r.kernel) and r.ok);
-    try testing.expectEqual(@as(isize, 288), t.prepared_live);
+    try testing.expectEqual(@as(isize, 384), t.prepared_live);
     try testing.expectEqual(@as(usize, 40), acc.waves.len);
     // the fused down GEMM's arm: its compiles join the report, and every layer's waves launch it
     const fused_checks = Plan.count(&set.reg, &eq.w1_texts);
@@ -149,18 +149,18 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try testing.expectEqual(exl3_plan + fused_checks, acc.report.results.items.len);
     for (acc.waves) |*w| try testing.expectEqual(@as(u32, 4), w.wave_launches);
     // the routed forms: the GEMVs rebuilt on their texts at construction (no check joins the report: the registry's
-    // twins run in a check window), the prepared tables swap (gate|up's one-launch table joins: + 48)
+    // twins run in a check window), the prepared tables swap (gate|up's one-launch tables join, K = 3 and K = 2: + 96)
     try acc.routeForms(&t, .{ .down_pair = true, .gu_one = true });
     try testing.expectEqual(Kernel.dsv41_exl3_pair_k3_5120, acc.gemv.dn.kernel);
     try testing.expect(acc.gemv.gu1_p != null);
     try testing.expectEqual(exl3_plan + fused_checks, acc.report.results.items.len);
-    try testing.expectEqual(@as(isize, 288 + 48), t.prepared_live);
-    // the banked route over the forms: six prepared tables (in_rin, gu_epi, din_rin, dpost, gu_one's, the pair's: + 288),
+    try testing.expectEqual(@as(isize, 384 + 96), t.prepared_live);
+    // the banked route over the forms: eight prepared tables (in_rin, gu_epi, din_rin, dpost, gu_one's and the pair's at K = 3 and K = 2: + 384),
     // no kept array (its GEMV statics are the forms' own, aliased), no check joins the report; the forms are its
     // input, so a later forms route is refused
     const keeps0 = t.keeps;
     try acc.routeBanked(&t);
-    try testing.expectEqual(@as(isize, 288 + 48 + 288), t.prepared_live);
+    try testing.expectEqual(@as(isize, 384 + 96 + 384), t.prepared_live);
     try testing.expectEqual(keeps0, t.keeps);
     try testing.expectEqual(Kernel.dsv41_exl3_b3_pair_k3_5120, acc.banked.?.dn_e.kernel);
     try testing.expectEqual(Kernel.dsv41_exl3_b3_guone_k3_2304, acc.banked.?.gu_e.kernel);
@@ -170,9 +170,9 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try testing.expectError(error.BankedRoutedTwice, acc.routeBanked(&t));
     acc.banked.?.deinit(&t);
     acc.banked = null;
-    try testing.expectEqual(@as(isize, 288 + 48), t.prepared_live);
+    try testing.expectEqual(@as(isize, 384 + 96), t.prepared_live);
     try acc.routeForms(&t, .{});
-    try testing.expectEqual(@as(isize, 288), t.prepared_live);
+    try testing.expectEqual(@as(isize, 384), t.prepared_live);
     // the trunk: its own construction plan, none of the EXL3 kernels
     var rep: selfcheck.Report = .{};
     defer rep.deinit(a);
@@ -522,9 +522,10 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
     {
         var r = try Gemv(Trace).init(&t, &reg);
         defer r.deinit(&t);
-        for ([_]Proj{ .gate, .down }) |proj| {
-            const e = if (proj == .down) r.dn else r.gu;
-            const st = if (proj == .down) &r.dn_statics else &r.gu_statics;
+        for ([_]struct { Proj, bool }{ .{ .gate, false }, .{ .down, false }, .{ .gate, true }, .{ .down, true } }) |pk| {
+            const proj, const k2 = pk;
+            const e = if (proj == .down) (if (k2) r.dn2 else r.dn) else (if (k2) r.gu2 else r.gu);
+            const st = if (proj == .down) (if (k2) &r.dn2_statics else &r.dn_statics) else (if (k2) &r.gu2_statics else &r.gu_statics);
             for (e.samples) |*s| {
                 const xh, const ids, const code = .{ try t.arg(e, "xh", &s.vars), try t.arg(e, "ids", &s.vars), try t.arg(e, "code", &s.vars) };
                 _ = try r.project(&t, proj, xh, ids, code);
@@ -590,6 +591,25 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
             const x, const c0, const tbl = .{ try t.arg(e, "x", v), try t.arg(e, "code0", v), try t.arg(e, "tbl", v) };
             _ = try r.gemmDown(&t, x, c0, tbl, @intCast(v.get(.tgs)));
             try expectLaunch(t.back(1), e, s, &.{ x, c0, tbl });
+        }
+        // the K = 2 GEMMs (their own samples: code 32 wide picks the K = 2 texts)
+        for (r.gemm_gu128_k2.samples) |*s| {
+            const e, const v = .{ r.gemm_gu128_k2, &s.vars };
+            const x0, const x1, const c0, const c1, const tbl = .{ try t.arg(e, "x0", v), try t.arg(e, "x1", v), try t.arg(e, "code0", v), try t.arg(e, "code1", v), try t.arg(e, "tbl", v) };
+            _ = try r.gemmGateUp(&t, x0, x1, c0, c1, tbl, @intCast(v.get(.tgs)));
+            try expectLaunch(t.back(1), e, s, &.{ x0, x1, c0, c1, tbl });
+        }
+        for (r.gemm_dn128_k2.samples) |*s| {
+            const e, const v = .{ r.gemm_dn128_k2, &s.vars };
+            const x, const c0, const tbl = .{ try t.arg(e, "x", v), try t.arg(e, "code0", v), try t.arg(e, "tbl", v) };
+            _ = try r.gemmDown(&t, x, c0, tbl, @intCast(v.get(.tgs)));
+            try expectLaunch(t.back(1), e, s, &.{ x, c0, tbl });
+        }
+        for (r.gemm_dn_w1_k2.samples) |*s| {
+            const e, const v = .{ r.gemm_dn_w1_k2, &s.vars };
+            const x, const c0, const rout, const tbl = .{ try t.arg(e, "x", v), try t.arg(e, "code0", v), try t.arg(e, "rout", v), try t.arg(e, "tbl", v) };
+            _ = try r.gemmDownWiden(&t, x, c0, rout, tbl, @intCast(v.get(.tgs)));
+            try expectLaunch(t.back(1), e, s, &.{ x, c0, rout, tbl });
         }
         // the table-codebook gate|up text (its own samples: the 128-row text's geometry)
         for (r.gemm_gu128lut.samples) |*s| {
@@ -657,7 +677,7 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
         const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_") or isDecode2(&e) or isPrefill2(&e) or e.kernel == .q3_prefill_dig_rot_take2_5120 or
             e.kernel == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or e.kernel == .q3_prefill_dig_gemm_2304x5120_xmul1hk3 or
             // the routed forms: their own test launches them (`Gemv.initForms`)
-            e.kernel == .dsv41_exl3_pair_k3_5120 or e.kernel == .dsv41_exl3_guone_k3_2304 or
+            e.kernel == .dsv41_exl3_pair_k3_5120 or e.kernel == .dsv41_exl3_guone_k3_2304 or e.kernel == .dsv41_exl3_pair_k2_5120 or e.kernel == .dsv41_exl3_guone_k2_2304 or
             // the banked route: its own test launches it (`Banked`)
             std.mem.startsWith(u8, @tagName(e.kernel), "dsv41_exl3_b3_");
         try testing.expectEqual(!unrouted, hit.contains(e.kernel));
@@ -793,12 +813,12 @@ test "dsv41 kernels ops: the prepared per-M launches are the per-call launches t
             },
         }
     }
-    // router 2 + 2 draft, premix 2, HCTAPE 4 + 4 draft, K36 4, GEMV 2 + routed forms 2 + banked 4, PREP 4 + banked 4;
-    // index top-k 1, softmax 2
-    try testing.expectEqual(@as(usize, 37), rule);
+    // router 2 + 2 draft, premix 2, HCTAPE 4 + 4 draft, K36 4, GEMV 2 + routed forms 2 + banked 4 (+ their 8 K = 2 twins),
+    // PREP 4 + banked 4; index top-k 1, softmax 2
+    try testing.expectEqual(@as(usize, 45), rule);
     // + the plan kernels: rcproj 6 sites, the draft variant 3, f32-x 8, m1rows 4, smallm_all 2 + bf16 3,
     // sinkhorn16 (32 n), the head (8 M)
-    try testing.expectEqual(@as(usize, 16 * 48 + 21 * 8 + (6 + 3 + 8 + 4 + 2 + 3) * 8 + 32 + 8), launches);
+    try testing.expectEqual(@as(usize, 24 * 48 + 21 * 8 + (6 + 3 + 8 + 4 + 2 + 3) * 8 + 32 + 8), launches);
     try testing.expectEqual(@as(isize, 0), t.prepared_live);
     // a route's prepared configs are released with it
     const n_launch = t.launches.items.len;
