@@ -73,7 +73,7 @@ test "dsv41 kernels c2: the EXL3 quant and the trunk partition the kernel set (k
         std.debug.print("partition: {s}\n", .{m});
         return error.TestUnexpectedResult;
     }
-    try testing.expectEqual(@as(usize, 34), eq.kernels.len);
+    try testing.expectEqual(@as(usize, 47), eq.kernels.len);
     try testing.expectEqual(@as(usize, 65), tr.kernels.len);
     try testing.expectEqual(xk.n_kernels, eq.kernels.len + tr.kernels.len);
     // the EXL3 subset is exactly the EXL3 families; its headers are the DIG ones
@@ -83,7 +83,7 @@ test "dsv41 kernels c2: the EXL3 quant and the trunk partition the kernel set (k
         var fam = false;
         for (exl3_families) |f| fam = fam or std.mem.eql(u8, e.family, f);
         try testing.expectEqual(fam, ex.contains(e.kernel));
-        if (e.header) |h| try testing.expectEqual(ex.contains(e.kernel), h == .dig2_x or h == .dig_mul1_k3 or h == .dig_mul1h_k3 or h == .dig_mul1h_k3_lut);
+        if (e.header) |h| try testing.expectEqual(ex.contains(e.kernel), h == .dig2_x or h == .dig_mul1_k3 or h == .dig_mul1h_k3 or h == .dig_mul1h_k3_lut or h == .dig_mul1h_k2);
     }
     // the EXL3-only check kinds stay on the EXL3 side
     for (&reg.entries) |*e| {

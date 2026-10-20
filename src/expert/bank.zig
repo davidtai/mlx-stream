@@ -66,8 +66,8 @@ pub const Implemented = struct {
     n_layers: u64,
 };
 
-/// DeepSeek-V4.1 on the EXL3 3.0 bpw bank: K = 3 on every layer, mul1.
-pub const dsv41: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 5120, .inter = 2304, .n_experts = 384, .n_layers = 40 };
+/// DeepSeek-V4.1 on an EXL3 bank: mul1, K = 3 (the 3.0 bpw bank, every layer) or K = 2 (the 2.9 bpw banks' layers 18-22).
+pub const dsv41: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{ 2, 3 }, .hidden = 5120, .inter = 2304, .n_experts = 384, .n_layers = 40 };
 
 /// Why a bank was refused, for the one log line the caller writes.
 pub const Diag = @import("sdk").Diag;
@@ -1106,7 +1106,7 @@ test "dsv41 bank: the real 3.0 bank opens" {
     try testing.expectEqual(@as(usize, 40 * 384), bank.digests.len);
     try testing.expectEqual(bank.sidecar_size, bank.sidecar.size);
     try testing.expectEqual(@as(u64, 204_535_234_560), bank.sidecar_size);
-    for (bank.layers) |l| try testing.expectEqual(@as(u32, 3), l.k);
+    for (bank.layers) |l| try testing.expect(l.k == 3 or l.k == 2);
     const s = bank.spans(13, 17);
     try testing.expectEqual(@as(u64, 66_700_324_864), s.gu_offset);
     try testing.expectEqual(@as(u64, 66_700_324_864 + 8_877_056), s.down_offset);

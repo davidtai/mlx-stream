@@ -33,6 +33,12 @@ const argOf = kr.argOf;
 const expectInput = kr.expectInput;
 const launchRule = kr.launchRule;
 const rowsOf = kr.rowsOf;
+
+/// Which text set a code array takes: 0 for K = 3 (48 int16 per tile), 1 for K = 2 (32). A layer's K reaches every
+/// dispatch this way: the bank's per-layer arrays are shaped by the v2 manifest's K (the claim admits only bank_ks).
+fn kIndexOf(comptime G: type, g: *G, code: G.T) usize {
+    return @intFromBool(rowsOf(G, g, code, 3) == 32);
+}
 const Statics = kr.Statics;
 const RowPlans = kr.RowPlans;
 const rowsVars = kr.rowsVars;
@@ -82,6 +88,19 @@ pub const kernels = [_]Kernel{
     .dsv41_exl3_b3_moeprep_dpost,
     .dsv41_exl3_b3_pair_k3_5120,
     .dsv41_exl3_b3_guone_k3_2304,
+    .dsv41_exl3_mul1h_k2_2304,
+    .dsv41_exl3_mul1h_k2_5120,
+    .dsv41_exl3_pair_k2_5120,
+    .dsv41_exl3_guone_k2_2304,
+    .dsv41_exl3_b3_mul1h_k2_2304,
+    .dsv41_exl3_b3_mul1h_k2_5120,
+    .dsv41_exl3_b3_pair_k2_5120,
+    .dsv41_exl3_b3_guone_k2_2304,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk2_m128,
+    .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128,
+    .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128w1,
+    .q3_exl3_dig_decmat_5120x2304_mul1hk2,
+    .q3_exl3_dig_decmat_2304x5120_mul1hk2,
 };
 
 /// The routed decode forms (`DSV41_CELL_ROUTED_FORMS`): each independently selectable, chosen at construction.
@@ -345,20 +364,21 @@ pub fn Accepted(comptime G: type) type {
 /// launcher must be installed on `g` first (`Set.install`): a backend that prepares launches
 /// prepares them through it.
 /// The 128-row DIG-X GEMM texts (their 0b smoke checks them by name).
-const m128_texts = [_]Kernel{ .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128, .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128 };
+const m128_texts = [_]Kernel{ .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128, .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128, .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk2_m128, .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128 };
 /// The fused down GEMM: a construction-time arm (`Accepted.routeFusedDown` self-checks it, then the waves launch it);
 /// the stock accept neither routes nor checks it. Its 0b smoke checks it by name.
-pub const w1_texts = [_]Kernel{.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1};
+pub const w1_texts = [_]Kernel{ .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1, .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128w1 };
 /// The table-codebook gate|up GEMM: registered, not routed (its 0b smoke checks it by name).
 const lut_texts = [_]Kernel{.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut};
 /// The routed decode forms: installed at construction by `Accepted.routeForms` (their twins are registry checks, run in
 /// a check window and by kbench v9); the stock accept neither routes nor checks them.
-pub const form_texts = [_]Kernel{ .dsv41_exl3_pair_k3_5120, .dsv41_exl3_guone_k3_2304 };
+pub const form_texts = [_]Kernel{ .dsv41_exl3_pair_k3_5120, .dsv41_exl3_guone_k3_2304, .dsv41_exl3_pair_k2_5120, .dsv41_exl3_guone_k2_2304 };
 /// The banked route's texts: installed at construction by `Accepted.routeBanked` (their twins are registry checks, run
 /// in a check window and by kbench v6d / v9b); the stock accept neither routes nor checks them.
 pub const banked_texts = [_]Kernel{
     .dsv41_exl3_b3_mul1h_k3_2304,     .dsv41_exl3_b3_mul1h_k3_5120,  .dsv41_exl3_b3_prep_in_rin,  .dsv41_exl3_b3_prep_gu_epi,
     .dsv41_exl3_b3_prep_din_rin,      .dsv41_exl3_b3_moeprep_dpost,  .dsv41_exl3_b3_pair_k3_5120, .dsv41_exl3_b3_guone_k3_2304,
+    .dsv41_exl3_b3_mul1h_k2_2304,     .dsv41_exl3_b3_mul1h_k2_5120,  .dsv41_exl3_b3_pair_k2_5120, .dsv41_exl3_b3_guone_k2_2304,
 };
 pub const checked_at_accept = blk: {
     var out: [kernels.len - w1_texts.len - lut_texts.len - form_texts.len - banked_texts.len]Kernel = undefined;
@@ -427,12 +447,12 @@ pub fn checkBank(comptime G: type, g: *G, reg: *const xk.Registry, proj: Proj, a
     vars.set(.cap, cap);
     switch (proj) {
         .gate, .up => {
-            try expectInput(G, g, reg.get(.dsv41_exl3_mul1h_k3_2304), "code", a.code, &vars, diag);
+            try expectInput(G, g, reg.get(if (kIndexOf(G, g, a.code) == 1) .dsv41_exl3_mul1h_k2_2304 else .dsv41_exl3_mul1h_k3_2304), "code", a.code, &vars, diag);
             try expectInput(G, g, reg.get(.q3_exl3_prep_gu_epi), "rg", a.rout, &vars, diag);
             try expectInput(G, g, reg.get(.q3_exl3_prep_in_rin), "rg", a.rin, &vars, diag);
         },
         .down => {
-            try expectInput(G, g, reg.get(.dsv41_exl3_mul1h_k3_5120), "code", a.code, &vars, diag);
+            try expectInput(G, g, reg.get(if (kIndexOf(G, g, a.code) == 1) .dsv41_exl3_mul1h_k2_5120 else .dsv41_exl3_mul1h_k3_5120), "code", a.code, &vars, diag);
             try expectInput(G, g, reg.get(.q3_moeprep_dpost), "rd", a.rout, &vars, diag);
             try expectInput(G, g, reg.get(.q3_exl3_prep_din_rin), "rn", a.rin, &vars, diag);
         },
@@ -451,6 +471,14 @@ pub fn Gemv(comptime G: type) type {
         dn_p: RowPlans(G, 48),
         /// gu_one: gate and up in one launch (`dsv41_exl3_guone_k3_2304`), bound by `initForms`.
         gu1_p: ?RowPlans(G, 48) = null,
+        /// The K = 2 texts (the same forms), for the layers whose code tiles are 32 int16 wide.
+        gu2: *const Entry,
+        dn2: *const Entry,
+        gu2_statics: Statics(G),
+        dn2_statics: Statics(G),
+        gu2_p: RowPlans(G, 48),
+        dn2_p: RowPlans(G, 48),
+        gu12_p: ?RowPlans(G, 48) = null,
         /// The gate / up call bound at construction: `guOne` (gu_one's one launch) or `guPair` (the two stock launches).
         gu_call: *const GuCall = guPair,
 
@@ -465,15 +493,27 @@ pub fn Gemv(comptime G: type) type {
         pub fn initForms(g: *G, reg: *const xk.Registry, forms: Forms) !Self {
             const gu = reg.get(.dsv41_exl3_mul1h_k3_2304);
             const dn = reg.get(if (forms.down_pair) .dsv41_exl3_pair_k3_5120 else .dsv41_exl3_mul1h_k3_5120);
+            const gu2 = reg.get(.dsv41_exl3_mul1h_k2_2304);
+            const dn2 = reg.get(if (forms.down_pair) .dsv41_exl3_pair_k2_5120 else .dsv41_exl3_mul1h_k2_5120);
             var gu_p: RowPlans(G, 48) = try .init(g, gu, null, null);
             errdefer gu_p.deinit(g);
             var dn_p: RowPlans(G, 48) = try .init(g, dn, null, null);
             errdefer dn_p.deinit(g);
+            var gu2_p: RowPlans(G, 48) = try .init(g, gu2, null, null);
+            errdefer gu2_p.deinit(g);
+            var dn2_p: RowPlans(G, 48) = try .init(g, dn2, null, null);
+            errdefer dn2_p.deinit(g);
             var gu1_p: ?RowPlans(G, 48) = if (forms.gu_one) try RowPlans(G, 48).init(g, reg.get(.dsv41_exl3_guone_k3_2304), null, null) else null;
             errdefer if (gu1_p) |*x| x.deinit(g);
+            var gu12_p: ?RowPlans(G, 48) = if (forms.gu_one) try RowPlans(G, 48).init(g, reg.get(.dsv41_exl3_guone_k2_2304), null, null) else null;
+            errdefer if (gu12_p) |*x| x.deinit(g);
             var gs = try Statics(G).init(g, gu);
             errdefer gs.deinit(g);
-            return .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = try Statics(G).init(g, dn), .gu_p = gu_p, .dn_p = dn_p, .gu1_p = gu1_p, .gu_call = if (forms.gu_one) guOne else guPair };
+            var ds = try Statics(G).init(g, dn);
+            errdefer ds.deinit(g);
+            var gs2 = try Statics(G).init(g, gu2);
+            errdefer gs2.deinit(g);
+            return .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = ds, .gu_p = gu_p, .dn_p = dn_p, .gu1_p = gu1_p, .gu2 = gu2, .dn2 = dn2, .gu2_statics = gs2, .dn2_statics = try Statics(G).init(g, dn2), .gu2_p = gu2_p, .dn2_p = dn2_p, .gu12_p = gu12_p, .gu_call = if (forms.gu_one) guOne else guPair };
         }
 
         pub fn deinit(self: *Self, g: *G) void {
@@ -482,6 +522,11 @@ pub fn Gemv(comptime G: type) type {
             if (self.gu1_p) |*x| x.deinit(g);
             self.gu_statics.deinit(g);
             self.dn_statics.deinit(g);
+            self.gu2_p.deinit(g);
+            self.dn2_p.deinit(g);
+            if (self.gu12_p) |*x| x.deinit(g);
+            self.gu2_statics.deinit(g);
+            self.dn2_statics.deinit(g);
         }
 
         /// Gate and up through the call `initForms` bound (no per-call choice).
@@ -495,14 +540,19 @@ pub fn Gemv(comptime G: type) type {
 
         fn guOne(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) anyerror![2]G.T {
             var out: [2]G.T = undefined;
-            try self.gu1_p.?.launch(g, rowsOf(G, g, xg, 0), &.{ xg, xu, ids, code_g, code_u }, &out);
+            const p = if (kIndexOf(G, g, code_g) == 1) &self.gu12_p.? else &self.gu1_p.?;
+            try p.launch(g, rowsOf(G, g, xg, 0), &.{ xg, xu, ids, code_g, code_u }, &out);
             return out;
         }
 
         /// xh [rows, in] f32 (rotated), ids [rows] u32 (each row's slot), code = the projection's
         /// bank code -> z [rows, out] f32 (gate / up: out 2304, down: out 5120).
         pub fn project(self: *const Self, g: *G, proj: Proj, xh: G.T, ids: G.T, code: G.T) !G.T {
-            const e, const st, const p = if (proj == .down) .{ self.dn, &self.dn_statics, &self.dn_p } else .{ self.gu, &self.gu_statics, &self.gu_p };
+            const k2 = kIndexOf(G, g, code) == 1;
+            const e, const st, const p = if (proj == .down)
+                (if (k2) .{ self.dn2, &self.dn2_statics, &self.dn2_p } else .{ self.dn, &self.dn_statics, &self.dn_p })
+            else
+                (if (k2) .{ self.gu2, &self.gu2_statics, &self.gu2_p } else .{ self.gu, &self.gu_statics, &self.gu_p });
             var ins: [9]G.T = undefined;
             ins[0] = xh;
             ins[1] = ids;
@@ -537,6 +587,13 @@ pub fn Banked(comptime G: type) type {
         /// the GEMVs' statics, aliased (the installed `Gemv`'s, released by it)
         gu_st: [xk.max_inputs]G.T = undefined,
         dn_st: [xk.max_inputs]G.T = undefined,
+        /// the K = 2 texts (the same forms) and their aliased statics
+        gu2_p: RowPlans(G, 48),
+        dn2_p: RowPlans(G, 48),
+        gu2_e: *const Entry,
+        dn2_e: *const Entry,
+        gu2_st: [xk.max_inputs]G.T = undefined,
+        dn2_st: [xk.max_inputs]G.T = undefined,
         gu_call: *const GuCall,
 
         const GuCall = fn (self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T;
@@ -544,10 +601,14 @@ pub fn Banked(comptime G: type) type {
         pub fn init(g: *G, reg: *const xk.Registry, forms: Forms, gemv: *const Gemv(G)) !Self {
             const gu_e = reg.get(if (forms.gu_one) .dsv41_exl3_b3_guone_k3_2304 else .dsv41_exl3_b3_mul1h_k3_2304);
             const dn_e = reg.get(if (forms.down_pair) .dsv41_exl3_b3_pair_k3_5120 else .dsv41_exl3_b3_mul1h_k3_5120);
-            var self: Self = .{ .in_rin_p = undefined, .gu_epi_p = undefined, .din_rin_p = undefined, .dpost_p = undefined, .gu_p = undefined, .dn_p = undefined, .gu_e = gu_e, .dn_e = dn_e, .gu_call = if (forms.gu_one) guOne else guPair };
+            const gu2_e = reg.get(if (forms.gu_one) .dsv41_exl3_b3_guone_k2_2304 else .dsv41_exl3_b3_mul1h_k2_2304);
+            const dn2_e = reg.get(if (forms.down_pair) .dsv41_exl3_b3_pair_k2_5120 else .dsv41_exl3_b3_mul1h_k2_5120);
+            var self: Self = .{ .in_rin_p = undefined, .gu_epi_p = undefined, .din_rin_p = undefined, .dpost_p = undefined, .gu_p = undefined, .dn_p = undefined, .gu_e = gu_e, .dn_e = dn_e, .gu2_p = undefined, .dn2_p = undefined, .gu2_e = gu2_e, .dn2_e = dn2_e, .gu_call = if (forms.gu_one) guOne else guPair };
             // The statics: the stock GEMV's by name (gu_one has none; its gate / up statics are compiled in).
             if (!forms.gu_one) try alias(gu_e, gemv.gu, &gemv.gu_statics, &self.gu_st);
             try alias(dn_e, gemv.dn, &gemv.dn_statics, &self.dn_st);
+            if (!forms.gu_one) try alias(gu2_e, gemv.gu2, &gemv.gu2_statics, &self.gu2_st);
+            try alias(dn2_e, gemv.dn2, &gemv.dn2_statics, &self.dn2_st);
             self.in_rin_p = try .init(g, reg.get(.dsv41_exl3_b3_prep_in_rin), null, null);
             errdefer self.in_rin_p.deinit(g);
             self.gu_epi_p = try .init(g, reg.get(.dsv41_exl3_b3_prep_gu_epi), null, null);
@@ -559,6 +620,10 @@ pub fn Banked(comptime G: type) type {
             self.gu_p = try .init(g, gu_e, null, null);
             errdefer self.gu_p.deinit(g);
             self.dn_p = try .init(g, dn_e, null, null);
+            errdefer self.dn_p.deinit(g);
+            self.gu2_p = try .init(g, gu2_e, null, null);
+            errdefer self.gu2_p.deinit(g);
+            self.dn2_p = try .init(g, dn2_e, null, null);
             return self;
         }
 
@@ -588,6 +653,8 @@ pub fn Banked(comptime G: type) type {
             self.dpost_p.deinit(g);
             self.gu_p.deinit(g);
             self.dn_p.deinit(g);
+            self.gu2_p.deinit(g);
+            self.dn2_p.deinit(g);
         }
 
         /// x [tokens, 5120] bf16 (taken rows), tok [rows] i32, ids packed -> the clamped SwiGLU [rows, 2304] f32.
@@ -606,14 +673,16 @@ pub fn Banked(comptime G: type) type {
             const rows = rowsOf(G, g, h, 0);
             var hd: [1]G.T = undefined;
             try self.din_rin_p.launch(g, rows, &.{ h, banks[0].down.rin, banks[1].down.rin, banks[2].down.rin, ids }, &hd);
-            var ins: [xk.max_inputs]G.T = self.dn_st;
+            const k2 = kIndexOf(G, g, banks[0].down.code) == 1;
+            var ins: [xk.max_inputs]G.T = if (k2) self.dn2_st else self.dn_st;
             ins[0] = hd[0];
             ins[1] = ids;
             ins[2] = banks[0].down.code;
             ins[3] = banks[1].down.code;
             ins[4] = banks[2].down.code;
             var zd: [1]G.T = undefined;
-            try self.dn_p.launch(g, rows, ins[0..self.dn_e.inputs.len], &zd);
+            const dn_e, const dn_p = if (k2) .{ self.dn2_e, &self.dn2_p } else .{ self.dn_e, &self.dn_p };
+            try dn_p.launch(g, rows, ins[0..dn_e.inputs.len], &zd);
             var out: [1]G.T = undefined;
             try self.dpost_p.launch(g, rows, &.{ zd[0], banks[0].down.rout, banks[1].down.rout, banks[2].down.rout, ids }, &out);
             return out[0];
@@ -622,7 +691,9 @@ pub fn Banked(comptime G: type) type {
         fn guPair(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T {
             const rows = rowsOf(G, g, xg, 0);
             var out: [2]G.T = undefined;
-            var ins: [xk.max_inputs]G.T = self.gu_st;
+            const k2 = kIndexOf(G, g, banks[0].gate.code) == 1;
+            const gu_e, const gu_p = if (k2) .{ self.gu2_e, &self.gu2_p } else .{ self.gu_e, &self.gu_p };
+            var ins: [xk.max_inputs]G.T = if (k2) self.gu2_st else self.gu_st;
             ins[1] = ids;
             inline for (.{ .gate, .up }, 0..) |proj, o| {
                 ins[0] = if (o == 0) xg else xu;
@@ -630,7 +701,7 @@ pub fn Banked(comptime G: type) type {
                 ins[3] = @field(banks[1], @tagName(proj)).code;
                 ins[4] = @field(banks[2], @tagName(proj)).code;
                 var z: [1]G.T = undefined;
-                try self.gu_p.launch(g, rows, ins[0..self.gu_e.inputs.len], &z);
+                try gu_p.launch(g, rows, ins[0..gu_e.inputs.len], &z);
                 out[o] = z[0];
             }
             return out;
@@ -638,7 +709,8 @@ pub fn Banked(comptime G: type) type {
 
         fn guOne(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T {
             var out: [2]G.T = undefined;
-            try self.gu_p.launch(g, rowsOf(G, g, xg, 0), &.{ xg, xu, ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code }, &out);
+            const p = if (kIndexOf(G, g, banks[0].gate.code) == 1) &self.gu2_p else &self.gu_p;
+            try p.launch(g, rowsOf(G, g, xg, 0), &.{ xg, xu, ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code }, &out);
             return out;
         }
     };
@@ -793,6 +865,10 @@ pub fn DigX(comptime G: type) type {
         /// the 128-row gate|up text with the mul1h codebook through a threadgroup table: registered, not launched by
         /// the route
         gemm_gu128lut: *const Entry,
+        /// the K = 2 twins of the launched GEMMs (layers whose code tiles are 32 int16 wide)
+        gemm_gu128_k2: *const Entry,
+        gemm_dn128_k2: *const Entry,
+        gemm_dn_w1_k2: *const Entry,
 
         pub fn init(reg: *const xk.Registry) Self {
             return .{
@@ -808,6 +884,9 @@ pub fn DigX(comptime G: type) type {
                 .widen1_e = reg.get(.q3_prefill_dig_rot_widen1_5120),
                 .gemm_dn_w1 = reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1),
                 .gemm_gu128lut = reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut),
+                .gemm_gu128_k2 = reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk2_m128),
+                .gemm_dn128_k2 = reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128),
+                .gemm_dn_w1_k2 = reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128w1),
             };
         }
 
@@ -826,7 +905,7 @@ pub fn DigX(comptime G: type) type {
             var vars = rowsVars(rowsOf(G, g, x0, 0));
             vars.set(.tgs, tgs);
             var out: [2]G.T = undefined;
-            try launchRule(G, g, self.gemm_gu128, &vars, &.{ x0, x1, code_g, code_u, tbl }, &out);
+            try launchRule(G, g, if (kIndexOf(G, g, code_g) == 1) self.gemm_gu128_k2 else self.gemm_gu128, &vars, &.{ x0, x1, code_g, code_u, tbl }, &out);
             return out;
         }
 
@@ -845,7 +924,7 @@ pub fn DigX(comptime G: type) type {
             var vars = rowsVars(rowsOf(G, g, x, 0));
             vars.set(.tgs, tgs);
             var out: [1]G.T = undefined;
-            try launchRule(G, g, self.gemm_dn_w1, &vars, &.{ x, code_d, rout_d, tbl }, &out);
+            try launchRule(G, g, if (kIndexOf(G, g, code_d) == 1) self.gemm_dn_w1_k2 else self.gemm_dn_w1, &vars, &.{ x, code_d, rout_d, tbl }, &out);
             return out[0];
         }
 
@@ -860,7 +939,7 @@ pub fn DigX(comptime G: type) type {
             var vars = rowsVars(rowsOf(G, g, x, 0));
             vars.set(.tgs, tgs);
             var out: [1]G.T = undefined;
-            try launchRule(G, g, self.gemm_dn128, &vars, &.{ x, code_d, tbl }, &out);
+            try launchRule(G, g, if (kIndexOf(G, g, code_d) == 1) self.gemm_dn128_k2 else self.gemm_dn128, &vars, &.{ x, code_d, tbl }, &out);
             return out[0];
         }
 
