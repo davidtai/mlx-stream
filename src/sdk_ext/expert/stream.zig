@@ -1867,6 +1867,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
                 if (self.held_base.items.len > 0 and self.held_layer == layer)
                     held_set.appendSlice(self.allocator, self.held_base.items) catch return self.fail(error.RoutesExhausted);
+                // Nor a row a wave still pins or a load is filling (every such row is one of the above today; held by its
+                // own mark so the admission can never hand out a row the check below would fail on).
+                for (self.layers[layer].meta[0..self.layers[layer].policy.capacity], 0..) |m, s| if (m.pins != 0 or m.state == .loading) {
+                    held_set.append(self.allocator, @intCast(s)) catch return self.fail(error.RoutesExhausted);
+                };
                 const admitted = self.layers[layer].policy.admitReadAheadHeld(experts, held_set.items, ah.loads[0..fit]);
                 if (comptime read_ahead_probed) if (self.probe) |pr| {
                     // The predicted seed: the ranking's top as many as the layer's unprotected rows (the seed's rule); blocked:
