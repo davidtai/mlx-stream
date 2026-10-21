@@ -4267,11 +4267,11 @@ test "dsv41 experts: P1 on seeded rows: a load's seed fills every prompt row, th
         seen[row] = true;
     };
     for (seen) |x| try testing.expect(x);
-    // The read-ahead's records at the barrier: 14 posted (the two resident predictions read nothing), all 16 predicted
-    // experts hits (the call routes every one); its bytes are the reads'.
+    // The read-ahead's records at the barrier: 14 posted and 14 hits (the barrier tallies the admissions; the two
+    // predicted experts already resident were hits of the seed's own, not the read-ahead's); its bytes are the reads'.
     const st = s.stats();
     try testing.expectEqual(@as(u64, 14), st.ahead_posted - st0.ahead_posted);
-    try testing.expectEqual(@as(u64, 16), st.ahead_hits - st0.ahead_hits);
+    try testing.expectEqual(@as(u64, 14), st.ahead_hits - st0.ahead_hits);
     const rec = sb.bank.layers[0].logical_bytes;
     try testing.expectEqual(14 * rec, st.ahead_bytes - st0.ahead_bytes);
     const demand = (st.expert_cache_misses - st0.expert_cache_misses) - (st.loads_skipped - st0.loads_skipped);
