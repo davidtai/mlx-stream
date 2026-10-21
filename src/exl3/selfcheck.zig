@@ -29,7 +29,7 @@ pub fn implemented(k: Kernel, c: Check) bool {
         .join_equiv => k == .q3jl_combine or k == .dsv41_jl_combine_bf16,
         .twin => twinOf(k) != null or formTwinOf(k) != null or bankedTwinOf(k) != null,
         .fused => fusedOf(k) != null,
-        .decode_table => k == .dsv41_exl3_mul1h_k3_2304 or k == .dsv41_exl3_mul1h_k3_5120,
+        .decode_table => k == .dsv41_exl3_mul1h_k3_2304 or k == .dsv41_exl3_mul1h_k3_5120 or k == .dsv41_exl3_mul1h_k2_2304 or k == .dsv41_exl3_mul1h_k2_5120,
         .golden_tiles => std.mem.startsWith(u8, @tagName(k), "q3_exl3_dig_decmat_"),
         .composition => isDigGemm(k) or fusedOf(k) != null,
         .layout_guard => k == .q3rc_mxfp8_fma or k == .q3drc_mxfp8_fma_f32x or k == .q3rc_mxfp8_fma__draft,
@@ -47,12 +47,17 @@ pub fn implemented(k: Kernel, c: Check) bool {
 }
 
 fn isDigGemm(k: Kernel) bool {
-    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .q3_prefill_dig_gemm_2304x5120_xmul1hk3 or twinOf(k) != null;
+    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .q3_prefill_dig_gemm_2304x5120_xmul1hk3 or twinOf(k) != null or
+        k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk2_m128 or k == .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128;
 }
 
 /// The fused down GEMM's GEMM text (its `fused` check's reference is that text, then rot_widen1); null otherwise.
 fn fusedOf(k: Kernel) ?Kernel {
-    return if (k == .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1) .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128 else null;
+    return switch (k) {
+        .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1 => .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128,
+        .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128w1 => .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128,
+        else => null,
+    };
 }
 
 /// A DIG-X GEMM's `twin` check reference: a 128-row text's 64-row text, the table-codebook text's 128-row text; null
@@ -77,6 +82,10 @@ fn bankedTwinOf(k: Kernel) ?Kernel {
         .dsv41_exl3_b3_moeprep_dpost => .q3_moeprep_dpost,
         .dsv41_exl3_b3_pair_k3_5120 => .dsv41_exl3_pair_k3_5120,
         .dsv41_exl3_b3_guone_k3_2304 => .dsv41_exl3_guone_k3_2304,
+        .dsv41_exl3_b3_mul1h_k2_2304 => .dsv41_exl3_mul1h_k2_2304,
+        .dsv41_exl3_b3_mul1h_k2_5120 => .dsv41_exl3_mul1h_k2_5120,
+        .dsv41_exl3_b3_pair_k2_5120 => .dsv41_exl3_pair_k2_5120,
+        .dsv41_exl3_b3_guone_k2_2304 => .dsv41_exl3_guone_k2_2304,
         else => null,
     };
 }
@@ -141,6 +150,8 @@ fn formTwinOf(k: Kernel) ?Kernel {
     return switch (k) {
         .dsv41_exl3_pair_k3_5120 => .dsv41_exl3_mul1h_k3_5120,
         .dsv41_exl3_guone_k3_2304 => .dsv41_exl3_mul1h_k3_2304,
+        .dsv41_exl3_pair_k2_5120 => .dsv41_exl3_mul1h_k2_5120,
+        .dsv41_exl3_guone_k2_2304 => .dsv41_exl3_mul1h_k2_2304,
         else => null,
     };
 }
@@ -177,7 +188,7 @@ fn checkFormTwin(h: *H, k: Kernel) !void {
     const id_arr = try fromHost(&sc, std.mem.sliceAsBytes(ids[0..n]), &shape, .uint32);
     var bad: u64 = 0;
     var words: u64 = 0;
-    if (k == .dsv41_exl3_pair_k3_5120) {
+    if (k == .dsv41_exl3_pair_k3_5120 or k == .dsv41_exl3_pair_k2_5120) {
         ins[1] = id_arr;
         sins[0] = ins[0];
         sins[1] = id_arr;
@@ -836,13 +847,14 @@ fn rowInvariance(h: *H, k: Kernel, site: ?*const xk.Site, sets: u64) !void {
 
 // ── decode_table: one-hot rows through the GEMV read W_hat exactly, every state covered ──
 
-fn goldenFor(h: *H, in_dim: u32) *const xk.GoldenPlane {
-    return if (in_dim == h.reg.golden.gate_up.in_dim) &h.reg.golden.gate_up else &h.reg.golden.down;
+/// The golden plane of a code input: its projection (the input width) at its K (the tile width / 16).
+fn goldenFor(h: *H, in_dim: u32, code_arg: *const xk.Arg) *const xk.GoldenPlane {
+    return h.reg.golden.plane(in_dim, code_arg.shape[3].m / 16);
 }
 
 fn checkDecodeTable(h: *H, k: Kernel) !void {
     const e = h.reg.get(k);
-    const g = goldenFor(h, e.inputs[inputIndex(e, "xh")].shape[1].m);
+    const g = goldenFor(h, e.inputs[inputIndex(e, "xh")].shape[1].m, &e.inputs[inputIndex(e, "code")]);
     var hp = try xk.HostPlane.init(h.a, g, h.table);
     defer hp.deinit(h.a);
     const rows: usize = g.onehot_rows;
@@ -868,7 +880,7 @@ fn checkDecodeTable(h: *H, k: Kernel) !void {
         else if (std.mem.eql(u8, arg.name, "ids"))
             try fromHost(&sc, std.mem.sliceAsBytes(ids), &.{@intCast(rows)}, .uint32)
         else if (std.mem.eql(u8, arg.name, "code"))
-            try fromHost(&sc, std.mem.sliceAsBytes(hp.code), &.{ 1, @intCast(in_dim / 16), @intCast(out_dim / 16), 48 }, .int16)
+            try fromHost(&sc, std.mem.sliceAsBytes(hp.code), &.{ 1, @intCast(in_dim / 16), @intCast(out_dim / 16), @intCast(16 * g.k) }, .int16)
         else
             try genInput(h, &sc, arg, &vars, &wave);
     }
@@ -894,13 +906,13 @@ fn checkGoldenTiles(h: *H, k: Kernel) !void {
     const e = h.reg.get(k);
     const n_out: usize = e.outputs[0].shape[0].m;
     const kd: usize = e.outputs[0].shape[1].m;
-    const g = goldenFor(h, @intCast(kd));
+    const g = goldenFor(h, @intCast(kd), &e.inputs[0]);
     var hp = try xk.HostPlane.init(h.a, g, h.table);
     defer hp.deinit(h.a);
     var sc: Scope = .{ .a = h.a };
     defer sc.deinit();
     const vars: Vars = .initFill(0);
-    const code = try fromHost(&sc, std.mem.sliceAsBytes(hp.code), &.{ 1, @intCast(kd / 16), @intCast(n_out / 16), 48 }, .int16);
+    const code = try fromHost(&sc, std.mem.sliceAsBytes(hp.code), &.{ 1, @intCast(kd / 16), @intCast(n_out / 16), @intCast(16 * g.k) }, .int16);
     const outs = try launch(h, &sc, k, &.{code}, &vars, null);
     const got = try hostCopy(h, outs[0]);
     defer h.a.free(got);
@@ -1019,7 +1031,8 @@ fn chainRebuild(h: *H, k: Kernel) !void {
         const n_j: usize = code_arg.shape[2].m;
         const in_dim: c_int = @intCast(n_i * 16);
         const out_dim: c_int = @intCast(n_j * 16);
-        const plane_words = n_i * n_j * 48;
+        const k16: usize = code_arg.shape[3].m;
+        const plane_words = n_i * n_j * k16;
         const code_host = try hostCopy(h, ins[inputIndex(e, nm[0])]);
         defer h.a.free(code_host);
         const got_all = try hostCopy(h, outs[p]);
@@ -1033,7 +1046,7 @@ fn chainRebuild(h: *H, k: Kernel) !void {
             defer sj.deinit();
             const slot: usize = wave.slots[j];
             @memcpy(std.mem.sliceAsBytes(plane), code_host[slot * plane_words * 2 ..][0 .. plane_words * 2]);
-            xk.reconstruct(plane, n_i, n_j, 3, h.table, w, null);
+            xk.reconstruct(plane, n_i, n_j, k16 / 16, h.table, w, null);
             var wv = try f32Of(&sj, try fromHost(&sj, std.mem.sliceAsBytes(w), &.{ in_dim, out_dim }, .float16), s);
             const wt = try op(&sj, mlx.mlx_transpose, .{ wv, s });
             wv = try op(&sj, mlx.mlx_transpose, .{ try t128(&sj, wt, &.{ out_dim, in_dim }, s), s });
@@ -1708,7 +1721,7 @@ fn k36F64(h: *H, sc: *Scope, k: Kernel) !void {
 const dig_rows = [_]u32{ 70, 37, 20, 17 };
 
 fn isGateUp(k: Kernel) bool {
-    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut;
+    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk2_m128;
 }
 
 /// One DIG GEMM launch over `wave` with the A rows `xs` (f16 [rows, 1, K], one per operand); `rout` for the fused
@@ -1905,7 +1918,8 @@ fn digF64(h: *H, k: Kernel) !void {
     const n_j: usize = code_arg.shape[2].m;
     const kd = n_i * 16;
     const nd = n_j * 16;
-    const plane_words = n_i * n_j * 48;
+    const k16: usize = code_arg.shape[3].m;
+    const plane_words = n_i * n_j * k16;
     const plane = try h.a.alloc(i16, plane_words);
     defer h.a.free(plane);
     const w = try h.a.alloc(u16, kd * nd);
@@ -1926,7 +1940,7 @@ fn digF64(h: *H, k: Kernel) !void {
         for ([_]usize{ 0, 3 }) |j| {
             const slot: usize = f.wave.slots[j];
             @memcpy(std.mem.sliceAsBytes(plane), code[slot * plane_words * 2 ..][0 .. plane_words * 2]);
-            xk.reconstruct(plane, n_i, n_j, 3, h.table, w, null);
+            xk.reconstruct(plane, n_i, n_j, k16 / 16, h.table, w, null);
             const r0 = row0Of(&f.wave, j);
             for ([_]u32{ r0, r0 + f.wave.rows[j] - 1 }) |row| {
                 @memset(ref, 0);

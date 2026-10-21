@@ -147,6 +147,13 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
     errdefer bank.deinit();
     var record: u64 = 0;
     for (bank.layers) |l| record = @max(record, l.logical_bytes);
+    // A second geometry (the 2.9 bpw banks' K = 2 layers) keeps its own transient scratch (`expert_bank.per_geometry_transients`):
+    // one window of max_route_ids rows per wide read in flight at its record, resident from construction in every phase,
+    // charged with the wide windows.
+    var alt_record: u64 = 0;
+    for (bank.layers) |l| if (l.logical_bytes != record) {
+        alt_record = @max(alt_record, l.logical_bytes);
+    };
     const inputs: expert_admission.Inputs = .{
         .baseline_bytes = baseline,
         .wired_bytes = opt.wired_bytes orelse sdk.memory.vmBytes().wired,
@@ -155,7 +162,7 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
         .allocation = opt.allocation,
         .phase_reserve_bytes = opt.phase_reserve_bytes,
         .lookahead_staging_bytes = if (opt.lookahead) |la| expert_admission.lookaheadCharge(record, 2 * la.budget, std.heap.pageSize()) else 0,
-        .wide_window_bytes = wideWindowBytes(opt.wide_depth, record),
+        .wide_window_bytes = wideWindowBytes(opt.wide_depth, record) + @as(u64, opt.wide_depth) * expert_policy.max_route_ids * alt_record,
         .host_reserve_bytes = opt.host_reserve_bytes,
         .prefill_charge_bytes = opt.prefill_charge_bytes,
         .peak_fill = opt.peak_fill,

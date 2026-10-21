@@ -1,0 +1,32 @@
+{
+ "gate_up_k2": {
+  "K": 2,
+  "code_sha256": "56cebcf50b059744f420dd6a60f7ed765b287b0db74f5ba9c22cb700cc8e5819",
+  "codebook": "mul1",
+  "onehot_rows": 384,
+  "onehot_rows_sha256": "c66f098684c71189b1ae85669ac5683b9b2289eadb7c381e0ffa823a04fb70e8",
+  "prng": "splitmix64 (state += 0x9E3779B97F4A7C15; z ^= z >> 30, * 0xBF58476D1CE4E5B9; z ^= z >> 27, * 0x94D049BB133111EB; z ^= z >> 31), outputs from the first; int16 = little-endian view",
+  "projection": [
+   5120,
+   2304
+  ],
+  "seed": 1592590339,
+  "states_covered_by_onehot_rows": 65536,
+  "w_hat_sha256": "725541f5b5f9c8ec4f60643e13f12266e3c3a9b74dbe61848801a688d22a1ae2"
+ },
+ "down_k2": {
+  "K": 2,
+  "code_sha256": "8cc34bd61915f7407c9221b479ace42c7a572c1d5160d06af229675363760eaf",
+  "codebook": "mul1",
+  "onehot_rows": 192,
+  "onehot_rows_sha256": "3237f4272658b4a44e7c289ba6d21eefa1f15503730dbcf578df5e2a157fdd6a",
+  "prng": "splitmix64 (state += 0x9E3779B97F4A7C15; z ^= z >> 30, * 0xBF58476D1CE4E5B9; z ^= z >> 27, * 0x94D049BB133111EB; z ^= z >> 31), outputs from the first; int16 = little-endian view",
+  "projection": [
+   2304,
+   5120
+  ],
+  "seed": 1592590340,
+  "states_covered_by_onehot_rows": 65536,
+  "w_hat_sha256": "5391b791e2b17170ffb6a12a49ee9cadba49e4c1d8909a79f8c3a1a2e7cc43b8"
+ }
+}

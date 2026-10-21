@@ -16,7 +16,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "9ddcfccac89c1633d708bd43035fec5fb690c7e248b46c7cb567d0cde6f8a9cd";
+pub const manifest_sha256 = "921f7a69c4b356b31e78f8b3d6ef743caae7cfa7bf7aae4cfd541f0e6d919d81";
 
 /// G7: the decode-timers build's launch probe (`sdk_ext/kernel_set.zig`: its build flag, keys and observer).
 pub const launch_observed = kset.launch_observed;
@@ -25,10 +25,10 @@ pub const Observer = kset.Observer;
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "../kernels/exl3/";
 
-/// The bank these texts decode: EXL3 codebook mul1, K = 3 on every layer.
+/// The bank these texts decode: EXL3 codebook mul1, K = 2 or 3 per layer (ascending).
 pub const bank_codebook = "mul1";
 pub const bank_multiplier: u64 = 0x83DCD12D;
-pub const bank_ks = [_]u32{3};
+pub const bank_ks = [_]u32{ 2, 3 };
 
 /// Every kernel of record; the tag is the kernel's MLX name and its file name. A variant
 /// `<base>__<variant>` (appended) is a registered text at other template values / input
@@ -157,6 +157,21 @@ pub const Kernel = enum {
     dsv41_exl3_b3_pair_k3_5120,
     dsv41_exl3_b3_guone_k3_2304,
     dsv41_jl_combine_bf16,
+    // The K = 2 twins (10-20, scripts/dsv41_exl3_k2_gen.py): layers whose EXL3 code tiles are 16 u32 words (2 bits per
+    // weight) decode and prefill through these; a layer's K reaches the dispatch as its code array's tile width
+    dsv41_exl3_mul1h_k2_2304,
+    dsv41_exl3_mul1h_k2_5120,
+    dsv41_exl3_pair_k2_5120,
+    dsv41_exl3_guone_k2_2304,
+    dsv41_exl3_b3_mul1h_k2_2304,
+    dsv41_exl3_b3_mul1h_k2_5120,
+    dsv41_exl3_b3_pair_k2_5120,
+    dsv41_exl3_b3_guone_k2_2304,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk2_m128,
+    dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128,
+    dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128w1,
+    q3_exl3_dig_decmat_5120x2304_mul1hk2,
+    q3_exl3_dig_decmat_2304x5120_mul1hk2,
 };
 
 /// The text a tag runs: its own, or a variant's base (the part before "__").
@@ -172,7 +187,7 @@ pub fn baseOf(k: Kernel) ?Kernel {
 }
 
 /// Header texts shared by several kernels (file header_<tag>.metal).
-pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail, woa_e4m3, index_topk, attnfuse, mxfp8_m1rows, attnfuse_s2, attnhalf_idx, pf_hc, smallk, joinless, dig_mul1h_k3_lut, hcpost_tf32 };
+pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail, woa_e4m3, index_topk, attnfuse, mxfp8_m1rows, attnfuse_s2, attnhalf_idx, pf_hc, smallk, joinless, dig_mul1h_k3_lut, hcpost_tf32, dig_mul1h_k2 };
 
 pub const n_kernels = std.meta.fieldNames(Kernel).len;
 pub const n_headers = std.meta.fieldNames(Header).len;
@@ -416,6 +431,8 @@ pub fn siteVars(s: *const Site, vars: *Vars) void {
 pub const GoldenPlane = struct {
     in_dim: u32,
     out_dim: u32,
+    /// trellis bits per weight (16 K int16 per tile)
+    k: u32,
     seed: u64,
     code_sha256: [32]u8,
     w_hat_sha256: [32]u8,
@@ -427,6 +444,14 @@ pub const Golden = struct {
     mul1_table_sha256: [32]u8,
     gate_up: GoldenPlane,
     down: GoldenPlane,
+    gate_up_k2: GoldenPlane,
+    down_k2: GoldenPlane,
+
+    /// The plane of a projection (its input width) at K.
+    pub fn plane(self: *const Golden, in_dim: u32, k: u32) *const GoldenPlane {
+        const gu = in_dim == self.gate_up.in_dim;
+        return if (k == 2) (if (gu) &self.gate_up_k2 else &self.down_k2) else (if (gu) &self.gate_up else &self.down);
+    }
 };
 
 // ── The registry ──
@@ -472,7 +497,7 @@ pub const Registry = struct {
         };
         if (!std.mem.eql(u8, m.format, format)) return refuse(diag, error.ManifestFormat, "exl3 kernels: format \"{s}\" is not {s}", .{ m.format, format });
         if (!std.mem.eql(u8, m.bank.codebook, bank_codebook) or m.bank.multiplier != bank_multiplier or !std.mem.eql(u32, m.bank.K, &bank_ks))
-            return refuse(diag, error.BankNotImplemented, "exl3 kernels: the manifest's bank ({s}, K {any}) is not the mul1 K = 3 bank these texts decode", .{ m.bank.codebook, m.bank.K });
+            return refuse(diag, error.BankNotImplemented, "exl3 kernels: the manifest's bank ({s}, K {any}) is not the mul1 K {any} bank these texts decode", .{ m.bank.codebook, m.bank.K, bank_ks });
         reg.codebook = m.bank.codebook;
         reg.multiplier = m.bank.multiplier;
         reg.ks = m.bank.K;
@@ -634,7 +659,7 @@ const JKernel = struct {
 const JPlane = struct { projection: [2]u32, K: u32, codebook: []const u8, seed: u64, code_sha256: []const u8, w_hat_sha256: []const u8, onehot_rows: u32, onehot_rows_sha256: []const u8, states_covered_by_onehot_rows: u32 };
 const JGolden = struct {
     mul1_table: struct { states: u32, sha256: []const u8 },
-    planes: struct { gate_up: JPlane, down: JPlane },
+    planes: struct { gate_up: JPlane, down: JPlane, gate_up_k2: JPlane, down_k2: JPlane },
 };
 const JBank = struct { codebook: []const u8, multiplier: u64, K: []const u32 };
 const JPredecessor = struct { manifest_sha256: []const u8, kernels: []const []const u8, headers: []const []const u8 };
@@ -907,17 +932,20 @@ fn adoptGolden(g: JGolden, diag: ?*Diag) Refusal!Golden {
     const bad = error.SchemaInvalid;
     return .{
         .mul1_table_sha256 = hexSha(g.mul1_table.sha256) orelse return refuse(diag, bad, "exl3 kernels: golden mul1 table sha256", .{}),
-        .gate_up = try adoptPlane(g.planes.gate_up, diag),
-        .down = try adoptPlane(g.planes.down, diag),
+        .gate_up = try adoptPlane(g.planes.gate_up, 3, diag),
+        .down = try adoptPlane(g.planes.down, 3, diag),
+        .gate_up_k2 = try adoptPlane(g.planes.gate_up_k2, 2, diag),
+        .down_k2 = try adoptPlane(g.planes.down_k2, 2, diag),
     };
 }
 
-fn adoptPlane(p: JPlane, diag: ?*Diag) Refusal!GoldenPlane {
-    if (p.K != 3 or !std.mem.eql(u8, p.codebook, "mul1") or p.states_covered_by_onehot_rows != 65536 or p.onehot_rows == 0 or p.onehot_rows > p.projection[0])
+fn adoptPlane(p: JPlane, k: u32, diag: ?*Diag) Refusal!GoldenPlane {
+    if (p.K != k or std.mem.indexOfScalar(u32, &bank_ks, k) == null or !std.mem.eql(u8, p.codebook, "mul1") or p.states_covered_by_onehot_rows != 65536 or p.onehot_rows == 0 or p.onehot_rows > p.projection[0])
         return refuse(diag, error.SchemaInvalid, "exl3 kernels: golden plane {d}x{d}", .{ p.projection[0], p.projection[1] });
     return .{
         .in_dim = p.projection[0],
         .out_dim = p.projection[1],
+        .k = k,
         .seed = p.seed,
         .code_sha256 = hexSha(p.code_sha256) orelse return refuse(diag, error.SchemaInvalid, "exl3 kernels: golden code sha256", .{}),
         .w_hat_sha256 = hexSha(p.w_hat_sha256) orelse return refuse(diag, error.SchemaInvalid, "exl3 kernels: golden w_hat sha256", .{}),
@@ -998,7 +1026,7 @@ pub fn splitmix64(state: *u64) u64 {
 
 /// A golden plane's seeded code: the little-endian int16 view of splitmix64(seed).
 pub fn synthPlane(a: Allocator, g: *const GoldenPlane) ![]i16 {
-    const n = (g.in_dim / 16) * (g.out_dim / 16) * 48;
+    const n = (g.in_dim / 16) * (g.out_dim / 16) * 16 * g.k;
     const out = try a.alloc(i16, n);
     var s = g.seed;
     var i: usize = 0;
@@ -1022,7 +1050,7 @@ pub const HostPlane = struct {
         const w = try a.alloc(u16, n);
         errdefer a.free(w);
         const states = try a.alloc(u16, n);
-        reconstruct(code, g.in_dim / 16, g.out_dim / 16, 3, table, w, states);
+        reconstruct(code, g.in_dim / 16, g.out_dim / 16, g.k, table, w, states);
         return .{ .code = code, .w = w, .states = states };
     }
 
@@ -1051,8 +1079,8 @@ const shaHex = kset.shaHex;
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 99), n_kernels);
-    try testing.expectEqual(@as(usize, 17), n_headers);
+    try testing.expectEqual(@as(usize, 112), n_kernels);
+    try testing.expectEqual(@as(usize, 18), n_headers);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
     try testing.expect(reg.get(.mtplx_dsv4_sinkhorn_hc4_it20).launch.rule.threadgroup_rule != null);
@@ -1066,7 +1094,7 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     defer reg.deinit();
     // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
     // check), so their fixtures stand
-    try testing.expectEqual(@as(usize, 16), reg.predecessors.len);
+    try testing.expectEqual(@as(usize, 17), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
     // the take2 retune's manifest lists the one before it (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86"));
@@ -1088,6 +1116,8 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     // the merge (10-05) lists both of its parents: the minified one (dc50fb5d) and kv16's bf16 variants' (823b22d8)
     try testing.expect(reg.acceptsManifest("dc50fb5d6df59e8cf8a0082aa27952a43948c4d22d389da90f3b26cbfbc2ff7f"));
     try testing.expect(reg.acceptsManifest("823b22d8bdedd66592f538adb15afccb610af898ed9cc4d36ee010fe3ec6d074"));
+    // the K = 2 twins' manifest lists the 10-19 one (every kernel and header unchanged)
+    try testing.expect(reg.acceptsManifest("9ddcfccac89c1633d708bd43035fec5fb690c7e248b46c7cb567d0cde6f8a9cd"));
     try testing.expect(reg.acceptsManifest(manifest_sha256));
     try testing.expect(!reg.acceptsManifest("0000000000000000000000000000000000000000000000000000000000000000"));
     // the member sites the RC tiers still run, a plan per M = 1..8 at each
@@ -1513,7 +1543,7 @@ test "dsv41 kernels: the host EXL3 decode reproduces exl3_ref (codebook, seeded 
     var d: [32]u8 = undefined;
     Sha256.hash(std.mem.sliceAsBytes(table), &d, .{});
     try testing.expectEqualSlices(u8, &reg.golden.mul1_table_sha256, &d);
-    for ([_]*const GoldenPlane{ &reg.golden.gate_up, &reg.golden.down }) |g| {
+    for ([_]*const GoldenPlane{ &reg.golden.gate_up, &reg.golden.down, &reg.golden.gate_up_k2, &reg.golden.down_k2 }) |g| {
         var hp = try HostPlane.init(a, g, table);
         defer hp.deinit(a);
         Sha256.hash(std.mem.sliceAsBytes(hp.code), &d, .{});

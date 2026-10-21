@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- DeepSeek-V4.1 EXL3 banks with K = 2 layers (the 1017 2.9 bpw repacks: layers 18-22 at 2 bits per weight) load and run.
+  The registry's bank K set is {2, 3}: `scripts/dsv41_exl3_k2_gen.py` writes the K = 2 twins of the live K = 3 texts (the
+  eight decode GEMVs, the three 128-row DIG-X GEMMs, the two golden-tile loaders, `header_dig_mul1h_k2`) from the
+  general-K lane plan and window tables and proves them offline against the EXL3 bitstream (and the K = 3 texts' own
+  constants); `scripts/dsv41_exl3_k2_manifest.py` registers them with K = 2 golden planes. A layer's K reaches every
+  route as its code array's tile width; the bank keeps a transient scratch per geometry (`per_geometry_transients`),
+  billed with the wide windows and the slot terms.
 - DeepSeek-V4.1 reference fixtures (src/arch/deepseek_v41/reference_test.zig): the Engram hashing checked against
   the official `NgramHashState.forward` (hermetic, on by default) and the stored FP8 Engram rows and FP4 decoding
   checked against independent Torch casts (opt-in: a GPU-lock-held run under `DSV41_PHASE0B_MLX` or

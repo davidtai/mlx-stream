@@ -36,6 +36,10 @@ pub const Component = enum(u8) {
 };
 pub const n_components = 9;
 pub const gu_components = 6;
+/// A bank of K = 3 and K = 2 layers keeps a transient scratch per geometry (`sdk_ext.expert.stream`): a K = 2 layer's
+/// rows land in K = 2-shaped slots in every bank (base, grown, transient), so the kernels read one tile width per
+/// launch and a code array's tile width names its layer's K.
+pub const per_geometry_transients = true;
 
 pub const Dtype = enum { I16, F16 };
 
@@ -66,8 +70,8 @@ pub const Implemented = struct {
     n_layers: u64,
 };
 
-/// DeepSeek-V4.1 on the EXL3 3.0 bpw bank: K = 3 on every layer, mul1.
-pub const dsv41: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 5120, .inter = 2304, .n_experts = 384, .n_layers = 40 };
+/// DeepSeek-V4.1 on an EXL3 bank: mul1, K = 3 (the 3.0 bpw bank, every layer) or K = 2 (the 2.9 bpw banks' layers 18-22).
+pub const dsv41: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{ 2, 3 }, .hidden = 5120, .inter = 2304, .n_experts = 384, .n_layers = 40 };
 
 /// Why a bank was refused, for the one log line the caller writes.
 pub const Diag = @import("sdk").Diag;
@@ -1095,7 +1099,7 @@ test "dsv41 bank: every bankv2 refusal refuses, by name" {
 }
 
 // DSV41_BANK=<bank dir> [DSV41_PHASE0_FIXTURE=<json from the reference runtime's dump_phase0_reader_fixture.py>]
-test "dsv41 bank: the real 3.0 bank opens" {
+test "dsv41 bank: the real bank opens (the 3.0 bpw bank or the 1017 2.9 bpw bank)" {
     const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var diag: Diag = .{};
     var bank = Bank.open(testing.allocator, std.testing.io, dir, dsv41, &diag) catch |e| {
@@ -1105,11 +1109,23 @@ test "dsv41 bank: the real 3.0 bank opens" {
     defer bank.deinit();
     try testing.expectEqual(@as(usize, 40 * 384), bank.digests.len);
     try testing.expectEqual(bank.sidecar_size, bank.sidecar.size);
-    try testing.expectEqual(@as(u64, 204_535_234_560), bank.sidecar_size);
-    for (bank.layers) |l| try testing.expectEqual(@as(u32, 3), l.k);
+    // the 3.0 bpw bank (K = 3 everywhere): 204,535,234,560 bytes; the 1017 2.9 bpw bank (layers 18-22 at K = 2):
+    // 196,041,768,960; either way the sidecar is the layer table's span and a record's spans are its segments'
+    const last = bank.layers[bank.layers.len - 1];
+    try testing.expectEqual(last.base_offset + 384 * last.record_bytes, bank.sidecar_size);
+    for (bank.layers) |l| try testing.expect(l.k == 3 or l.k == 2);
+    const l13 = bank.layers[13];
+    try testing.expectEqual(@as(u32, 3), l13.k);
     const s = bank.spans(13, 17);
-    try testing.expectEqual(@as(u64, 66_700_324_864), s.gu_offset);
-    try testing.expectEqual(@as(u64, 66_700_324_864 + 8_877_056), s.down_offset);
+    try testing.expectEqual(l13.base_offset + 17 * l13.record_bytes, s.gu_offset);
+    try testing.expectEqual(s.gu_offset + 8_877_056, s.down_offset);
+    if (bank.layers[18].k == 2) {
+        const l18 = bank.layers[18];
+        const s2 = bank.spans(18, 5);
+        try testing.expectEqual(@as(u64, 8_892_416), l18.record_bytes);
+        try testing.expectEqual(l18.base_offset + 5 * l18.record_bytes, s2.gu_offset);
+        try testing.expectEqual(s2.gu_offset + 5_927_936, s2.down_offset);
+    }
     const fixture = std.mem.span(std.c.getenv("DSV41_PHASE0_FIXTURE") orelse return);
     const Rec = struct { layer: u32, expert: u32, gu: [2]u64, down: [2]u64 };
     const Fixture = struct { layer_set: []const Rec, pick_set: []const Rec };
