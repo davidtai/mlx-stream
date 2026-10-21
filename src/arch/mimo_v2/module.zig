@@ -1525,7 +1525,8 @@ fn readAheadOff(_: *source_mod.Source, _: u32, _: Router, _: Array, _: Array, _:
 
 /// The layer's own F32 router (`route`, unchanged) on its post-normed INPUT (the attention output is not yet known), in
 /// `predict_rows` tiles; the prompt's counts ranked hottest first (the seed's order) go to the stream, which reads them
-/// into the layer's empty persistent rows while its attention runs. The prediction only picks reads: no output sees it.
+/// into the layer's persistent rows (the empty ones, then the rows of the residents it leaves out) while its attention runs.
+/// The prediction only picks reads: no output sees it.
 fn readAheadPredicted(source: *source_mod.Source, abs_layer: u32, r: Router, post_norm: Array, x: Array, norm_ones: Array, eps: f32, s: Stream) anyerror!void {
     const shape = mlx.getShape(x);
     const n = shape[0];

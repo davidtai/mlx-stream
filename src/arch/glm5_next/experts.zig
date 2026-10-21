@@ -690,7 +690,8 @@ pub fn SourceOf(comptime fam: Family) type {
             return self.ex.math.predictor.scores == &scoresBf16Fused;
         }
 
-        /// P1: layer `layer`'s predicted experts, hottest first, read into its free persistent rows ahead of its call.
+        /// P1: layer `layer`'s predicted experts, hottest first, read into its persistent rows (the empty ones, then the
+        /// rows of the residents it leaves out) ahead of its call.
         pub fn readAheadSeed(self: *Self, layer: u32, ranked: []const u16) !void {
             try self.ex.at(layer).readAheadSeed(ranked);
         }

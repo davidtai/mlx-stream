@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Expert stream, every arch: P1's read-ahead takes rows when none is empty. `LayerPolicy.admitReadAhead` (and
+  `admitReadAheadHeld`, the stream's call with the live routes' slots held) replaces the coldest residents the
+  prediction left out, never a protected, pinned or held one, so a server whose prompt rows a usage-profile seed or
+  the last request filled still reads the predicted seed ahead (before: 0 records posted whenever the rows were full,
+  which the seed always made them). DeepSeek-V4.1: the predictor pass runs in the one-span prompt pass too (prompts
+  up to the prefill chunk, 1K-4K served), not only the layer-major one; `expert_wide_read_ahead` defaults on with the
+  wide seed alone and `ReadAheadNeedsSeed` is its refusal (`ReadAheadNeedsLayerMajor` is gone); a decode or verify
+  forward predicts nothing (`Hook.prompting`). GLM-5.3 (`glm_moe_dsa`): the prompt call's predictor no longer waits
+  for empty rows (`readAheadRoom` is gone). GLM-5.3 (`glm5_next`) and MiMo already ran theirs on every prompt call.
 - DeepSeek-V4.1 EXL3 banks with K = 2 layers (the 1017 2.9 bpw repacks: layers 18-22 at 2 bits per weight) load and run.
   The registry's bank K set is {2, 3}: `scripts/dsv41_exl3_k2_gen.py` writes the K = 2 twins of the live K = 3 texts (the
   eight decode GEMVs, the three 128-row DIG-X GEMMs, the two golden-tile loaders, `header_dig_mul1h_k2`) from the

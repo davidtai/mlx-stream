@@ -127,8 +127,8 @@ test "dsv41 policy: a read-ahead admits predicted experts to empty slots, unprot
         try testing.expectEqual(r.slot, p.slotOf(e).?);
         try testing.expect(!p.protected.isSet(e));
     }
-    // Full: nothing more is admitted, nothing evicted.
-    try testing.expectEqual(@as(usize, 0), p.admitReadAhead(&.{ 7, 3 }, &buf).len);
+    // Full, and the prediction names every resident: nothing more is admitted (no resident it left out to replace).
+    try testing.expectEqual(@as(usize, 0), p.admitReadAhead(&.{ 5, 9, 1, 12, 7, 3 }, &buf).len);
     // The call's true counts: 5 x3, 12 x2, 3 x2, 9 x1 -> seed = {5, 12, 3, 9} (capacity 4, nothing protected).
     p.prepareSeed(&.{ 5, 5, 5, 12, 12, 3, 3, 9 });
     // The read-ahead experts the seed chose are re-protected (resident: hits); 3 is to be admitted;
@@ -144,6 +144,43 @@ test "dsv41 policy: a read-ahead admits predicted experts to empty slots, unprot
     try testing.expectEqual(@as(u32, 1), plan_.n_loads);
     try testing.expectEqual(slot1, plan_.loads[0].slot);
     try testing.expectEqual(@as(?u32, null), p.slotOf(1));
+}
+
+test "dsv41 policy: a read-ahead with no empty row replaces the coldest residents its prediction left out, never a protected, pinned or held one" {
+    const a = testing.allocator;
+    var p = try LayerPolicy.init(a, 16, 4);
+    defer p.deinit(a);
+    var buf: [8]LayerPolicy.ReadAhead = undefined;
+    // A load's seed (or the last request's residents): 5, 9, 1, 12 in slots 0..3, recency in that order (5 the coldest).
+    try testing.expectEqual(@as(usize, 4), p.admitReadAhead(&.{ 5, 9, 1, 12 }, &buf).len);
+    try testing.expectEqual(@as(u32, 4), p.occupancy);
+    // The next prompt predicts 9, 7, 3, 12: 9 and 12 are residents (hits to be, never victims); 7 takes the coldest
+    // resident not predicted (5, slot 0), 3 the next (1, slot 2); 9 and 12 keep their slots.
+    const got = p.admitReadAhead(&.{ 9, 7, 3, 12 }, &buf);
+    try testing.expectEqualSlices(LayerPolicy.ReadAhead, &.{ .{ .expert = 7, .slot = 0 }, .{ .expert = 3, .slot = 2 } }, got);
+    try testing.expectEqual(@as(u32, 4), p.occupancy);
+    try testing.expectEqual(@as(?u32, null), p.slotOf(5));
+    try testing.expectEqual(@as(?u32, null), p.slotOf(1));
+    try testing.expectEqual(@as(?u32, 1), p.slotOf(9));
+    try testing.expectEqual(@as(?u32, 3), p.slotOf(12));
+    for ([_]u16{ 7, 3, 9, 12 }) |e| try testing.expect(!p.protected.isSet(e));
+    // A protected resident (the call's seed) and a held slot (a live route's) are never victims: with 9 protected
+    // and slot 3 (12's) held, a prediction of 2, 4, 6 replaces 7 and 3 (the coldest unprotected, unheld) and stops.
+    p.prepareSeed(&.{ 9, 9, 9 });
+    try testing.expect(p.protected.isSet(9));
+    const got2 = p.admitReadAheadHeld(&.{ 2, 4, 6 }, &.{3}, &buf);
+    try testing.expectEqual(@as(usize, 2), got2.len);
+    try testing.expectEqual(@as(?u32, 1), p.slotOf(9));
+    try testing.expectEqual(@as(?u32, 3), p.slotOf(12));
+    try testing.expectEqual(@as(?u32, null), p.slotOf(7));
+    try testing.expectEqual(@as(?u32, null), p.slotOf(3));
+    try testing.expect(p.slotOf(2) != null and p.slotOf(4) != null and p.slotOf(6) == null);
+    // The held mark is the admission's only: a later admission may take slot 3.
+    try testing.expectEqual(@as(usize, 1), p.admitReadAhead(&.{8}, &buf).len);
+    try testing.expectEqual(@as(?u32, null), p.slotOf(12));
+    // Nothing of the plan scratch stays set.
+    try testing.expectEqual(@as(usize, 0), p.retained.count());
+    try testing.expectEqual(@as(usize, 0), p.held.count());
 }
 
 test "dsv41 policy: P1's predicted counts rank as the seed ranks (count descending, ties by id), the same from any count order" {
@@ -605,7 +642,8 @@ test "dsv41 policy: capacities and read-ahead admissions refuse or stop at their
     try testing.expectError(error.InvalidCapacity, p.grow(9));
     try testing.expectError(error.InvalidCapacity, p.shrink(3));
     var ra: [3]LayerPolicy.ReadAhead = undefined;
-    // An id past the experts and a repeat are skipped; the admissions stop when the empty slots run out.
+    // An id past the experts and a repeat are skipped; the admissions stop when the slots run out (the residents are the
+    // prediction's own: no victim).
     const got = p.admitReadAhead(&.{ 9, 4, 4, 6, 7 }, &ra);
     try testing.expectEqualSlices(LayerPolicy.ReadAhead, &.{ .{ .expert = 4, .slot = 0 }, .{ .expert = 6, .slot = 1 } }, got);
     try testing.expectEqual(@as(u32, 2), p.occupancy);

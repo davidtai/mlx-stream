@@ -199,9 +199,10 @@ pub const Config = struct {
         return self.expert_wide_defer_base orelse (self.dsv41ServedTier() and (self.expert_wide_cold_rows orelse 0) == 0);
     }
 
-    /// P1's read-ahead: the setting, else on wherever the prompt pass is layer-major with the wide seed.
+    /// P1's read-ahead: the setting, else on wherever the prompt pass seeds (every prompt pass, one-span or layer-major,
+    /// runs its predictor).
     pub fn dsv41WideReadAhead(self: *const Config) bool {
-        return self.expert_wide_read_ahead orelse (self.dsv41LayerMajor() and self.dsv41WideSeed());
+        return self.expert_wide_read_ahead orelse self.dsv41WideSeed();
     }
 
     /// P1b's base call at the seed: the setting, else on wherever the wide seed and the deferred base call both are.

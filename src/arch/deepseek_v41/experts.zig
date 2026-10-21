@@ -768,9 +768,10 @@ pub const Wide = struct {
     /// waves (their slots held until then): fewer, fuller waves. Exact: a wave's rows are
     /// independent of its composition and the combine folds by routed position.
     defer_base: bool = false,
-    /// P1: each layer's predicted seed read into its free persistent rows while its attention runs (the
-    /// model's predictor pass hands it over, `Hook.readAheadSeed`), landed at the routing barrier before
-    /// the seed. Exact: it chooses reads and rows only. Needs `seed`.
+    /// P1: each layer's predicted seed read into its persistent rows (the empty ones, then those of the
+    /// residents the prediction leaves out) while its attention runs (the model's predictor pass hands it
+    /// over, `Hook.readAheadSeed`, in every prompt pass), landed at the routing barrier before the seed.
+    /// Exact: it chooses reads and rows only. Needs `seed`.
     read_ahead: bool = false,
     /// P1b: with `defer_base` and the seed, the deferred base call runs once the seed's groups are read (after the first
     /// group with a transient row), so the later groups' reads overlap its drain; later base rows run in a last call.
@@ -1251,6 +1252,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             /// P1 (`Wide.read_ahead`, fixed at construction): the model runs its predictor pass for this layer.
             pub fn readAhead(h: Hook) bool {
                 return h.ex.wide_route.read_ahead;
+            }
+
+            /// The source is in its prompt phase (before its one phase change): the forward is a prompt's, so its predictor
+            /// pass has rows to read ahead into. A source without a phase API is always prompting.
+            pub fn prompting(h: Hook) bool {
+                return if (comptime @hasDecl(S, "decoding")) !h.ex.source.decoding() else true;
             }
 
             /// P1: the layer's predicted seed, experts hottest first, read ahead of its routed call.
@@ -4196,6 +4203,82 @@ test "dsv41 experts: P1 at wide depth 3: three groups live, the read-ahead lande
     const rec = sb.bank.layers[0].logical_bytes;
     try testing.expectEqual(16 * rec, st.ahead_bytes);
     try testing.expectEqual((st.expert_cache_misses - st.loads_skipped + st.ahead_posted) * rec, st.expert_bytes_read);
+}
+
+test "dsv41 experts: P1 on seeded rows: a load's seed fills every prompt row, the prompt's read-ahead still posts (replacing the residents it leaves out), every routed row served from its record" {
+    const a = testing.allocator;
+    var sb = try SynthBank.open(128);
+    defer sb.close();
+    StreamRec.bank = &sb;
+    defer StreamRec.bank = null;
+    var c = testConfig(64, 32, 1);
+    c.n_routed_experts = 128;
+    const n = 60;
+    const k = 6;
+    var ids: [n * k]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast(((i % k) * 20 + i / k) % 120);
+    const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 }, .wide_depth = 3, .transient_rows = 3 * max_route_ids });
+    defer s.deinit();
+    StreamRec.stream = s;
+    defer StreamRec.stream = null;
+    var src = StreamSource.init(s);
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    var rrs = [_]StreamRec{StreamRec.init(a)};
+    defer rrs[0].deinit(&g);
+    const Math = WithPrefillRoutes(TraceOps, TraceMath, StreamRec);
+    const Ex = ExpertsWith(TraceOps, StreamSource, Math, .{ .prefill = true });
+    var ex = try Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .seed = true, .hot_first = true, .depth = 3, .read_ahead = true } });
+    defer ex.deinit();
+    StreamRec.base_code = ex.banks[0][@backingInt(BankKind.base)].?.gate.code;
+    StreamRec.transient_code = ex.banks[0][@backingInt(BankKind.transient)].?.gate.code;
+    // The load's seed (a usage profile's order): experts 120..127 and 0..7, every row of both layers filled, unprotected.
+    const Order = struct {
+        fn of(_: void, _: u32) []const u16 {
+            return &.{ 120, 121, 122, 123, 124, 125, 126, 127, 0, 1, 2, 3, 4, 5, 6, 7 };
+        }
+    };
+    try testing.expectEqual(@as(u64, 32), try s.seedResidents({}, Order.of));
+    try testing.expectEqual(@as(u32, 16), s.layers[0].policy.occupancy);
+    // The seed reads through the read-ahead's load path: its 32 records count as posted; the prompt's own are the delta.
+    const st0 = s.stats();
+    try testing.expectEqual(@as(u64, 32), st0.ahead_posted);
+    // The prompt's predicted seed: 0, 7, 14, ..., 105 (0 and 7 already resident: hits to be, never victims; the other
+    // fourteen replace the seeded residents 120..127 and 1..6, the coldest first, none routed by this call).
+    var predicted: [16]u16 = undefined;
+    for (&predicted, 0..) |*e, i| e.* = @intCast(i * 7);
+    try ex.at(0).readAheadSeed(&predicted);
+    try testing.expect(s.ahead.live);
+    try testing.expectEqual(@as(u32, 14), s.ahead.n);
+    for (predicted) |e| try testing.expect(s.layers[0].policy.slotOf(e) != null);
+    for ([_]u16{ 120, 127, 1, 6 }) |e| try testing.expectEqual(@as(?u32, null), s.layers[0].policy.slotOf(e));
+    var script: Script = .{ .calls = &.{&ids} };
+    g.host_values = script.values();
+    _ = try ex.at(0).routed(&g, try g.input(&.{ n, 64 }, .bfloat16), try g.input(&.{ n, k }, .int32));
+    try ex.flush();
+    try testing.expect(!s.ahead.live);
+    // Exact: every routed row once, computed from its own expert's record with its token.
+    var seen: [n * k]bool = @splat(false);
+    for (rrs[0].recs.items) |r| for (r.experts, r.act_row) |e, t| {
+        const row = for (0..k) |j| {
+            const i = t * k + j;
+            if (ids[i] == e and !seen[i]) break i;
+        } else return error.RowNotRouted;
+        seen[row] = true;
+    };
+    for (seen) |x| try testing.expect(x);
+    // The read-ahead's records at the barrier: 14 posted and 14 hits (the barrier tallies the admissions; the two
+    // predicted experts already resident were hits of the seed's own, not the read-ahead's); its bytes are the reads'.
+    const st = s.stats();
+    try testing.expectEqual(@as(u64, 14), st.ahead_posted - st0.ahead_posted);
+    try testing.expectEqual(@as(u64, 14), st.ahead_hits - st0.ahead_hits);
+    const rec = sb.bank.layers[0].logical_bytes;
+    try testing.expectEqual(14 * rec, st.ahead_bytes - st0.ahead_bytes);
+    const demand = (st.expert_cache_misses - st0.expert_cache_misses) - (st.loads_skipped - st0.loads_skipped);
+    try testing.expectEqual((demand + 14) * rec, st.expert_bytes_read - st0.expert_bytes_read);
+    // Layer 1's seeded residents are untouched (no prompt read-ahead or route there).
+    try testing.expectEqual(@as(u32, 16), s.layers[1].policy.occupancy);
+    try testing.expect(s.layers[1].policy.slotOf(120) != null and s.layers[1].policy.slotOf(7) != null);
 }
 
 test "dsv41 experts: P1b: the seed's base call drains once the seed has landed, before the next group's read wait; every routed row keeps its slot" {

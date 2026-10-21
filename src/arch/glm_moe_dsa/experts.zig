@@ -262,6 +262,12 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             try self.stream.flush();
         }
 
+        /// The stream is in its prompt phase (before `grow`): a prompt call's predictor has rows to read ahead into. A
+        /// multi-row step past the phase change (a decode-phase `extend`) predicts nothing.
+        pub fn prompting(self: *const Self) bool {
+            return self.stream.phase == .prefill;
+        }
+
         /// P1: layer `layer`'s predicted experts (hottest first) read ahead of its routed call (prompt phase).
         pub fn readAheadSeed(self: *Self, layer: u32, experts: []const u16) !void {
             if (bpl == 1) return self.stream.readAheadSeed(layer, experts) else {
@@ -274,13 +280,6 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 };
                 return self.stream.readAheadSeed(bpl * layer, buf[0..n]);
             }
-        }
-
-        /// The prompt rows of routed layer `layer` a read-ahead can still fill (it never evicts; with several bank layers
-        /// per routed layer it reads into the first).
-        pub fn readAheadRoom(self: *const Self, layer: u32) u32 {
-            const p = &self.stream.layers[bpl * layer].policy;
-            return p.capacity -| p.occupancy;
         }
 
         /// A wide prompt call's misses read at its layer's start, before its attention: each bank layer's non-resident

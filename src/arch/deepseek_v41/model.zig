@@ -507,9 +507,15 @@ pub fn Model(comptime G: type) type {
             var carry: Tr.Carry = .{};
             errdefer carry.release(g);
             errdefer for (mains[0..n_main]) |x| g.release(x);
+            // P1 (the routed hook's construction option, read once): a prompt's predicted seed read ahead during each layer's
+            // attention, in this one-span pass as in the layer-major one; a decode or verify forward (the source past its
+            // phase change) predicts nothing.
+            const has_ahead = comptime @hasDecl(@TypeOf(routed.at(0)), "readAheadSeed");
+            const read_ahead = if (comptime has_ahead) routed.at(0).readAhead() and routed.at(0).prompting() else false;
             for (self.layers, 0..) |*lw, l| {
                 const li = c.layers[l];
                 const wave = g.mark();
+                if (comptime has_ahead) if (read_ahead) try self.predictSeed(g, l, lw, routed.at(@intCast(l)), &.{h}, &.{pm}, probe);
                 if (li.engram_slot) |slot| h = if (posts[slot]) |p| try self.engramLayerPosted(g, a, slot, h, p, n) else try self.engramLayer(g, a, slot, h, rows, n);
                 if (want_main and li.dspark_target) {
                     mains[n_main] = g.keep(try mainOf(g, h));
@@ -1923,6 +1929,90 @@ test "dsv41 model: P1: each layer's predictor pass counts its chunks' predicted 
     for (stage[0..nl]) |s_| try testing.expectEqual(@as(u8, 2), s_);
     // The seed the call chose is the read-ahead's pair: each layer's first route hits both.
     try testing.expectEqual(@as(u64, 2 * nl), src.stats().expert_cache_hits);
+}
+
+test "dsv41 model: P1 in the one-span prompt pass: every layer's predictor runs before its call and the read-ahead lands before routing; a decode forward predicts nothing" {
+    const xp = @import("experts.zig");
+    const quant = @import("../../sdk_ext.zig").quant;
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    // The default tier with a chunk at least the prompt: one span, `forwardSpan` (not the layer-major pass).
+    const tier = try routes.parse(&.{.{ "MTPLX_DSV41_PREFILL_CHUNK", "64" }}, null);
+    try testing.expect(!tier.layer_major);
+    const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    var st = try model_.newState();
+    defer st.deinit(&g, testing.allocator);
+    const nl = m.c.n_layers;
+    const n: u16 = @intCast(m.c.n_routed_experts);
+    const k = m.c.n_experts_per_tok;
+    var rows0: [8]u32 = @splat(2);
+    var rows1: [8]u32 = @splat(4);
+    var src = try xp.FakeSource.init(testing.allocator, .{ .hidden = m.c.hidden_size, .inter = m.c.moe_intermediate_size, .n_experts = n, .rows = rows0[0..nl] });
+    defer src.deinit();
+    const Count = struct {
+        pub fn call(_: *@This(), gg: *TraceOps, act: u32, r: quant.PrefillRows, _: xp.BankArraysOf(u32)) !u32 {
+            return gg.input(&.{ @intCast(r.slot.len), gg.shapeOf(act).d[1] }, .float32);
+        }
+        pub fn finish(_: *@This(), _: *TraceOps) !void {}
+    };
+    var counts: [8]Count = @splat(.{});
+    const Math = xp.WithPrefillRoutes(TraceOps, xp.TraceMath, Count);
+    const Ex = xp.ExpertsWith(TraceOps, xp.FakeSource, Math, .{ .prefill = true });
+    var ex = try Ex.initWith(testing.allocator, &g, &src, .{ .d = .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, .routes = counts[0..nl] }, &m.c, .{ .wide = .{ .seed = true, .read_ahead = true } });
+    defer ex.deinit();
+    try testing.expect(ex.at(0).readAhead() and ex.at(0).prompting());
+    // Every host read of ids (the predictor's one read a layer, a routing barrier's) is the same pattern: 0, 3, 2, 1, ...
+    const Host = struct {
+        n: u16,
+        fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            for (out, 0..) |*o, i| o.* = @intCast((i * 3) % h.n);
+        }
+        fn argmax(_: *anyopaque) anyerror!u32 {
+            return 7;
+        }
+    };
+    var host: Host = .{ .n = n };
+    g.host_values = .{ .ctx = &host, .ids = Host.ids, .argmax = Host.argmax };
+    // 25 prompt rows in one span: the predictor's counts per layer are one read's ids.
+    var want_counts: [4]u32 = @splat(0);
+    for (0..25 * k) |i| want_counts[(i * 3) % n] += 1;
+    var rank_buf: [4]u16 = undefined;
+    const want = expert_policy.rankHottest(&want_counts, &rank_buf);
+    var out: [1]u32 = undefined;
+    try model_.greedy(&g, &st, &(@as([25]u32, @splat(1))), 25, &ex, &out, {});
+    // Per layer: the ranking's head admitted (2 rows), in order; read ahead, landed, then the layer's route.
+    try testing.expectEqual(@as(usize, 2 * nl), src.ahead_log.items.len);
+    for (0..nl) |l| try testing.expectEqualSlices(u16, want[0..2], src.ahead_log.items[2 * l ..][0..2]);
+    var stage: [8]u8 = @splat(0);
+    for (src.log.items) |e| switch (e.kind) {
+        .read_ahead => {
+            try testing.expectEqual(@as(u8, 0), stage[e.layer]);
+            try testing.expectEqual(@as(u32, 2), e.part);
+            stage[e.layer] = 1;
+        },
+        .await_read_ahead => {
+            try testing.expectEqual(@as(u8, 1), stage[e.layer]);
+            stage[e.layer] = 2;
+        },
+        .route => try testing.expectEqual(@as(u8, 2), stage[e.layer]),
+        else => {},
+    };
+    for (stage[0..nl]) |s_| try testing.expectEqual(@as(u8, 2), s_);
+    try testing.expectEqual(@as(u64, 2 * nl), src.stats().expert_cache_hits);
+    // Past the phase change the source decodes: a one-token forward runs no predictor pass (the log grows by no admission).
+    try ex.grow(&g, rows1[0..nl]);
+    try testing.expect(!ex.at(0).prompting());
+    const logged = src.ahead_log.items.len;
+    const r = try model_.forward(&g, &st, &.{7}, .{ .logits = .last }, &ex, graph.NoProbe{});
+    try TM.fence(&g, &st, &.{r.logits.?});
+    try ex.flush();
+    try testing.expectEqual(logged, src.ahead_log.items.len);
+    for (src.log.items) |e| if (e.kind == .read_ahead) try testing.expect(e.layer < nl);
 }
 
 test "dsv41 model: P1's predictor reads its chunks' ids in batches: one eval a batch of four, every chunk's ids counted" {
