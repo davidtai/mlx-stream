@@ -27,8 +27,9 @@ pub const Config = struct {
     /// either way. A value of another type or name is refused at construction by name (`Dsv41PromptResidentsSetting`).
     prompt_residents: sdk_ext.expert.usage.PromptResidents = .keep,
     prompt_residents_bad: bool = false,
-    /// `resident_seed` (sdk_ext/expert/usage.zig): the prompt rows seeded at the load from the pack's
-    /// `expert-usage-v1.json` (default: when the pack has it). The usage record is glm5_next's only (refused by name).
+    /// `resident_seed`, `expert_usage_record`, `expert_usage_label` (sdk_ext/expert/usage.zig): the prompt rows seeded at
+    /// the load from the pack's `expert-usage-v1.json` (default: when the pack has it), and the record of each request's
+    /// routed experts written to `expert_usage_record` (an absolute path; off by default), the file a later load seeds from.
     residency: sdk_ext.expert.usage.Settings = .{},
     /// The prompt pass's bill for the prefill admission.
     dsv41_prefill: ?v41.PrefillBill = null,
@@ -95,7 +96,7 @@ pub const Config = struct {
             log.warn("deepseek_v41: load refused: prompt_residents names none of keep, forget (Dsv41PromptResidentsSetting)\n", .{});
             return error.Dsv41PromptResidentsSetting;
         }
-        try c.residency.checkSeedOnly("deepseek_v41");
+        try c.residency.check("deepseek_v41");
     }
 
     /// The host's load facts onto this config (the module and the bill read them under these names).
@@ -317,6 +318,8 @@ test "dsv41 settings: prompt_residents: keep unless named; forget (the control) 
     try std.testing.expectError(error.Dsv41PromptResidentsSetting, (try parse("{\"prompt_residents\":1}")).checkResidency());
     try std.testing.expectEqual(usage.Seed.usage, (try parse("{\"resident_seed\":\"usage\"}")).residency.seed.?);
     try std.testing.expectError(error.ResidentSeedSetting, (try parse("{\"resident_seed\":\"all\"}")).checkResidency());
-    try std.testing.expectError(error.ExpertUsageRecordNotInstalled, (try parse("{\"expert_usage_record\":\"/tmp/u.json\"}")).checkResidency());
+    try (try parse("{\"expert_usage_record\":\"/tmp/u.json\",\"expert_usage_label\":\"sweep\"}")).checkResidency();
+    try std.testing.expectError(error.ExpertUsageRecordSetting, (try parse("{\"expert_usage_record\":\"u.json\"}")).checkResidency());
+    try std.testing.expectError(error.ExpertUsageLabelWithoutRecord, (try parse("{\"expert_usage_label\":\"sweep\"}")).checkResidency());
     try std.testing.expectEqualStrings("deepseek_v41 prompt residents: keep (decode's residents stay for the next prompt)", usage.promptResidentsLine("deepseek_v41", .keep));
 }

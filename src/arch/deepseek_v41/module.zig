@@ -582,6 +582,9 @@ pub const Module = struct {
     tally_write: bool = false,
     /// `prompt_residents` (settings.zig), installed at construction: what a fresh request's reverse change keeps.
     prompt_residents: sdk_ext.expert.usage.PromptResidents = .keep,
+    /// The usage profile's record (`expert_usage_record`; null: off, the default): each request's end adds its routed
+    /// experts (the prompt pass's routed ids, the decode routes) and writes the file a later load seeds from.
+    usage_rec: ?*sdk_ext.expert.usage.Recorder = null,
     /// The harness's route overrides the Module was built with (the bill reads the same ones).
     overrides: RouteOverrides = .{},
     /// The prefill routes as built: the trunk's pass and the hook's wide route (with the stream's
@@ -918,6 +921,7 @@ pub const Module = struct {
         // The usage seed (`resident_seed`): the prompt rows the warm-up's forget emptied, filled before the first request
         // (whose request end returns at once: nothing of a request ran, `prompt_ready`).
         try self.seedResidents(config, dir);
+        try self.openUsage(config);
         try self.openTally(config);
         // The bill at the admitted rows (the boundaries' bounds read it); the verification harness checks the constructed
         // footprint against it (`checkConstruction`).
@@ -1064,6 +1068,32 @@ pub const Module = struct {
         }
     }
 
+    /// `expert_usage_record` at construction: off (no recorder, no route counted), or the recorder over the stream's
+    /// layers and experts with the decode routes counted (`countRoutes`), as glm5_next installs it. One line.
+    fn openUsage(self: *Module, config: *const settings.Config) !void {
+        const path = config.residency.recordPath() orelse return;
+        const st = switch (self.arm) {
+            inline else => |t| t.arm.stream,
+        };
+        self.usage_rec = try sdk_ext.expert.usage.Recorder.init(self.gpa, self.io, path, "deepseek_v41", config.residency.label(), @intCast(st.layers.len), st.bank.n_experts);
+        st.countRoutes();
+        log.info("deepseek_v41 expert usage record: on path={s} label={s} ({d} layers x {d} experts; each request's prompt routed ids and decode routes, written at its end)\n", .{ path, config.residency.label(), st.layers.len, st.bank.n_experts });
+    }
+
+    /// The request's usage (`expert_usage_record` on): its counts added before the tally's end (which zeroes the decode
+    /// counts), then the file written. A failed write is logged; the request is not failed.
+    fn endUsage(self: *Module) void {
+        const r = self.usage_rec orelse return;
+        switch (self.arm) {
+            inline else => |t| t.arm.stream.addUsage(r.counts),
+        }
+        r.endRequest(self.io, self.prompt_tokens, 0) catch |e| {
+            log.warn("deepseek_v41 expert usage: not written to {s}: {s}\n", .{ r.path, @errorName(e) });
+            return;
+        };
+        log.info("deepseek_v41 expert usage: written to {s} ({d} requests, {d} prompt tokens)\n", .{ r.path, r.requests, r.prompt_tokens });
+    }
+
     /// The rate tally's file read (`expert.tally`; the stream's tally seeded from it: the pins) and the rates its writes
     /// start from. Nothing without a tally (the default: ratio 0); no file under `expert_tally_file: off` or in test
     /// builds (their HOME is the box user's).
@@ -1121,6 +1151,8 @@ pub const Module = struct {
     pub fn deinit(self: *Module) void {
         self.recordDecodeEnd();
         const gpa = self.gpa;
+        if (self.usage_rec) |r| r.deinit();
+        self.usage_rec = null;
         if (self.tally_path) |p| gpa.free(p);
         if (self.tally_rates.len > 0) gpa.free(self.tally_rates);
         self.dropTurnBoundary();
@@ -1636,6 +1668,7 @@ pub const Module = struct {
         // A request that ended in its prompt phase with nothing released needs nothing more.
         if (self.prompt_ready) return;
         self.recordDecodeEnd();
+        self.endUsage();
         self.endTally();
         const vm0: ?VmMark = if (self.overrides.verify) VmMark.now() else null;
         var x: ReverseLive = .{ .m = self, .before = BoundaryMemory.now(), .coming = coming };

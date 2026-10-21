@@ -289,8 +289,8 @@ test "dsv41 plugin: applySettings takes the host's model-settings entry (null: n
     for ([_]struct { text: []const u8, err: anyerror }{
         .{ .text = "{\"prompt_residents\":\"hold\"}", .err = error.Dsv41PromptResidentsSetting },
         .{ .text = "{\"resident_seed\":\"hot\"}", .err = error.ResidentSeedSetting },
-        .{ .text = "{\"expert_usage_record\":\"/tmp/u.json\"}", .err = error.ExpertUsageRecordNotInstalled },
-        .{ .text = "{\"expert_usage_label\":\"\"}", .err = error.ExpertUsageRecordNotInstalled },
+        .{ .text = "{\"expert_usage_record\":\"u.json\"}", .err = error.ExpertUsageRecordSetting },
+        .{ .text = "{\"expert_usage_label\":\"\"}", .err = error.ExpertUsageLabelSetting },
     }) |w| {
         var x: Config = .{};
         applySettings(&x, try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), w.text, .{}));

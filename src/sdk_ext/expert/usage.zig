@@ -98,7 +98,7 @@ pub const Settings = struct {
         }
     }
 
-    /// `check` for an arch that installs the seed but not the record (MiMo-V2.6, DeepSeek-V4.1): a named
+    /// `check` for an arch that installs the seed but not the record (MiMo-V2.6): a named
     /// `expert_usage_record` or `expert_usage_label` is refused by name, never ignored.
     pub fn checkSeedOnly(s: *const Settings, comptime arch: []const u8) error{ ResidentSeedSetting, ExpertUsageRecordNotInstalled }!void {
         if (s.seed_bad) {
@@ -106,7 +106,7 @@ pub const Settings = struct {
             return error.ResidentSeedSetting;
         }
         if (s.record_named or s.label_named) {
-            log.warn(arch ++ ": load refused: expert_usage_record / expert_usage_label are installed on glm5_next only (ExpertUsageRecordNotInstalled)\n", .{});
+            log.warn(arch ++ ": load refused: expert_usage_record / expert_usage_label are installed on glm5_next and deepseek_v41 only (ExpertUsageRecordNotInstalled)\n", .{});
             return error.ExpertUsageRecordNotInstalled;
         }
     }
