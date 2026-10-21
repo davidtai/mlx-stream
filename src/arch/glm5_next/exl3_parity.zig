@@ -99,7 +99,7 @@ test "glm5_next exl3 parity: W_hat of random K=3 mul1 codes at GLM's shapes is e
     defer a.destroy(table);
     xk.mul1Table(table);
     for (planes) |p| {
-        const g: xk.GoldenPlane = .{ .in_dim = p.in, .out_dim = p.out, .seed = p.seed, .code_sha256 = undefined, .w_hat_sha256 = undefined, .onehot_rows = 0, .onehot_rows_sha256 = undefined };
+        const g: xk.GoldenPlane = .{ .in_dim = p.in, .out_dim = p.out, .k = 3, .seed = p.seed, .code_sha256 = undefined, .w_hat_sha256 = undefined, .onehot_rows = 0, .onehot_rows_sha256 = undefined };
         try testing.expect(p.in == kernels.hidden or p.in == kernels.inter);
         var hp = try xk.HostPlane.init(a, &g, table);
         defer hp.deinit(a);
@@ -137,7 +137,7 @@ test "glm5_next exl3 parity: the GEMV text over random rows at GLM's shapes agai
     var prng = std.Random.DefaultPrng.init(0x474c4d35);
     const r = prng.random();
     for (planes) |p| {
-        const g: xk.GoldenPlane = .{ .in_dim = p.in, .out_dim = p.out, .seed = p.seed, .code_sha256 = undefined, .w_hat_sha256 = undefined, .onehot_rows = 0, .onehot_rows_sha256 = undefined };
+        const g: xk.GoldenPlane = .{ .in_dim = p.in, .out_dim = p.out, .k = 3, .seed = p.seed, .code_sha256 = undefined, .w_hat_sha256 = undefined, .onehot_rows = 0, .onehot_rows_sha256 = undefined };
         var hp = try xk.HostPlane.init(a, &g, table);
         defer hp.deinit(a);
         const xh = try a.alloc(f32, p.in);
