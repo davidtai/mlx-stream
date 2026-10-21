@@ -879,9 +879,10 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         const m = g.mark();
         if (probe) |p| p.begin(l);
         if (pt.enabled and prompt) pt.start();
-        // P1: every prompt call's predictor (the read-ahead takes the layer's empty rows, then the rows of the residents
-        // the prediction leaves out); a decode or verify forward predicts nothing here (the lookahead is decode's).
-        if (rt.read_ahead and prompt and lw.bank_layer != null) {
+        // P1: every prompt-phase call's predictor (the read-ahead takes the layer's empty rows, then the rows of the
+        // residents the prediction leaves out); a verify forward, a one-row step or any step past the phase change
+        // predicts nothing here (the lookahead is decode's).
+        if (rt.read_ahead and prompt and lw.bank_layer != null and ex.prompting()) {
             try predictSeed(g, a, c, lw, h, rows, &seed);
             try ex.readAheadSeed(lw.bank_layer.?, seed.items);
         }

@@ -262,6 +262,12 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             try self.stream.flush();
         }
 
+        /// The stream is in its prompt phase (before `grow`): a prompt call's predictor has rows to read ahead into. A
+        /// multi-row step past the phase change (a decode-phase `extend`) predicts nothing.
+        pub fn prompting(self: *const Self) bool {
+            return self.stream.phase == .prefill;
+        }
+
         /// P1: layer `layer`'s predicted experts (hottest first) read ahead of its routed call (prompt phase).
         pub fn readAheadSeed(self: *Self, layer: u32, experts: []const u16) !void {
             if (bpl == 1) return self.stream.readAheadSeed(layer, experts) else {
