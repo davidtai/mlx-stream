@@ -497,6 +497,15 @@ fn expectServed(s: *Stream, sb: *const SynthBank, r: *const Route, ids: []const 
     return s.expectServed(r, ids, sb.image);
 }
 
+/// Expert `e`'s resident row of `layer` holds its record's bytes, component by component.
+fn expectSlotHolds(s: *Stream, sb: *const SynthBank, layer: u32, e: u16) !void {
+    const slot = s.layers[layer].policy.slotOf(e) orelse return error.NotResident;
+    const off = sb.bank.recordOffset(layer, e);
+    for (sb.bank.layers[layer].segments, 0..) |seg, comp| {
+        try testing.expectEqualSlices(u8, sb.image[off + seg.offset ..][0..seg.length], s.slotRow(layer, slot, @fromBackingInt(@intCast(comp)))[0..seg.length]);
+    }
+}
+
 fn readsOf(r: *const Route) u64 {
     var n: u64 = 0;
     for (r.partsOf()) |p| n += p.n_reads;
@@ -762,7 +771,7 @@ test "dsv41 stream: P1: a read-ahead's records land before the layer's routes, w
     try testing.expectEqual(@as(u64, 0), off.st.ahead_posted + off.st.ahead_hits + off.st.ahead_demand + off.st.ahead_bytes);
 }
 
-test "dsv41 stream: P1: a route lands its layer's read-ahead first, another layer's lands the live one, full rows admit none, the phase change lands one" {
+test "dsv41 stream: P1: a route lands its layer's read-ahead first, another layer's lands the live one, full rows replace the residents the prediction leaves out, the phase change lands one" {
     var sb = try SynthBank.open(32);
     defer sb.close();
     const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 3, 3 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
@@ -780,14 +789,29 @@ test "dsv41 stream: P1: a route lands its layer's read-ahead first, another laye
     try testing.expectEqual(@as(u32, 1), r.plan.n_hits);
     try expectServed(s, &sb, r, &.{ 8, 9 });
     s.release(r);
+    // Layer 0's rows are full (4, 5, 6 resident, none protected): a prediction of 10 and 11 replaces the two coldest
+    // (4, then 5) and keeps 6; the next layer's read-ahead lands it.
     try s.readAheadSeed(0, &.{ 10, 11 });
-    try testing.expect(!s.ahead.live and s.ahead.n == 0);
+    try testing.expect(s.ahead.live and s.ahead.layer == 0 and s.ahead.n == 2);
+    try testing.expectEqual(@as(?u32, null), s.layers[0].policy.slotOf(4));
+    try testing.expectEqual(@as(?u32, null), s.layers[0].policy.slotOf(5));
+    try testing.expect(s.layers[0].policy.slotOf(6) != null);
     try s.readAheadSeed(1, &.{12});
+    try testing.expect(s.ahead.live and s.ahead.layer == 1);
+    for ([_]u16{ 10, 11, 6 }) |e| try testing.expectEqual(SlotState.ready, s.locate(0, s.layers[0].policy.slotOf(e).?).meta.state);
+    try expectSlotHolds(s, &sb, 0, 10);
+    try expectSlotHolds(s, &sb, 0, 11);
+    // A prediction naming every resident replaces nothing (no resident it left out).
+    try s.awaitReadAhead(1);
+    try s.readAheadSeed(0, &.{ 6, 10, 11, 20 });
+    try testing.expect(!s.ahead.live and s.ahead.n == 0);
+    try testing.expectEqual(@as(?u32, null), s.layers[0].policy.slotOf(20));
+    try s.readAheadSeed(1, &.{13});
     try testing.expect(s.ahead.live);
     try s.grow(&.{ 4, 4 });
     try testing.expect(!s.ahead.live);
-    try testing.expectEqual(SlotState.ready, s.locate(1, s.layers[1].policy.slotOf(12).?).meta.state);
-    try testing.expectError(error.NotPrefill, s.readAheadSeed(1, &.{13}));
+    try testing.expectEqual(SlotState.ready, s.locate(1, s.layers[1].policy.slotOf(13).?).meta.state);
+    try testing.expectError(error.NotPrefill, s.readAheadSeed(1, &.{14}));
 }
 
 test "dsv41 stream: P1: a read-ahead whose record fails to land forgets its job's records and fails the stream" {

@@ -29,10 +29,10 @@ In the 16K profile taken before this change, the prompt read 186 GB of expert re
 
 ![One layer of the prompt pass: the predictor runs first, its guess is read during attention, and the barrier sorts hits from demand reads](img/lookahead-mechanism.png)
 
-The guesses are issued to the SSD reader and land only in empty rows, so they never evict anything. At the barrier:
+The guesses are issued to the SSD reader and land in the layer's persistent rows: the empty ones first, then the rows of the residents the guess left out, coldest first. A resident the guess names keeps its row (it is a hit to be), and a row a live route still reads, a protected seed expert or a pinned expert is never replaced. So on a server whose rows a usage-profile seed or the last request filled, the guess still gets its reads in. At the barrier:
 
 - **hit:** a record read ahead that the layer routes. It's already in its row, so no read is issued.
-- **demand:** a record the read-ahead didn't cover, either because the guess missed it or because no empty row was left. It's read after the barrier.
+- **demand:** a record the read-ahead didn't cover, either because the guess missed it or because no row was free to take. It's read after the barrier.
 
 The guesses only choose when reads start. The bytes a row serves are the same record either way.
 
@@ -40,13 +40,13 @@ The guesses only choose when reads start. The bytes a row serves are the same re
 
 ![Expert records read into slots per request, split into read ahead and read on demand, from 1K to 1M prompt tokens](img/lookahead-ladder.png)
 
-At 16K, 5,096 records (67.9 GB) were issued ahead and 1,223 were read on demand. Prompts of 1K and 2K run as one span, so the predictor doesn't run for them.
+At 16K, 5,096 records (67.9 GB) were issued ahead and 1,223 were read on demand. In that release prompts of 1K and 2K ran as one span and the predictor didn't run for them; the predictor now runs in every prompt pass, one-span or layer-major, for every arch.
 
 Hits were 5,087 of 5,096. That rate flatters the predictor, because a 16K prompt routes about 95% of all experts. In the release that added it, 16K prefill rose from 430.9 to 475.2 tok/s (+10.3%). That release also added a third read window, so the predictor's share of the gain wasn't measured on its own.
 
 ## Under a second per prompt, no new expert memory
 
-The prompt-pass predictor runs one router matmul per chunk, four chunks per GPU round trip. It took 0.6 to 0.75 s in the 16K profiles, with 25 MB of temporary memory per chunk (100 MB per batch). Its guesses fill slots that are already reserved, so a wrong guess costs only bandwidth.
+The prompt-pass predictor runs one router matmul per chunk, four chunks per GPU round trip. It took 0.6 to 0.75 s in the 16K profiles, with 25 MB of temporary memory per chunk (100 MB per batch). Its guesses fill slots that are already reserved, so a wrong guess costs only bandwidth (and, where it replaced a resident the guess left out, that resident's re-read if the call routes it after all).
 
 Decode reserves 54.5 MB of read buffers, room for four records, twice its two-record budget. The host picks those records from at most 64 candidates: 8 verify tokens, top 8 experts each.
 

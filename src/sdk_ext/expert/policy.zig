@@ -423,24 +423,54 @@ pub const LayerPolicy = struct {
     /// One read-ahead admission (`admitReadAhead`): the expert and the persistent slot it took.
     pub const ReadAhead = struct { expert: u16, slot: u32 };
 
-    /// P1's read-ahead: each predicted expert (hottest first) not resident takes an empty persistent slot, unprotected,
-    /// until they run out (no eviction); `prepareSeed` then re-protects those its seed chooses (hits), the rest stay
-    /// evictable. Returns the admissions (at most `out.len`).
+    /// P1's read-ahead: each predicted expert (hottest first) not resident takes an empty persistent slot, else the slot
+    /// of the coldest resident the prediction left out (lowest (recency, slot); never a protected, pinned or held one, nor
+    /// one a plan is routing), unprotected, until no slot is free to take; `prepareSeed` then re-protects those its seed
+    /// chooses (hits), the rest stay evictable. A resident the prediction names is never a victim: it is a hit to be.
+    /// `held`: slots live routes of the layer still serve from (never victims). Returns the admissions (at most `out.len`).
     pub fn admitReadAhead(p: *LayerPolicy, experts: []const u16, out: []ReadAhead) []ReadAhead {
+        return p.admitReadAheadHeld(experts, &.{}, out);
+    }
+
+    pub fn admitReadAheadHeld(p: *LayerPolicy, experts: []const u16, held: []const u32, out: []ReadAhead) []ReadAhead {
+        for (held) |s| p.held.set(s);
+        defer for (held) |s| p.held.unset(s);
+        for (experts) |e| if (e < p.n_experts) p.retained.set(e);
+        defer for (experts) |e| if (e < p.n_experts) p.retained.unset(e);
         var n: usize = 0;
         for (experts) |e| {
             if (n == out.len) break;
             if (e >= p.n_experts or p.expert_to_slot[e] != no_slot) continue;
-            const slot = p.emptySlot() orelse break;
+            const slot = p.emptySlot() orelse p.aheadVictim() orelse break;
+            const victim = p.slot_to_expert[slot];
+            if (victim != no_expert) {
+                p.expert_to_slot[victim] = no_slot;
+                p.protected.unset(victim);
+                p.recency[victim] = 0;
+            } else p.occupancy += 1;
             p.slot_to_expert[slot] = e;
             p.expert_to_slot[e] = slot;
-            p.occupancy += 1;
             p.clock += 1;
             p.recency[e] = p.clock;
             out[n] = .{ .expert = e, .slot = slot };
             n += 1;
         }
         return out[0..n];
+    }
+
+    /// The read-ahead's victim: the coldest probationary resident (`probationVictim`'s rule) the prediction did not
+    /// name (`retained` holds the predicted experts for the admission).
+    fn aheadVictim(p: *const LayerPolicy) ?u32 {
+        var best: ?u32 = null;
+        var best_recency: u64 = 0;
+        for (p.slot_to_expert[0..p.capacity], 0..) |e, s| {
+            if (e == no_expert or p.retained.isSet(e) or p.in_route.isSet(e) or p.protected.isSet(e) or p.held.isSet(s) or p.pinned.isSet(e)) continue;
+            if (best == null or p.recency[e] < best_recency) {
+                best = @intCast(s);
+                best_recency = p.recency[e];
+            }
+        }
+        return best;
     }
 
     /// Forgets a resident expert (its record failed to load).

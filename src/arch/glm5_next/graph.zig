@@ -806,7 +806,8 @@ fn predictSpans(routes: Routes, spans: []const T, buf: *[max_spans]T) []const T 
 }
 
 /// P1: routed layer `l`'s predicted counts (evaluated) ranked hottest first and posted to the stream, which reads the
-/// seed into the layer's free persistent rows while the attention runs. The prediction only picks reads.
+/// seed into the layer's persistent rows (the empty ones, then the rows of the residents it leaves out) while the
+/// attention runs. The prediction only picks reads.
 fn postReadAhead(g: *G, c: *const glm.Config, ahead: *const Ahead, src: anytype, l: u32) !void {
     std.debug.assert(ahead.layer.? == l);
     const counts = try g.readU32(ahead.counts.?, src.ahead_counts[0..c.n_routed_experts]);

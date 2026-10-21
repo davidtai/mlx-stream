@@ -1890,9 +1890,9 @@ pub const Module = struct {
 
 /// The `layer_major_prefill` setting, checked before anything is built. K16 batches each layer's
 /// routed call across chunks (the wide lane): the stock tier's prompt forwards are decode-width.
-pub fn layerMajor(config: *const settings.Config) error{ LayerMajorOnStockTier, ReadAheadNeedsLayerMajor }!bool {
-    // P1's predictor pass is the layer-major prompt pass's (a chunk-major one has no layer top to read ahead from).
-    if (config.dsv41WideReadAhead() and (!config.dsv41LayerMajor() or !config.dsv41WideSeed())) return error.ReadAheadNeedsLayerMajor;
+pub fn layerMajor(config: *const settings.Config) error{ LayerMajorOnStockTier, ReadAheadNeedsSeed }!bool {
+    // P1's read-ahead lands at the seed's barrier: it needs the wide seed (every prompt pass runs its predictor).
+    if (config.dsv41WideReadAhead() and !config.dsv41WideSeed()) return error.ReadAheadNeedsSeed;
     if (!config.dsv41LayerMajor()) return false;
     if ((config.numeric_tier orelse .served) == .stock) return error.LayerMajorOnStockTier;
     return true;
@@ -2479,13 +2479,18 @@ test "dsv41 module: the served tier's prefill routes are on by default, the stoc
     c.expert_wide_defer_base = false;
     try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 5, .read_ahead = true }, wideRoute(&c));
     c.expert_wide_defer_base = null;
-    // P1 off by its setting (the A/B's other arm); on without the layer-major seed, refused by name.
+    // P1 off by its setting (the A/B's other arm); on without the wide seed, refused by name; on without the layer-major
+    // pass, allowed (the one-span prompt pass runs the predictor too).
     c.expert_wide_read_ahead = false;
     try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 5, .defer_base = true, .base_at_seed = true, .seed_aligned = true }, wideRoute(&c));
     c.expert_wide_read_ahead = true;
     c.expert_wide_seed = false;
-    try std.testing.expectError(error.ReadAheadNeedsLayerMajor, layerMajor(&c));
+    try std.testing.expectError(error.ReadAheadNeedsSeed, layerMajor(&c));
     c.expert_wide_seed = null;
+    c.layer_major_prefill = false;
+    try std.testing.expect(!try layerMajor(&c));
+    try std.testing.expect(wideRoute(&c).read_ahead);
+    c.layer_major_prefill = null;
     c.expert_wide_read_ahead = null;
     // P1b off by its setting (the base call after the last group, as before).
     c.expert_wide_base_at_seed = false;

@@ -276,13 +276,6 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             }
         }
 
-        /// The prompt rows of routed layer `layer` a read-ahead can still fill (it never evicts; with several bank layers
-        /// per routed layer it reads into the first).
-        pub fn readAheadRoom(self: *const Self, layer: u32) u32 {
-            const p = &self.stream.layers[bpl * layer].policy;
-            return p.capacity -| p.occupancy;
-        }
-
         /// A wide prompt call's misses read at its layer's start, before its attention: each bank layer's non-resident
         /// experts (in expert order) routed into transient rows in groups, as many as all windows but two hold (the
         /// call's groups alternate in those two; a bank layer's residents are held meanwhile: no staged miss evicts one);

@@ -1335,7 +1335,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
 
             /// Construction's end: every layer's residents and prompt state forgotten (`LayerPolicy.forgetAll`: the warm-up's),
-            /// so a first prompt's seed and read-ahead start from empty rows. Slot bytes stay: a later load reuses them only on
+            /// so a first prompt's seed and read-ahead start from empty rows (a later prompt's read-ahead replaces the residents
+            /// it does not predict). Slot bytes stay: a later load reuses them only on
             /// an exact (layer, expert, slot) match. Refused while anything is live; returns the residents forgotten.
             pub fn forgetResidents(self: *Stream) !u32 {
                 if (self.phase != .prefill) return error.NotPrefill;
@@ -1834,8 +1835,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (!ok) return self.fail(if (waited) |_| error.ReadFailed else |e| e);
             }
 
-            /// P1: layer `layer`'s predicted seed (`experts`, hottest first) read into its empty persistent rows, no route, while
-            /// its attention runs: `LayerPolicy.admitReadAhead` (unprotected; the seed re-protects its choices), pool jobs of
+            /// P1: layer `layer`'s predicted seed (`experts`, hottest first) read into its persistent rows, no route, while its
+            /// attention runs: `LayerPolicy.admitReadAheadHeld` (an empty row, else the coldest resident the prediction left out
+            /// that no live route of the layer holds; unprotected; the seed re-protects its choices), pool jobs of
             /// `max_items` within the ticket ring. `awaitReadAhead` or a route of the layer lands it; a live one lands first.
             /// `stock`: every record now, in file order. P7 `overlap`: the prediction's rank order (the admission order), its
             /// first `wide_depth x max_route_ids` records now (the groups the call routes at its start); the rest wait for
@@ -1850,10 +1852,25 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const mn = minisOf(&self.bank.layers[layer]);
                 // The ticket ring's room in records (each record's minis take a gate/up and a down ticket apiece).
                 const fit = @min(ah.loads.len, self.ahead_cap orelse (self.pool.published.len - 2 * expert_io.max_items) / (2 * mn));
-                const admitted = self.layers[layer].policy.admitReadAhead(experts, ah.loads[0..fit]);
+                // The rows live routes of the layer serve from and the deferred base call's are never a read-ahead's victims
+                // (as a plan beside them holds them): their records are being read by a wave.
+                const held_set = &self.held_scratch;
+                held_set.clearRetainingCapacity();
+                for (&self.routes) |*o| {
+                    if (o.state == .free or o.layer != layer) continue;
+                    for (o.hit_slots[0..o.plan.n_hits]) |hs| if (hs < self.layers[layer].policy.capacity) {
+                        held_set.append(self.allocator, hs) catch return self.fail(error.RoutesExhausted);
+                    };
+                    for (o.plan.loadsOf()) |l| if (l.persistent) {
+                        held_set.append(self.allocator, l.slot) catch return self.fail(error.RoutesExhausted);
+                    };
+                }
+                if (self.held_base.items.len > 0 and self.held_layer == layer)
+                    held_set.appendSlice(self.allocator, self.held_base.items) catch return self.fail(error.RoutesExhausted);
+                const admitted = self.layers[layer].policy.admitReadAheadHeld(experts, held_set.items, ah.loads[0..fit]);
                 if (comptime read_ahead_probed) if (self.probe) |pr| {
                     // The predicted seed: the ranking's top as many as the layer's unprotected rows (the seed's rule); blocked:
-                    // those neither resident nor admitted (no empty row: every row held by a resident, the read-ahead never evicts).
+                    // those neither resident nor admitted (no row free to take: every row protected, pinned or held).
                     const pol = &self.layers[layer].policy;
                     const room: usize = pol.capacity -| @as(u32, @intCast(pol.protected.count()));
                     const top = experts[0..@min(experts.len, room)];
