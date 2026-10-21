@@ -804,6 +804,9 @@ pub const Module = struct {
         if (self.installed.devroute) log.info("NATIVE devroute: installed (the decode hit wave on the device through each layer's resident LUT, committed before the routing barrier's wait)\n", .{});
         // HOIST_FIRST: exact by construction (the same evals of the same arrays; only the hoist's commit moves ahead of the wait).
         if (self.installed.hoist_first) log.info("NATIVE hoist first: installed (each decode call's hoist committed behind its routing barrier's arrays, before the wait)\n", .{});
+        // The embedding fence below installs the host embedding rows (refused, not skipped, when it fails): named here so
+        // the call-sites line reads what the load serves (it printed "embedding rows false" before the fence ran).
+        self.installed.embedding_rows = config.embedding_host_rows orelse true;
         var line_buf: [384]u8 = undefined;
         log.info("{s}\n", .{self.installed.line(&line_buf)});
         log.info("{s}\n", .{self.installed.callSites(&line_buf)});
