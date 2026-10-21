@@ -4240,7 +4240,9 @@ test "dsv41 experts: P1 on seeded rows: a load's seed fills every prompt row, th
     };
     try testing.expectEqual(@as(u64, 32), try s.seedResidents({}, Order.of));
     try testing.expectEqual(@as(u32, 16), s.layers[0].policy.occupancy);
-    const seeded_bytes = s.stats().expert_bytes_read;
+    // The seed reads through the read-ahead's load path: its 32 records count as posted; the prompt's own are the delta.
+    const st0 = s.stats();
+    try testing.expectEqual(@as(u64, 32), st0.ahead_posted);
     // The prompt's predicted seed: 0, 7, 14, ..., 105 (0 and 7 already resident: hits to be, never victims; the other
     // fourteen replace the seeded residents 120..127 and 1..6, the coldest first, none routed by this call).
     var predicted: [16]u16 = undefined;
@@ -4268,11 +4270,12 @@ test "dsv41 experts: P1 on seeded rows: a load's seed fills every prompt row, th
     // The read-ahead's records at the barrier: 14 posted (the two resident predictions read nothing), all 16 predicted
     // experts hits (the call routes every one); its bytes are the reads'.
     const st = s.stats();
-    try testing.expectEqual(@as(u64, 14), st.ahead_posted);
-    try testing.expectEqual(@as(u64, 16), st.ahead_hits);
+    try testing.expectEqual(@as(u64, 14), st.ahead_posted - st0.ahead_posted);
+    try testing.expectEqual(@as(u64, 16), st.ahead_hits - st0.ahead_hits);
     const rec = sb.bank.layers[0].logical_bytes;
-    try testing.expectEqual(14 * rec, st.ahead_bytes);
-    try testing.expectEqual(seeded_bytes + (st.expert_cache_misses - st.loads_skipped + st.ahead_posted) * rec, st.expert_bytes_read);
+    try testing.expectEqual(14 * rec, st.ahead_bytes - st0.ahead_bytes);
+    const demand = (st.expert_cache_misses - st0.expert_cache_misses) - (st.loads_skipped - st0.loads_skipped);
+    try testing.expectEqual((demand + 14) * rec, st.expert_bytes_read - st0.expert_bytes_read);
     // Layer 1's seeded residents are untouched (no prompt read-ahead or route there).
     try testing.expectEqual(@as(u32, 16), s.layers[1].policy.occupancy);
     try testing.expect(s.layers[1].policy.slotOf(120) != null and s.layers[1].policy.slotOf(7) != null);
