@@ -72,6 +72,54 @@ pub fn laneCodewords(words: []const u16, rate: format.Rate, lane: u32, out: *[8]
     }
 }
 
+/// The integer-rate fast path (n a multiple of 16, K = n / 16): lane L's first window starts at stream bit
+/// 8 L K + K - 16 (+ one period). The lane-dependent part 8 L K is a multiple of 8, so relative to the word holding the
+/// start the position is 16 a + 8 b + c0 with a, b in {0, 1} per lane and c0 = K mod 8 a constant. Taking halfword a of word
+/// qb as the lane's origin leaves start = 8 b + c0 + K m for window m: its 32-bit funnel word is H_j,
+/// j = (8 b + cm) >> 4 = (cm >> 4) + carry with cm = c0 + K m and carry = b and (cm mod 16) >= 8, and the window is the
+/// 16 bits of H_j starting at bit position (8 b + cm) & 15 from its top. H_j are the 32-bit values at halfword offsets
+/// a + j of word qb (even offsets: a word; odd: the low half of one and the high half of the next). Per weight: one select
+/// (carry), one shift, one mask. This mirrors the Metal fast path; the test holds it to `format.unpackTile`.
+pub const IntPlan = struct {
+    /// the word holding the first window's start (before the modulo), the halfword within it, and the 8-bit offset
+    qb: u32,
+    a: u32,
+    b: u32,
+};
+
+pub fn intPlan(rate: format.Rate, l: u32) IntPlan {
+    std.debug.assert(rate.n % 16 == 0);
+    const k = rate.n / 16;
+    const start = 8 * l * k + k + 16 * rate.n - 16; // the first window's start bit, one period in
+    const qb = start >> 5;
+    const lp = start - 32 * qb; // 0, 8, 16, 24
+    const a = lp >> 4;
+    const b = (lp >> 3) & 1;
+    return .{ .qb = qb, .a = a, .b = b };
+}
+
+/// The 32 bits at halfword offset j (0..7) of the words starting at `qb` (stream order: MSB first).
+fn hword(words: []const u16, rate: format.Rate, qb: u32, j: u32) u32 {
+    const w0 = tileWord(words, rate, qb + (j >> 1));
+    if (j & 1 == 0) return w0;
+    const w1 = tileWord(words, rate, qb + (j >> 1) + 1);
+    return (w0 << 16) | (w1 >> 16);
+}
+
+pub fn laneCodewordsInt(words: []const u16, rate: format.Rate, l: u32, out: *[8]u16) void {
+    const k = rate.n / 16;
+    const p = intPlan(rate, l);
+    var m: u32 = 0;
+    while (m < 8) : (m += 1) {
+        const cm = (k % 8) + k * m;
+        const carry: u32 = if (p.b == 1 and (cm & 15) >= 8) 1 else 0;
+        const j = (cm >> 4) + carry;
+        const r = (8 * p.b + cm) & 15;
+        const h = hword(words, rate, p.qb, j + p.a);
+        out[m] = @truncate((h >> @intCast(16 - r)) & 0xFFFF);
+    }
+}
+
 /// The Metal text of the helpers every exl3lib kernel includes, each templated on what the kernel body binds from its
 /// template ints (`NHW` the rate's halfwords, `WBITS` the window, `CODEBOOK` 0 MUL1 / 1 MCG): `exl3_lane_words<N>` loads
 /// a lane's four words, `exl3_lane_cw<WMASK>` extracts window m, `exl3_decode<CB>` turns a codeword into the f16 weight.
@@ -97,6 +145,28 @@ pub const metal_helpers =
     \\  const uint lo = (q == 0u) ? w.wprev : ((q == 1u) ? w.w0 : ((q == 2u) ? w.w1 : w.w2));
     \\  return exl3_funnel(lo, hi, sh) & WMASK;
     \\}
+    \\// the integer-rate fast path (N % 16 == 0): the lane's base word qb' and b (see lane.zig IntPlan)
+    \\template <uint N> inline uint exl3_int_qb(uint L) { constexpr uint K = N / 16u; return (8u * L * K + K + 16u * N - 16u) >> 5u; }
+    \\template <uint N> inline uint exl3_int_a(uint L) { constexpr uint K = N / 16u; return ((8u * L * K + K + 16u * N - 16u) >> 4u) & 1u; }
+    \\template <uint N> inline uint exl3_int_b(uint L) { constexpr uint K = N / 16u; return ((8u * L * K + K + 16u * N - 16u) >> 3u) & 1u; }
+    \\struct IntWords { uint h[8]; };   // the 32-bit values at halfword offsets a + 0..7 of the lane's word qb
+    \\template <uint N> inline IntWords exl3_int_words(const device uint* tile, uint qb, uint a) {
+    \\  constexpr uint NW = N / 2u;
+    \\  const uint b0 = qb % NW;
+    \\  const uint w0 = tile[b0], w1 = tile[(b0 + 1u) % NW], w2 = tile[(b0 + 2u) % NW], w3 = tile[(b0 + 3u) % NW], w4 = tile[(b0 + 4u) % NW];
+    \\  const uint o1 = (w0 << 16u) | (w1 >> 16u), o3 = (w1 << 16u) | (w2 >> 16u), o5 = (w2 << 16u) | (w3 >> 16u), o7 = (w3 << 16u) | (w4 >> 16u);
+    \\  IntWords r;
+    \\  if (a == 0u) { r.h[0] = w0; r.h[1] = o1; r.h[2] = w1; r.h[3] = o3; r.h[4] = w2; r.h[5] = o5; r.h[6] = w3; r.h[7] = o7; }
+    \\  else { r.h[0] = o1; r.h[1] = w1; r.h[2] = o3; r.h[3] = w2; r.h[4] = o5; r.h[5] = w3; r.h[6] = o7; r.h[7] = w4; }
+    \\  return r;
+    \\}
+    \\// window m: cm = (K mod 8) + K m, j = (cm >> 4) + carry, the 16 bits of h[j] at (8 b + cm) & 15 from the top; M is the unrolled m
+    \\template <uint N, uint WMASK, uint M> inline uint exl3_int_cw(IntWords w, uint b) {
+    \\  constexpr uint K = N / 16u; constexpr uint CM = (K % 8u) + K * M; constexpr uint JC = CM >> 4u; constexpr bool CARRY_IF_B = (CM & 15u) >= 8u;
+    \\  const uint hsel = (CARRY_IF_B && b != 0u) ? w.h[JC + 1u] : w.h[JC];
+    \\  const uint r = (8u * b + CM) & 15u;
+    \\  return ((hsel >> (16u - r)) & 0xffffu) & WMASK;
+    \\}
     \\template <int CB> inline half exl3_decode(uint cw) {
     \\  if (CB == 1) {
     \\    const uint mixed = cw * 0xCBAC1FEDu; const uint pair = 0x3B603B60u ^ (mixed & 0x8FFF8FFFu);
@@ -105,7 +175,7 @@ pub const metal_helpers =
     \\  const uint rr = cw * 0x83DCD12Du;
     \\  const uint bs = (rr & 0x00FF00FFu) + ((rr >> 8u) & 0x00FF00FFu);
     \\  const half hs = as_type<half>(ushort((bs * 0x00010001u + 0x64000000u) >> 16u));
-    \\  return half(fma(float(hs), float(as_type<half>(ushort(0x1EEEu))), float(as_type<half>(ushort(0xC931u)))));
+    \\  return fma(hs, as_type<half>(ushort(0x1EEEu)), as_type<half>(ushort(0xC931u)));
     \\}
     \\
 ;
@@ -143,6 +213,28 @@ test "exl3lib lane plan: the three-load funnel read equals unpackTile at every a
             while (lane < 32) : (lane += 1) {
                 laneCodewords(words[0..rate.n], rate, lane, &got);
                 for (got, 0..) |cw, m| try testing.expectEqual(ref[8 * lane + m], cw);
+            }
+        }
+    }
+}
+
+test "exl3lib lane plan: the integer-rate fast path equals unpackTile at K1..K8 (the Metal select-shift-mask arithmetic)" {
+    var prng = std.Random.DefaultPrng.init(0x1A4E1);
+    const rnd = prng.random();
+    var words: [format.Rate.max_n]u16 = undefined;
+    var ref: [format.TILE_VALUES]u16 = undefined;
+    var got: [8]u16 = undefined;
+    var k: u32 = 1;
+    while (k <= 8) : (k += 1) {
+        const rate = format.Rate.fromK(k);
+        var trial: u32 = 0;
+        while (trial < 6) : (trial += 1) {
+            for (words[0..rate.n]) |*w| w.* = rnd.int(u16);
+            format.unpackTile(words[0..rate.n], rate, &ref);
+            var l: u32 = 0;
+            while (l < 32) : (l += 1) {
+                laneCodewordsInt(words[0..rate.n], rate, l, &got);
+                for (got, 0..) |cw, m| try testing.expectEqual(ref[8 * l + m], cw);
             }
         }
     }

@@ -31,8 +31,10 @@ const cases = [_]Case{
     .{ .hidden = 512, .inter = 256, .topk = 4, .rows = 2, .experts = 6, .n = 64, .dec = .mul1 },
     .{ .hidden = 512, .inter = 256, .topk = 4, .rows = 2, .experts = 6, .n = 80, .dec = .mul1 },
     .{ .hidden = 512, .inter = 256, .topk = 4, .rows = 2, .experts = 6, .n = 128, .dec = .mcg },
-    // Qwen3.8-Flash-Next's geometry at the served rate
+    // Qwen3.8-Flash-Next's geometry at the served rate: 1 row (decode), 4 and 8 rows (MTP verify widths)
     .{ .hidden = 2560, .inter = 640, .topk = 10, .rows = 1, .experts = 12, .n = 80, .dec = .mul1, .timed = true },
+    .{ .hidden = 2560, .inter = 640, .topk = 10, .rows = 4, .experts = 12, .n = 80, .dec = .mul1, .timed = true },
+    .{ .hidden = 2560, .inter = 640, .topk = 10, .rows = 8, .experts = 12, .n = 80, .dec = .mul1, .timed = true },
 };
 
 const tolerance: f64 = 5e-3;
@@ -127,9 +129,54 @@ fn runCase(a: std.mem.Allocator, g: *G, s: mlx.mlx_stream, c: Case) !void {
     std.mem.sort(u64, &times, {}, std.sort.asc(u64));
     const bytes = @as(f64, @floatFromInt(c.topk)) * 3.0 * @as(f64, @floatFromInt(c.hidden)) * @as(f64, @floatFromInt(c.inter)) * @as(f64, @floatFromInt(c.n)) / 128.0;
     const med_us = @as(f64, @floatFromInt(times[15])) / 1000.0;
-    std.debug.print("EXL3LIB_TIME n={d} geo={d}x{d} rows={d} topk={d} median_us={d:.1} p10_us={d:.1} p90_us={d:.1} expert_gbps={d:.1}\n", .{
-        c.n, c.hidden, c.inter, c.rows, c.topk, med_us, @as(f64, @floatFromInt(times[3])) / 1000.0, @as(f64, @floatFromInt(times[27])) / 1000.0, bytes / (med_us * 1e-6) / 1e9,
+    // the launches apart: gate/up alone, then down alone on a fixed h
+    var t_gu: [30]u64 = undefined;
+    var t_dn: [30]u64 = undefined;
+    const h_fixed = try k.gateUp(s, xa, sa, arrays, c.rows);
+    defer _ = mlx.mlx_array_free(h_fixed);
+    try mlx.check(mlx.mlx_array_eval(h_fixed));
+    i = 0;
+    while (i < 35) : (i += 1) {
+        var t0 = nowNs();
+        const hh = try k.gateUp(s, xa, sa, arrays, c.rows);
+        try mlx.check(mlx.mlx_array_eval(hh));
+        const d1 = nowNs() - t0;
+        _ = mlx.mlx_array_free(hh);
+        t0 = nowNs();
+        const yy = try k.downReduce(s, h_fixed, sa, wa, arrays, c.rows);
+        try mlx.check(mlx.mlx_array_eval(yy));
+        const d2 = nowNs() - t0;
+        _ = mlx.mlx_array_free(yy);
+        if (i >= 5) {
+            t_gu[i - 5] = d1;
+            t_dn[i - 5] = d2;
+        }
+    }
+    std.mem.sort(u64, &t_gu, {}, std.sort.asc(u64));
+    std.mem.sort(u64, &t_dn, {}, std.sort.asc(u64));
+    const dist = @as(f64, @floatFromInt(c.rows)) * bytes; // every row its own experts here: bytes scale with rows
+    std.debug.print("EXL3LIB_TIME n={d} geo={d}x{d} rows={d} topk={d} median_us={d:.1} p10_us={d:.1} p90_us={d:.1} gu_us={d:.1} down_us={d:.1} expert_gbps={d:.1}\n", .{
+        c.n,                                        c.hidden,                                   c.inter,                      c.rows, c.topk, med_us, @as(f64, @floatFromInt(times[3])) / 1000.0, @as(f64, @floatFromInt(times[27])) / 1000.0,
+        @as(f64, @floatFromInt(t_gu[15])) / 1000.0, @as(f64, @floatFromInt(t_dn[15])) / 1000.0, dist / (med_us * 1e-6) / 1e9,
     });
+    // the ALU shares: the same chain without the codebook hash (probe 1) and without the funnel either (probe 2)
+    for ([_]u8{ 1, 2 }) |probe| {
+        var kp = try decode.Kernels.init(.{ .hidden = c.hidden, .inter = c.inter, .topk = c.topk, .rate = rate, .dec = c.dec, .probe = probe });
+        defer kp.deinit();
+        var tp: [30]u64 = undefined;
+        i = 0;
+        while (i < 35) : (i += 1) {
+            const t0 = nowNs();
+            const o = try kp.moe(s, xa, sa, wa, arrays, c.rows);
+            try mlx.check(mlx.mlx_array_eval(o.y));
+            const dt = nowNs() - t0;
+            _ = mlx.mlx_array_free(o.h);
+            _ = mlx.mlx_array_free(o.y);
+            if (i >= 5) tp[i - 5] = dt;
+        }
+        std.mem.sort(u64, &tp, {}, std.sort.asc(u64));
+        std.debug.print("EXL3LIB_PROBE n={d} rows={d} probe={d} median_us={d:.1} p10_us={d:.1}\n", .{ c.n, c.rows, probe, @as(f64, @floatFromInt(tp[15])) / 1000.0, @as(f64, @floatFromInt(tp[3])) / 1000.0 });
+    }
 }
 
 test "exl3lib gpu: the two-launch decode chain equals the host reference at every rate and codebook (EXL3LIB_GPU=1)" {

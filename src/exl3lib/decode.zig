@@ -27,6 +27,8 @@ pub const Geometry = struct {
     topk: u32,
     rate: format.Rate,
     dec: format.Decode,
+    /// timing probes only (never a served kernel): 1 skips the codebook hash, 2 skips the funnel too
+    probe: u8 = 0,
 
     pub fn admitted(g: Geometry) bool {
         return g.hidden % 128 == 0 and g.inter % 128 == 0 and g.hidden > 0 and g.inter > 0 and g.topk > 0 and g.topk <= 32;
@@ -48,6 +50,7 @@ pub const text_gu =
     \\    constexpr uint NW = N / 2u;
     \\    constexpr uint WMASK = (WBITS >= 16) ? 0xffffu : ((1u << uint(WBITS)) - 1u);
     \\    constexpr int CB = int(CODEBOOK);
+    \\    constexpr int PRB = int(PROBE);
     \\    constexpr uint HIDC = uint(HID);
     \\    constexpr uint INTC = uint(INTER);
     \\    constexpr uint TOPKC = uint(TOPK);
@@ -96,9 +99,12 @@ pub const text_gu =
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\    // 2. the GEMV over this simdgroup's quarter of the input tiles, the block's 8 output tiles, gate and up
-    \\    const uint base = exl3_lane_base<N>(L);
+    \\    constexpr bool INTK = (N % 16u) == 0u;
+    \\    const uint base = INTK ? exl3_int_qb<N>(L) : exl3_lane_base<N>(L);
+    \\    const uint ia = INTK ? exl3_int_a<N>(L) : 0u;
+    \\    const uint ib = INTK ? exl3_int_b<N>(L) : 0u;
     \\    uint off[8];
-    \\    for (uint m = 0; m < 8u; ++m) off[m] = exl3_lane_off<N>(L, m, base);
+    \\    for (uint m = 0; m < 8u; ++m) off[m] = INTK ? 0u : exl3_lane_off<N>(L, m, base);
     \\    uint rows_of[4];
     \\    for (uint m = 0; m < 4u; ++m) rows_of[m] = exl3lib_row_of(L, m);
     \\    float ag[8][2]; float au[8][2];
@@ -112,14 +118,31 @@ pub const text_gu =
     \\        for (uint t = 0; t < 8u; ++t) {
     \\            const uint tn = blk * 8u + t;
     \\            const ulong toff = (ulong(tk) * OUT_TILES + tn) * ulong(NW);
-    \\            const LaneWords wg = exl3_lane_words<N>(gbase + toff, base);
-    \\            const LaneWords wu = exl3_lane_words<N>(ubase + toff, base);
-    \\            for (uint m = 0; m < 8u; ++m) {
-    \\                const float wgv = float(exl3_decode<CB>(exl3_lane_cw<WMASK>(wg, off[m])));
-    \\                const float wuv = float(exl3_decode<CB>(exl3_lane_cw<WMASK>(wu, off[m])));
-    \\                const uint c = (m >> 2);
-    \\                ag[t][c] = fma(xr_g[m & 3u], wgv, ag[t][c]);
-    \\                au[t][c] = fma(xr_u[m & 3u], wuv, au[t][c]);
+    \\            if (INTK) {
+    \\                const IntWords wg = exl3_int_words<N>(gbase + toff, base, ia);
+    \\                const IntWords wu = exl3_int_words<N>(ubase + toff, base, ia);
+    \\                uint cg[8], cu[8];
+    \\                cg[0] = exl3_int_cw<N, WMASK, 0>(wg, ib); cg[1] = exl3_int_cw<N, WMASK, 1>(wg, ib); cg[2] = exl3_int_cw<N, WMASK, 2>(wg, ib); cg[3] = exl3_int_cw<N, WMASK, 3>(wg, ib);
+    \\                cg[4] = exl3_int_cw<N, WMASK, 4>(wg, ib); cg[5] = exl3_int_cw<N, WMASK, 5>(wg, ib); cg[6] = exl3_int_cw<N, WMASK, 6>(wg, ib); cg[7] = exl3_int_cw<N, WMASK, 7>(wg, ib);
+    \\                cu[0] = exl3_int_cw<N, WMASK, 0>(wu, ib); cu[1] = exl3_int_cw<N, WMASK, 1>(wu, ib); cu[2] = exl3_int_cw<N, WMASK, 2>(wu, ib); cu[3] = exl3_int_cw<N, WMASK, 3>(wu, ib);
+    \\                cu[4] = exl3_int_cw<N, WMASK, 4>(wu, ib); cu[5] = exl3_int_cw<N, WMASK, 5>(wu, ib); cu[6] = exl3_int_cw<N, WMASK, 6>(wu, ib); cu[7] = exl3_int_cw<N, WMASK, 7>(wu, ib);
+    \\                for (uint m = 0; m < 8u; ++m) {
+    \\                    const float wgv = (PRB == 0) ? float(exl3_decode<CB>(cg[m])) : ((PRB == 1) ? float(as_type<half>(ushort(cg[m] & 0x3fffu))) : float(as_type<half>(ushort((wg.h[0] >> (m * 2u)) & 0x3fffu))));
+    \\                    const float wuv = (PRB == 0) ? float(exl3_decode<CB>(cu[m])) : ((PRB == 1) ? float(as_type<half>(ushort(cu[m] & 0x3fffu))) : float(as_type<half>(ushort((wu.h[0] >> (m * 2u)) & 0x3fffu))));
+    \\                    const uint c = (m >> 2);
+    \\                    ag[t][c] = fma(xr_g[m & 3u], wgv, ag[t][c]);
+    \\                    au[t][c] = fma(xr_u[m & 3u], wuv, au[t][c]);
+    \\                }
+    \\            } else {
+    \\                const LaneWords wg = exl3_lane_words<N>(gbase + toff, base);
+    \\                const LaneWords wu = exl3_lane_words<N>(ubase + toff, base);
+    \\                for (uint m = 0; m < 8u; ++m) {
+    \\                    const float wgv = float(exl3_decode<CB>(exl3_lane_cw<WMASK>(wg, off[m])));
+    \\                    const float wuv = float(exl3_decode<CB>(exl3_lane_cw<WMASK>(wu, off[m])));
+    \\                    const uint c = (m >> 2);
+    \\                    ag[t][c] = fma(xr_g[m & 3u], wgv, ag[t][c]);
+    \\                    au[t][c] = fma(xr_u[m & 3u], wuv, au[t][c]);
+    \\                }
     \\            }
     \\        }
     \\    }
@@ -174,6 +197,7 @@ pub const text_down =
     \\    constexpr uint NW = N / 2u;
     \\    constexpr uint WMASK = (WBITS >= 16) ? 0xffffu : ((1u << uint(WBITS)) - 1u);
     \\    constexpr int CB = int(CODEBOOK);
+    \\    constexpr int PRB = int(PROBE);
     \\    constexpr uint HIDC = uint(HID);
     \\    constexpr uint INTC = uint(INTER);
     \\    constexpr uint TOPKC = uint(TOPK);
@@ -186,9 +210,12 @@ pub const text_down =
     \\    const uint L = thread_index_in_simdgroup;
     \\    threadgroup half hd[INTC];
     \\    threadgroup float red[4][128];
-    \\    const uint base = exl3_lane_base<N>(L);
+    \\    constexpr bool INTK = (N % 16u) == 0u;
+    \\    const uint base = INTK ? exl3_int_qb<N>(L) : exl3_lane_base<N>(L);
+    \\    const uint ia = INTK ? exl3_int_a<N>(L) : 0u;
+    \\    const uint ib = INTK ? exl3_int_b<N>(L) : 0u;
     \\    uint off[8];
-    \\    for (uint m = 0; m < 8u; ++m) off[m] = exl3_lane_off<N>(L, m, base);
+    \\    for (uint m = 0; m < 8u; ++m) off[m] = INTK ? 0u : exl3_lane_off<N>(L, m, base);
     \\    uint rows_of[4];
     \\    for (uint m = 0; m < 4u; ++m) rows_of[m] = exl3lib_row_of(L, m);
     \\    const uint tk_per = IN_TILES / 4u;
@@ -220,10 +247,21 @@ pub const text_down =
     \\            for (uint m = 0; m < 4u; ++m) xr[m] = float(hd[tk * 16u + rows_of[m]]);
     \\            for (uint t = 0; t < 8u; ++t) {
     \\                const uint tn = blk * 8u + t;
-    \\                const LaneWords w = exl3_lane_words<N>(dbase + (ulong(tk) * OUT_TILES + tn) * ulong(NW), base);
-    \\                for (uint m = 0; m < 8u; ++m) {
-    \\                    const float wv = float(exl3_decode<CB>(exl3_lane_cw<WMASK>(w, off[m])));
-    \\                    a[t][m >> 2] = fma(xr[m & 3u], wv, a[t][m >> 2]);
+    \\                if (INTK) {
+    \\                    const IntWords w = exl3_int_words<N>(dbase + (ulong(tk) * OUT_TILES + tn) * ulong(NW), base, ia);
+    \\                    uint cw[8];
+    \\                    cw[0] = exl3_int_cw<N, WMASK, 0>(w, ib); cw[1] = exl3_int_cw<N, WMASK, 1>(w, ib); cw[2] = exl3_int_cw<N, WMASK, 2>(w, ib); cw[3] = exl3_int_cw<N, WMASK, 3>(w, ib);
+    \\                    cw[4] = exl3_int_cw<N, WMASK, 4>(w, ib); cw[5] = exl3_int_cw<N, WMASK, 5>(w, ib); cw[6] = exl3_int_cw<N, WMASK, 6>(w, ib); cw[7] = exl3_int_cw<N, WMASK, 7>(w, ib);
+    \\                    for (uint m = 0; m < 8u; ++m) {
+    \\                        const float wv = (PRB == 0) ? float(exl3_decode<CB>(cw[m])) : ((PRB == 1) ? float(as_type<half>(ushort(cw[m] & 0x3fffu))) : float(as_type<half>(ushort((w.h[0] >> (m * 2u)) & 0x3fffu))));
+    \\                        a[t][m >> 2] = fma(xr[m & 3u], wv, a[t][m >> 2]);
+    \\                    }
+    \\                } else {
+    \\                    const LaneWords w = exl3_lane_words<N>(dbase + (ulong(tk) * OUT_TILES + tn) * ulong(NW), base);
+    \\                    for (uint m = 0; m < 8u; ++m) {
+    \\                        const float wv = float(exl3_decode<CB>(exl3_lane_cw<WMASK>(w, off[m])));
+    \\                        a[t][m >> 2] = fma(xr[m & 3u], wv, a[t][m >> 2]);
+    \\                    }
     \\                }
     \\            }
     \\        }
@@ -288,7 +326,7 @@ pub const Kernels = struct {
         _ = mlx.mlx_fast_metal_kernel_free(self.down);
     }
 
-    fn template(self: *const Kernels, buf: *[6]ks.TemplateArg) []const ks.TemplateArg {
+    fn template(self: *const Kernels, buf: *[7]ks.TemplateArg) []const ks.TemplateArg {
         buf.* = .{
             .{ .name = "NHW", .value = .{ .int = @intCast(self.geo.rate.n) } },
             .{ .name = "CODEBOOK", .value = .{ .int = @backingInt(self.geo.dec.codebook) } },
@@ -296,6 +334,7 @@ pub const Kernels = struct {
             .{ .name = "HID", .value = .{ .int = @intCast(self.geo.hidden) } },
             .{ .name = "INTER", .value = .{ .int = @intCast(self.geo.inter) } },
             .{ .name = "TOPK", .value = .{ .int = @intCast(self.geo.topk) } },
+            .{ .name = "PROBE", .value = .{ .int = self.geo.probe } },
         };
         return buf;
     }
@@ -303,7 +342,7 @@ pub const Kernels = struct {
     fn configs(self: *Kernels, rows: usize) !struct { gu: mlx.mlx_fast_metal_kernel_config, down: mlx.mlx_fast_metal_kernel_config } {
         if (rows == 0 or rows > max_rows) return error.BadExl3Shape;
         if (self.cfg_gu[rows] == null) {
-            var tbuf: [6]ks.TemplateArg = undefined;
+            var tbuf: [7]ks.TemplateArg = undefined;
             const t = self.template(&tbuf);
             const g = self.geo;
             const r: c_int = @intCast(rows);
@@ -366,7 +405,7 @@ pub const Kernels = struct {
 
 test "exl3lib decode texts: every template constant the texts read is one the launch passes" {
     const t = std.testing;
-    for ([_][]const u8{ "NHW", "CODEBOOK", "WBITS", "HID", "INTER", "TOPK" }) |name| {
+    for ([_][]const u8{ "NHW", "CODEBOOK", "WBITS", "HID", "INTER", "TOPK", "PROBE" }) |name| {
         try t.expect(std.mem.indexOf(u8, header ++ text_gu, name) != null);
         try t.expect(std.mem.indexOf(u8, header ++ text_down, name) != null);
     }
