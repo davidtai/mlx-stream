@@ -91,6 +91,8 @@ pub const Config = struct {
     prefill_shared_mid: ?bool = null,
     /// The compressed layers' attention core as the fused launch q3_ph_flash_cmp (`Routes.prefill_attn_fused`; null = off).
     prefill_attn_fused: ?bool = null,
+    /// The compressed layers' attention chain on bf16 operand fragments (`Routes.prefill_attn_bf16mma`; null = off).
+    prefill_attn_bf16mma: ?bool = null,
     /// stack4, the exact decode stack: ROUTED_FORMS down_pair + gu_one, ROUTED_BANKED, DEVROUTE, HOIST_FIRST and
     /// DRAFT_STAGED as the construction's defaults (`dsv41DecodeStack4`; null = the tier's: on for served; false: each
     /// off, the stock decode GEMVs, host-built hit waves and one draft commit per block). A harness override wins.
@@ -126,7 +128,7 @@ pub const Config = struct {
             else => return,
         };
         var any = false;
-        inline for (.{ "expert_event_gates", "layer_major_prefill", "expert_wide_feed", "expert_wide_seed", "expert_wide_hot_first", "embedding_host_rows", "kv16_oproj_bf16", "kv16_hcpost", "prefill_shared_mid", "prefill_attn_fused", "decode_stack4", "kv16_expert_bf16", "expert_prompt_overlap", "expert_prompt_stage" }) |key| {
+        inline for (.{ "expert_event_gates", "layer_major_prefill", "expert_wide_feed", "expert_wide_seed", "expert_wide_hot_first", "embedding_host_rows", "kv16_oproj_bf16", "kv16_hcpost", "prefill_shared_mid", "prefill_attn_fused", "prefill_attn_bf16mma", "decode_stack4", "kv16_expert_bf16", "expert_prompt_overlap", "expert_prompt_stage" }) |key| {
             if (obj.get(key)) |v| if (v == .bool) {
                 @field(c, key) = v.bool;
                 any = true;

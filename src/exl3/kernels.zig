@@ -16,7 +16,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "0c3f9f31ae24d55e3d40f075b8440aab236a2c2c69763cba498b553d7d884581";
+pub const manifest_sha256 = "c6d53222f6bf3438b7af6a1fd08d0ed14d39cb19b41e0b7e93e95338e88b674f";
 
 /// G7: the decode-timers build's launch probe (`sdk_ext/kernel_set.zig`: its build flag, keys and observer).
 pub const launch_observed = kset.launch_observed;
@@ -114,6 +114,8 @@ pub const Kernel = enum {
     q3_ph_pvrope_cmp,
     q3_ph_pvrope_cmp__kvbf16,
     q3_ph_flash_cmp,
+    q3_ph_qkrope_cmp_bf16mma,
+    q3_ph_pvrope_cmp_bf16mma,
     q3pf_hc_mix_rsqrt,
     q3pf_hc_pre_norm,
     q3pf_hc_mix_rsqrt__f32,
@@ -1080,7 +1082,7 @@ const shaHex = kset.shaHex;
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 113), n_kernels);
+    try testing.expectEqual(@as(usize, 115), n_kernels);
     try testing.expectEqual(@as(usize, 18), n_headers);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
@@ -1095,7 +1097,7 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     defer reg.deinit();
     // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
     // check), so their fixtures stand
-    try testing.expectEqual(@as(usize, 18), reg.predecessors.len);
+    try testing.expectEqual(@as(usize, 19), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
     // the take2 retune's manifest lists the one before it (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86"));

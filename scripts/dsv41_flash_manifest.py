@@ -21,6 +21,8 @@ MANIFEST = os.path.join(KDIR, 'manifest.json')
 KERNELS_ZIG = 'src/exl3/kernels.zig'
 NAME = 'q3_ph_flash_cmp'
 BASE = 'q3_ph_pvrope_cmp__kvbf16'
+# the chain's bf16-fragment twins: (name, the entry they clone: same inputs, outputs, grid and templates)
+TWINS = [('q3_ph_qkrope_cmp_bf16mma', 'q3_ph_qkrope_cmp__kvbf16'), ('q3_ph_pvrope_cmp_bf16mma', 'q3_ph_pvrope_cmp__kvbf16')]
 SOFTMAX = 'q3_attnfuse_softmax'
 
 
@@ -81,12 +83,36 @@ def entry(by_name):
     return e
 
 
+def twin(by_name, name, base_name):
+    base = by_name[base_name]
+    src = read_text(name + '.metal')
+    hdr = read_text(base['header']['file'])
+    e = copy.deepcopy(base)
+    e.pop('variant', None)
+    e['name'] = name
+    e['source'] = {'bytes': len(src), 'file': name + '.metal', 'sha256': sha(src)}
+    e['lane_pins'] = [{'hash_of': 'source', 'sha256': sha(src),
+                       'symbol': f'{name} (the chain text {base_name} on bf16 operand fragments, 2026-10-22): no Python lane; parity against the chain is the route test'},
+                      {'hash_of': 'header', 'sha256': sha(hdr), 'symbol': 'header_attnfuse_s2 (the NAX tile header the chain uses)'}]
+    e['self_check'] = {'checks': ['compile', 'row_invariance'], 'rows_max': 8}
+    return e
+
+
+def refresh(e, src):
+    e['source'] = {'bytes': len(src), 'file': e['name'] + '.metal', 'sha256': sha(src)}
+    for pin in e['lane_pins']:
+        if pin['hash_of'] == 'source':
+            pin['sha256'] = sha(src)
+
+
 def build(m, current_bytes):
     out = copy.deepcopy(m)
     by_name = {e['name']: e for e in m['kernels']}
-    if NAME in by_name:
-        sys.exit('the manifest already has the fused attention core')
-    out['kernels'].append(entry(by_name))
+    if NAME not in by_name:
+        out['kernels'].append(entry(by_name))
+    for name, base_name in TWINS:
+        if name not in by_name:
+            out['kernels'].append(twin(by_name, name, base_name))
     out['predecessors'].append({'headers': [h['id'] for h in m['headers']], 'kernels': [e['name'] for e in m['kernels']],
                                 'manifest_sha256': sha(current_bytes), 'widened': []})
     return out
@@ -100,25 +126,25 @@ def main():
     with open(MANIFEST, 'rb') as f:
         current = f.read()
     m = json.loads(current)
-    if any(e['name'] == NAME for e in m['kernels']):
-        # the entry exists: refresh its text's bytes, sha256 and source pin in place (a text edit while iterating)
-        src = read_text(NAME + '.metal')
+    names = {e['name'] for e in m['kernels']}
+    if NAME in names and all(n in names for n, _ in TWINS):
+        # every entry exists: refresh the texts' bytes, sha256 and source pins in place (text edits while iterating)
         for e in m['kernels']:
             if e['name'] == NAME:
-                e['source'] = {'bytes': len(src), 'file': NAME + '.metal', 'sha256': sha(src)}
-                for pin in e['lane_pins']:
-                    if pin['hash_of'] == 'source':
-                        pin['sha256'] = sha(src)
+                refresh(e, read_text(NAME + '.metal'))
                 e['grid'] = [{'m': 512}, {'m': 1}, {'m': 1, 'v': 'rows'}]
                 e['threadgroup'] = [128, 1, 1]
                 for s2 in e['launch_samples']:
                     s2['grid'] = [512, 1, s2['grid'][2]]
                     s2['threadgroup'] = [128, 1, 1]
+            for n, _ in TWINS:
+                if e['name'] == n:
+                    refresh(e, read_text(n + '.metal'))
         out = dumps(m).encode()
         if out == current:
-            print(f'manifest already carries {NAME} at this text; sha256 {sha(current)}')
+            print(f'manifest already carries the entries at these texts; sha256 {sha(current)}')
             return 0
-        print(f'refreshed {NAME} in the manifest')
+        print('refreshed the entries in the manifest')
     else:
         out = dumps(build(m, current)).encode()
     pin = sha(out)

@@ -1155,6 +1155,7 @@ const CellReceipt = struct {
     prefill_fused_down: ?bool = null,
     /// The compressed layers' fused attention core, as installed (read back from the Module).
     prefill_attn_fused: ?bool = null,
+    prefill_attn_bf16mma: ?bool = null,
     /// The decode read-ahead's speculative records per layer call, as installed (read back from the Module).
     lookahead_budget: ?u32 = null,
     /// (v9) ENGRAM=prefetch and the wide call's deferred base-bank rows, as installed (read back from the Module).
@@ -1643,6 +1644,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .prefill_hc_post = md.installed.prefill_hc_post,
         .prefill_fused_down = md.installed.prefill_fused_down,
         .prefill_attn_fused = md.installed.prefill_attn_fused,
+        .prefill_attn_bf16mma = md.installed.prefill_attn_bf16mma,
         .lookahead_budget = md.installed.lookahead_budget,
         .engram_posted = md.installed.engram_posted,
         .deferred_base = md.installed.wide.defer_base,
@@ -1771,6 +1773,7 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_PREFILL_HC_POST")) |v| ov.prefill_hc_post = try cellBool("DSV41_CELL_PREFILL_HC_POST", v);
     if (envStr("DSV41_CELL_PREFILL_FUSED_DOWN")) |v| ov.prefill_fused_down = try cellBool("DSV41_CELL_PREFILL_FUSED_DOWN", v);
     if (envStr("DSV41_CELL_PREFILL_ATTN_FUSED")) |v| ov.prefill_attn_fused = try cellBool("DSV41_CELL_PREFILL_ATTN_FUSED", v);
+    if (envStr("DSV41_CELL_PREFILL_ATTN_BF16MMA")) |v| ov.prefill_attn_bf16mma = try cellBool("DSV41_CELL_PREFILL_ATTN_BF16MMA", v);
     if (envStr("DSV41_CELL_ENGRAM_POSTED")) |v| ov.engram_posted = try cellBool("DSV41_CELL_ENGRAM_POSTED", v);
     if (envStr("DSV41_CELL_WIDE_DEFER_BASE")) |v| config.expert_wide_defer_base = try cellBool("DSV41_CELL_WIDE_DEFER_BASE", v);
     if (envStr("DSV41_CELL_WIDE_READ_AHEAD")) |v| config.expert_wide_read_ahead = try cellBool("DSV41_CELL_WIDE_READ_AHEAD", v);

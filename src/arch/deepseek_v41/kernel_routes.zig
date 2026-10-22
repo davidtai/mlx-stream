@@ -90,6 +90,8 @@ pub const kernels = [_]Kernel{
     .q3_ph_pvrope_cmp,
     .q3_ph_pvrope_cmp__kvbf16,
     .q3_ph_flash_cmp,
+    .q3_ph_qkrope_cmp_bf16mma,
+    .q3_ph_pvrope_cmp_bf16mma,
     .q3pf_hc_mix_rsqrt,
     .q3pf_hc_pre_norm,
     .q3pf_hc_mix_rsqrt__f32,
@@ -1055,6 +1057,17 @@ pub fn PrefillAttn(comptime G: type) type {
             self.flash = e;
         }
 
+        /// The chain on bf16 operand fragments (`q3_ph_qkrope_cmp_bf16mma`, `q3_ph_pvrope_cmp_bf16mma`): the same
+        /// three launches, the QK and PV tensor ops on bf16 fragments (f32 accumulation; ex rounded to bf16).
+        /// Registered for the ropefuse compressed core on the bf16 stream only (TemplateNotRegistered otherwise).
+        pub fn bf16Mma(self: *Self, reg: *const xk.Registry, diag: ?*xk.Diag) !void {
+            if (self.kind != .rope or !self.cmp) return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: the bf16-fragment chain is the ropefuse compressed core only", .{});
+            const qk = instantiation(reg, .q3_ph_qkrope_cmp_bf16mma, self.q_dt, self.ring_dt) orelse return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: q3_ph_qkrope_cmp_bf16mma has no instantiation at q {t}, window store {t}", .{ self.q_dt, self.ring_dt });
+            const pv = instantiation(reg, .q3_ph_pvrope_cmp_bf16mma, self.q_dt, self.ring_dt) orelse return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: q3_ph_pvrope_cmp_bf16mma has no instantiation at window store {t}", .{self.ring_dt});
+            self.qk = qk;
+            self.pv = pv;
+        }
+
         pub fn deinit(self: *Self, g: *G) void {
             self.statics.deinit(g);
             self.flash_statics.deinit(g);
@@ -1662,6 +1675,28 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
             defer pw.deinit(&t);
             try testing.expectError(error.TemplateNotRegistered, pw.fuse(&t, &reg, null));
         }
+        // the bf16-fragment chain: refused off the ropefuse compressed route; on it the same three launches
+        try testing.expectError(error.TemplateNotRegistered, pa.bf16Mma(&reg, null));
+        {
+            var pm = try PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, .bfloat16, .bfloat16, true, null);
+            defer pm.deinit(&t);
+            try pm.bf16Mma(&reg, null);
+            try testing.expectEqual(Kernel.q3_ph_qkrope_cmp_bf16mma, pm.qk.kernel);
+            try testing.expectEqual(Kernel.q3_ph_pvrope_cmp_bf16mma, pm.pv.kernel);
+            const s = &pm.qk.samples[0];
+            const n_s: c_int = @intCast(s.vars.get(.rows));
+            const kc: c_int = @intCast(s.vars.get(.kc));
+            const q = try t.node(&.{ 1, n_s, 64, 512 }, .bfloat16, &.{});
+            const win = try t.node(&.{ 1, @intCast(s.vars.get(.ring)), 512 }, .bfloat16, &.{});
+            const ckv = try t.node(&.{ 1, @intCast(s.vars.get(.store)), 512 }, .bfloat16, &.{});
+            const cidx = try t.node(&.{ 1, n_s, kc }, .int32, &.{});
+            const qc = try t.node(&.{ n_s, 32 }, .float32, &.{});
+            const n_launch = t.launches.items.len;
+            _ = try pm.attend(&t, q, win, try t.node(&.{ n_s, 128 }, .int32, &.{}), try t.node(&.{ n_s, 128 }, .bool_, &.{}), .{ ckv, cidx }, sink, .{ qc, qc });
+            try testing.expectEqual(n_launch + 3, t.launches.items.len);
+            try testing.expectEqual(Kernel.q3_ph_qkrope_cmp_bf16mma, t.back(3).k);
+            try testing.expectEqual(Kernel.q3_ph_pvrope_cmp_bf16mma, t.back(1).k);
+        }
         try pr.fuse(&t, &reg, null);
         const fe = pr.flash.?;
         try testing.expectEqual(Kernel.q3_ph_flash_cmp, fe.kernel);
@@ -1967,6 +2002,50 @@ test "dsv41 kernels flash gpu: q3_ph_flash_cmp attends as the chain does, within
         }
         try testing.expectEqual(@as(usize, 0), nan);
         try testing.expect(max_abs <= 2e-3 * @max(max_ref, 1.0));
+        const fe_keep = r.flash;
+        // the bf16-fragment chain against the f32-fragment chain
+        {
+            r.flash = null;
+            const qk0 = r.qk;
+            const pv0 = r.pv;
+            try r.bf16Mma(reg, &kd);
+            const o3 = try r.attend(&g, q, win, widx, wval, .{ ckv, cidx }, sink, .{ qc, qs });
+            g.evalAll(&.{o3}) catch |e| {
+                var buf: [512]u8 = undefined;
+                std.debug.print("bf16mma launch failed: {s}\n", .{mlx.takeError(&buf) orelse ""});
+                return e;
+            };
+            const h3 = try a.alloc(f32, n);
+            defer a.free(h3);
+            _ = try g.hostF32(o3, h3);
+            var mx3: f32 = 0;
+            var bad3: usize = 0;
+            for (h1, h3) |x, y| {
+                if (std.math.isNan(y) or std.math.isInf(y)) bad3 += 1;
+                mx3 = @max(mx3, @abs(x - y));
+            }
+            std.debug.print("BF16MMA_PARITY {{\"rows\": {d}, \"max_abs\": {e:.3}, \"max_ref\": {e:.3}, \"bad\": {d}}}\n", .{ rows, mx3, max_ref, bad3 });
+            try testing.expectEqual(@as(usize, 0), bad3);
+            try testing.expect(mx3 <= 2e-3 * @max(max_ref, 1.0));
+            if (cs.timed) {
+                var best: u64 = std.math.maxInt(u64);
+                for (0..4) |run| {
+                    const mk = g.mark();
+                    defer g.resetTo(mk);
+                    var outs: [4]G.T = undefined;
+                    const t0 = std.Io.Timestamp.now(io, .boot);
+                    for (&outs) |*o| o.* = try r.attend(&g, q, win, widx, wval, .{ ckv, cidx }, sink, .{ qc, qs });
+                    try g.evalAll(&outs);
+                    const ns: u64 = @intCast(t0.untilNow(io, .boot).nanoseconds);
+                    if (run > 0) best = @min(best, ns);
+                }
+                const per_row_s = @as(f64, @floatFromInt(best)) / 4.0 / @as(f64, @floatFromInt(rows)) / 1e9;
+                std.debug.print("BF16MMA_TIMING {{\"rows\": {d}, \"us_per_row\": {d:.2}, \"s_per_16k_x40\": {d:.2}}}\n", .{ rows, per_row_s * 1e6, per_row_s * 16384.0 * 40.0 });
+            }
+            r.qk = qk0;
+            r.pv = pv0;
+            r.flash = fe_keep;
+        }
         if (cs.timed) {
             const fe = r.flash;
             for ([_]bool{ false, true }) |fused| {
