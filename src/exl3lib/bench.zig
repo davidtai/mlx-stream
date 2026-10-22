@@ -1,9 +1,8 @@
 //! The decode-chain benchmark (EXL3LIB_GPU=1 EXL3LIB_BENCH=1, else skipped): three arms on the same synthetic banks at
 //! every integer rate K2..K8 (n 32..128) plus the fractional n40, Qwen3.8-Flash-Next's geometry (2560 x 640, top-10),
 //! rows 1 / 4 / 8 (decode and MTP verify widths):
-//!   fused   - exl3lib's two-launch chain (`decode.zig`, the rotations inside every threadgroup)
-//!   fused2  - exl3lib's form 2 (five launches, one threadgroup per (block, row-slot), lane-ordered inputs)
-//!   steps   - the same math as eleven separately launched steps on the same readers (`unfused.zig`)
+//!   fused3  - exl3lib's form 3 (split-K planes in both GEMVs, finish launches fuse SwiGLU, the down prepare and the reduce)
+//!   fused3b4, fused3b2 - form 3 with 4 / 2 output tiles per GEMV threadgroup (8 / 4 f32 accumulators per lane, 2x / 4x the threadgroups)
 //!   sushi   - the host's Sushi module chain (`sushi_exl3.moe`, reached through `mlx_host`), the shipped control
 //! Parity of every arm against the host reference first (an arm failing parity is reported, not timed); then rounds
 //! interleaved over the arms with a rotated start, 3 warm, `rounds` timed; median / p10 us per layer and the effective
@@ -33,8 +32,8 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-const Arm = enum { fused, fused2, steps, sushi };
-const arms = [_]Arm{ .fused, .fused2, .steps, .sushi };
+const Arm = enum { fused3, fused3b4, fused3b2, sushi };
+const arms = [_]Arm{ .fused3, .fused3b4, .fused3b2, .sushi };
 const rates = [_]u32{ 32, 40, 48, 64, 80, 96, 112, 128 };
 const row_counts = [_]u32{ 1, 4, 8 };
 const hidden: u32 = 2560;
@@ -54,20 +53,16 @@ const Ctx = struct {
     sc1: mlx.mlx_array,
     sc3: mlx.mlx_array,
     bank: decode.Kernels.Bank,
-    k: *decode.Kernels,
-    st: *unfused.Steps,
-    k2: *decode.Kernels2,
+    k3: *decode.Kernels3,
+    k3b4: *decode.Kernels3,
+    k3b2: *decode.Kernels3,
     dec: format.Decode,
 
     fn run(c: *const Ctx, arm: Arm) !mlx.mlx_array {
         switch (arm) {
-            .fused => {
-                const o = try c.k.moe(c.s, c.x2, c.slots1, c.sc1, c.bank, c.rows);
-                _ = mlx.mlx_array_free(o.h);
-                return o.y;
-            },
-            .fused2 => return c.k2.moe(c.s, c.x2, c.slots1, c.sc1, c.bank, c.rows),
-            .steps => return c.st.moe(c.s, c.x2, c.slots1, c.sc1, c.bank, c.rows),
+            .fused3 => return c.k3.moe(c.s, c.x2, c.slots1, c.sc1, c.bank, c.rows),
+            .fused3b4 => return c.k3b4.moe(c.s, c.x2, c.slots1, c.sc1, c.bank, c.rows),
+            .fused3b2 => return c.k3b2.moe(c.s, c.x2, c.slots1, c.sc1, c.bank, c.rows),
             .sushi => {
                 if (!has_sushi) return error.SkipZigTest;
                 const b: sushi.Bank = .{
@@ -124,12 +119,13 @@ fn benchCase(a: std.mem.Allocator, g: *G, s: mlx.mlx_stream, n: u32, rows: u32) 
         .down_suh = try g.hostArray(std.mem.sliceAsBytes(bank.down_suh), &.{ ci(experts), ci(inter) }, .float16),
         .down_svh = try g.hostArray(std.mem.sliceAsBytes(bank.down_svh), &.{ ci(experts), ci(hidden) }, .float16),
     };
-    var k = try decode.Kernels.init(.{ .hidden = hidden, .inter = inter, .topk = topk, .rate = rate, .dec = dec });
-    defer k.deinit();
-    var st = try unfused.Steps.init(.{ .hidden = hidden, .inter = inter, .topk = topk, .rate = rate, .dec = dec });
-    defer st.deinit();
-    var k2 = try decode.Kernels2.init(.{ .hidden = hidden, .inter = inter, .topk = topk, .rate = rate, .dec = dec });
-    defer k2.deinit();
+    const geo: decode.Geometry = .{ .hidden = hidden, .inter = inter, .topk = topk, .rate = rate, .dec = dec };
+    var k3 = try decode.Kernels3.init(geo, 8);
+    defer k3.deinit();
+    var k3b4 = try decode.Kernels3.init(geo, 4);
+    defer k3b4.deinit();
+    var k3b2 = try decode.Kernels3.init(geo, 2);
+    defer k3b2.deinit();
     const c: Ctx = .{
         .s = s,
         .rows = rows,
@@ -140,9 +136,9 @@ fn benchCase(a: std.mem.Allocator, g: *G, s: mlx.mlx_stream, n: u32, rows: u32) 
         .sc1 = try g.hostArray(std.mem.sliceAsBytes(scores), &.{ci(nslots)}, .float32),
         .sc3 = try g.hostArray(std.mem.sliceAsBytes(scores), &.{ 1, ci(rows), ci(topk) }, .float32),
         .bank = bank_arrays,
-        .k = &k,
-        .st = &st,
-        .k2 = &k2,
+        .k3 = &k3,
+        .k3b4 = &k3b4,
+        .k3b2 = &k3b2,
         .dec = dec,
     };
     // parity

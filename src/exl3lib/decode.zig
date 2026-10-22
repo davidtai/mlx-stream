@@ -488,7 +488,57 @@ pub const text_down4 =
     \\
 ;
 
-pub const header: [:0]const u8 = lane.metal_helpers ++ metal_common;
+/// The GEMV core every form-3 kernel inlines: lane L of a simdgroup accumulates its 8 tiles x 2 columns over input
+/// tiles [tk0, tk1) of expert `wbase` (the stacked bank's expert base, in uint words), x in lane order.
+const metal_gemv_core =
+    \\template <uint N, uint WMASK, int CB, uint OUT_TILES, uint BT>
+    \\inline void exl3lib_gemv_core(const device uint* wbase, const device half* xrow, uint tk0, uint tk1, uint blk, uint L, thread float (&a)[BT][2]) {
+    \\  constexpr uint NW = N / 2u;
+    \\  constexpr bool INTK = (N % 16u) == 0u;
+    \\  const uint base = INTK ? exl3_int_qb<N>(L) : exl3_lane_base<N>(L);
+    \\  const uint ia = INTK ? exl3_int_a<N>(L) : 0u;
+    \\  const uint ib = INTK ? exl3_int_b<N>(L) : 0u;
+    \\  uint off[8];
+    \\  for (uint m = 0; m < 8u; ++m) off[m] = INTK ? 0u : exl3_lane_off<N>(L, m, base);
+    \\  for (uint tk = tk0; tk < tk1; ++tk) {
+    \\    const half4 x4 = *reinterpret_cast<const device half4*>(xrow + tk * 16u);
+    \\    const float xr[4] = { float(x4.x), float(x4.y), float(x4.z), float(x4.w) };
+    \\    for (uint t = 0; t < BT; ++t) {
+    \\      const device uint* tile = wbase + (ulong(tk) * OUT_TILES + blk * BT + t) * ulong(NW);
+    \\      if (INTK) {
+    \\        const IntWords ww = exl3_int_words<N>(tile, base, ia);
+    \\        uint cw[8];
+    \\        cw[0] = exl3_int_cw<N, WMASK, 0>(ww, ib); cw[1] = exl3_int_cw<N, WMASK, 1>(ww, ib); cw[2] = exl3_int_cw<N, WMASK, 2>(ww, ib); cw[3] = exl3_int_cw<N, WMASK, 3>(ww, ib);
+    \\        cw[4] = exl3_int_cw<N, WMASK, 4>(ww, ib); cw[5] = exl3_int_cw<N, WMASK, 5>(ww, ib); cw[6] = exl3_int_cw<N, WMASK, 6>(ww, ib); cw[7] = exl3_int_cw<N, WMASK, 7>(ww, ib);
+    \\        for (uint m = 0; m < 8u; ++m) a[t][m >> 2] = fma(xr[m & 3u], float(exl3_decode<CB>(cw[m])), a[t][m >> 2]);
+    \\      } else {
+    \\        const LaneWords ww = exl3_lane_words<N>(tile, base);
+    \\        for (uint m = 0; m < 8u; ++m) a[t][m >> 2] = fma(xr[m & 3u], float(exl3_decode<CB>(exl3_lane_cw<WMASK>(ww, off[m]))), a[t][m >> 2]);
+    \\      }
+    \\    }
+    \\  }
+    \\}
+    \\// the simdgroup's BT x 2 accumulators folded over the quad lanes into red[sg][16 BT] (output = tile * 16 + column)
+    \\template <uint BT>
+    \\inline void exl3lib_fold(thread float (&a)[BT][2], threadgroup float* red_sg, uint L) {
+    \\  for (uint t = 0; t < BT; ++t) for (uint c = 0; c < 2u; ++c) { a[t][c] += simd_shuffle_xor(a[t][c], ushort(1)); a[t][c] += simd_shuffle_xor(a[t][c], ushort(2)); }
+    \\  if ((L & 3u) == 0u) for (uint t = 0; t < BT; ++t) { red_sg[t * 16u + (L >> 2)] = a[t][0]; red_sg[t * 16u + (L >> 2) + 8u] = a[t][1]; }
+    \\}
+    \\// H128 of 128 values held one per thread (tid): 5 shuffle stages in the simdgroup, 2 exchange stages through xch
+    \\inline float exl3lib_h128(float v, threadgroup float* xch, uint tid, uint L) {
+    \\  for (uint st = 0; st < 5u; ++st) { const uint bit = 1u << st; const float p = simd_shuffle_xor(v, ushort(bit)); v = (L & bit) ? (p - v) : (v + p); }
+    \\  for (uint st = 5; st < 7u; ++st) {
+    \\    const uint bit = 1u << st;
+    \\    xch[tid] = v; threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    const float p = xch[tid ^ bit]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    v = (tid & bit) ? (p - v) : (v + p);
+    \\  }
+    \\  return v;
+    \\}
+    \\
+;
+
+pub const header: [:0]const u8 = lane.metal_helpers ++ metal_common ++ metal_gemv_core;
 
 const gu_inputs = [_][*:0]const u8{ "x", "slots", "gate_t", "gate_suh", "gate_svh", "up_t", "up_suh", "up_svh" };
 const gu_outputs = [_][*:0]const u8{"h"};
@@ -948,5 +998,245 @@ pub const Kernels2 = struct {
         const yk = try one(self.down, c.down, &.{ hd, slots, scores, bank.down_t, bank.down_svh }, s);
         defer _ = mlx.mlx_array_free(yk);
         return one(self.reduce, c.reduce, &.{yk}, s);
+    }
+};
+
+/// Form 3 (split-K planes). Launch 2: one threadgroup per (128-wide intermediate block, row-slot, K slice of KS); the
+/// four simdgroups are projection x half of the slice; the slice's partial sums go to the planes zg / zu f32
+/// [KS, RK, inter] (written once each; no atomics).
+pub const text_gu3 =
+    \\    constexpr uint N = uint(NHW);
+    \\    constexpr uint WMASK = (WBITS >= 16) ? 0xffffu : ((1u << uint(WBITS)) - 1u);
+    \\    constexpr int CB = int(CODEBOOK);
+    \\    constexpr uint HIDC = uint(HID);
+    \\    constexpr uint INTC = uint(INTER);
+    \\    constexpr uint KSC = uint(KS);
+    \\    constexpr uint BTC = uint(BT);     // output tiles per threadgroup: 2 BT f32 accumulators per lane
+    \\    constexpr uint IN_TILES = HIDC / 16u;
+    \\    constexpr uint OUT_TILES = INTC / 16u;
+    \\    const uint blk = threadgroup_position_in_grid.x;
+    \\    const uint rk = threadgroup_position_in_grid.y;
+    \\    const uint ks = threadgroup_position_in_grid.z;
+    \\    const uint sg = simdgroup_index_in_threadgroup;
+    \\    const uint L = thread_index_in_simdgroup;
+    \\    const uint tid = thread_index_in_threadgroup;
+    \\    const uint e = slots[rk];
+    \\    const uint proj = sg >> 1u;
+    \\    const uint khalf = sg & 1u;
+    \\    threadgroup float red[4][16u * BTC];
+    \\    float a[BTC][2];
+    \\    for (uint t = 0; t < BTC; ++t) { a[t][0] = 0.0f; a[t][1] = 0.0f; }
+    \\    const device uint* wbase = (const device uint*)(proj == 0u ? gate_t : up_t) + ulong(e) * ulong(IN_TILES) * ulong(OUT_TILES) * ulong(N / 2u);
+    \\    const device half* xrow = (proj == 0u ? xgp : xup) + ulong(rk) * ulong(HIDC) + 4u * (L & 3u);
+    \\    const uint per = IN_TILES / (KSC * 2u);
+    \\    const uint tk0 = (ks * 2u + khalf) * per;
+    \\    exl3lib_gemv_core<N, WMASK, CB, OUT_TILES, BTC>(wbase, xrow, tk0, tk0 + per, blk, L, a);
+    \\    exl3lib_fold<BTC>(a, red[sg], L);
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    if (tid < 16u * BTC) {
+    \\        const ulong o = (ulong(ks) * ulong(RKC) + rk) * ulong(INTC) + blk * (16u * BTC) + tid;
+    \\        zg[o] = red[0][tid] + red[1][tid];
+    \\        zu[o] = red[2][tid] + red[3][tid];
+    \\    }
+    \\
+;
+
+/// Form 3, launch 3: per (128-wide intermediate block, row-slot): sum the planes, f16 round, H128, svh, f16 round,
+/// SwiGLU, then the down's input rotation (f16 round, down suh, H128, f16 round) into hd in lane order.
+pub const text_fin3 =
+    \\    constexpr uint INTC = uint(INTER);
+    \\    constexpr uint KSC = uint(KS);
+    \\    constexpr float HAD_SCALE = 0.08838834764831845f;
+    \\    const uint blk = threadgroup_position_in_grid.x;
+    \\    const uint rk = threadgroup_position_in_grid.y;
+    \\    const uint L = thread_index_in_simdgroup;
+    \\    const uint tid = thread_index_in_threadgroup;
+    \\    const uint e = slots[rk];
+    \\    threadgroup float xch[128];
+    \\    const uint o = blk * 128u + tid;
+    \\    float g = 0.0f, u = 0.0f;
+    \\    for (uint ks = 0; ks < KSC; ++ks) { const ulong i = (ulong(ks) * ulong(RKC) + rk) * ulong(INTC) + o; g += zg[i]; u += zu[i]; }
+    \\    g = exl3lib_h128(float(half(g)), xch, tid, L);
+    \\    u = exl3lib_h128(float(half(u)), xch, tid, L);
+    \\    const float gv = float(half(g * HAD_SCALE * float(gate_svh[e * INTC + o])));
+    \\    const float uv = float(half(u * HAD_SCALE * float(up_svh[e * INTC + o])));
+    \\    const float hv = (gv / (1.0f + metal::exp(-gv))) * uv;
+    \\    // the down's prepare: f16 round, down suh, H128, f16 round, stored in lane order within the 16-wide tile
+    \\    float d = float(half(hv)) * float(down_suh[e * INTC + o]);
+    \\    d = exl3lib_h128(d, xch, tid, L);
+    \\    const uint r = o & 15u;
+    \\    const uint q = (r & 7u) >> 1u;
+    \\    const uint m = (r & 1u) | ((r >> 3u) << 1u);
+    \\    hd[ulong(rk) * ulong(INTC) + (o & ~15u) + 4u * q + m] = half(d * HAD_SCALE);
+    \\
+;
+
+/// Form 3, launch 4: the down GEMV as split-K planes zd f32 [KS2, RK, hidden].
+pub const text_down3 =
+    \\    constexpr uint N = uint(NHW);
+    \\    constexpr uint WMASK = (WBITS >= 16) ? 0xffffu : ((1u << uint(WBITS)) - 1u);
+    \\    constexpr int CB = int(CODEBOOK);
+    \\    constexpr uint HIDC = uint(HID);
+    \\    constexpr uint INTC = uint(INTER);
+    \\    constexpr uint KSC = uint(KS);
+    \\    constexpr uint BTC = uint(BT);     // output tiles per threadgroup: 2 BT f32 accumulators per lane
+    \\    constexpr uint IN_TILES = INTC / 16u;
+    \\    constexpr uint OUT_TILES = HIDC / 16u;
+    \\    const uint blk = threadgroup_position_in_grid.x;
+    \\    const uint rk = threadgroup_position_in_grid.y;
+    \\    const uint ks = threadgroup_position_in_grid.z;
+    \\    const uint sg = simdgroup_index_in_threadgroup;
+    \\    const uint L = thread_index_in_simdgroup;
+    \\    const uint tid = thread_index_in_threadgroup;
+    \\    const uint e = slots[rk];
+    \\    threadgroup float red[4][16u * BTC];
+    \\    float a[BTC][2];
+    \\    for (uint t = 0; t < BTC; ++t) { a[t][0] = 0.0f; a[t][1] = 0.0f; }
+    \\    const device uint* wbase = (const device uint*)(down_t) + ulong(e) * ulong(IN_TILES) * ulong(OUT_TILES) * ulong(N / 2u);
+    \\    const device half* xrow = hdp + ulong(rk) * ulong(INTC) + 4u * (L & 3u);
+    \\    const uint per = IN_TILES / (KSC * 4u);
+    \\    const uint tk0 = (ks * 4u + sg) * per;
+    \\    exl3lib_gemv_core<N, WMASK, CB, OUT_TILES, BTC>(wbase, xrow, tk0, tk0 + per, blk, L, a);
+    \\    exl3lib_fold<BTC>(a, red[sg], L);
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    if (tid < 16u * BTC) zd[(ulong(ks) * ulong(RKC) + rk) * ulong(HIDC) + blk * (16u * BTC) + tid] = ((red[0][tid] + red[1][tid]) + red[2][tid]) + red[3][tid];
+    \\
+;
+
+/// Form 3, launch 5: per (128-wide hidden block, row): for each slot in order sum the planes, f16 round, H128, svh,
+/// f16 round, times the score; y f32 [rows, hidden].
+pub const text_dfin3 =
+    \\    constexpr uint HIDC = uint(HID);
+    \\    constexpr uint TOPKC = uint(TOPK);
+    \\    constexpr uint KSC = uint(KS);
+    \\    constexpr float HAD_SCALE = 0.08838834764831845f;
+    \\    const uint blk = threadgroup_position_in_grid.x;
+    \\    const uint row = threadgroup_position_in_grid.y;
+    \\    const uint L = thread_index_in_simdgroup;
+    \\    const uint tid = thread_index_in_threadgroup;
+    \\    threadgroup float xch[128];
+    \\    const uint o = blk * 128u + tid;
+    \\    float acc = 0.0f;
+    \\    for (uint k = 0; k < TOPKC; ++k) {
+    \\        const uint rk = row * TOPKC + k;
+    \\        const uint e = slots[rk];
+    \\        float v = 0.0f;
+    \\        for (uint ks = 0; ks < KSC; ++ks) v += zd[(ulong(ks) * ulong(RKC) + rk) * ulong(HIDC) + o];
+    \\        v = exl3lib_h128(float(half(v)), xch, tid, L);
+    \\        acc = fma(scores[rk], float(half(v * HAD_SCALE * float(down_svh[e * HIDC + o]))), acc);
+    \\    }
+    \\    y[ulong(row) * ulong(HIDC) + o] = acc;
+    \\
+;
+
+const gu3_inputs = [_][*:0]const u8{ "xgp", "xup", "slots", "gate_t", "up_t" };
+const gu3_outputs = [_][*:0]const u8{ "zg", "zu" };
+const fin3_inputs = [_][*:0]const u8{ "zg", "zu", "slots", "gate_svh", "up_svh", "down_suh" };
+const fin3_outputs = [_][*:0]const u8{"hd"};
+const down3_inputs = [_][*:0]const u8{ "hdp", "slots", "down_t" };
+const down3_outputs = [_][*:0]const u8{"zd"};
+const dfin3_inputs = [_][*:0]const u8{ "zd", "slots", "scores", "down_svh" };
+
+/// Form 3: five launches (prepare gate, prepare up, split-K gate/up planes, finish + SwiGLU + down prepare, split-K
+/// down planes, finish + reduce) -> six with the two prepares; KS slices fill the GPU at one row.
+pub const Kernels3 = struct {
+    geo: Geometry,
+    ks_gu: u32,
+    ks_dn: u32,
+    /// output tiles per GEMV threadgroup (8, 4 or 2): 2 bt f32 accumulators per lane, 128 / (16 bt) x more threadgroups
+    bt: u32,
+    prep: mlx.mlx_fast_metal_kernel,
+    gu: mlx.mlx_fast_metal_kernel,
+    fin: mlx.mlx_fast_metal_kernel,
+    down: mlx.mlx_fast_metal_kernel,
+    dfin: mlx.mlx_fast_metal_kernel,
+    cfg: [Kernels.max_rows + 1]?Cfg = @splat(null),
+
+    const Cfg = struct { prep_h: mlx.mlx_fast_metal_kernel_config, gu: mlx.mlx_fast_metal_kernel_config, fin: mlx.mlx_fast_metal_kernel_config, down: mlx.mlx_fast_metal_kernel_config, dfin: mlx.mlx_fast_metal_kernel_config };
+    const prep_in = [_][*:0]const u8{ "x", "slots", "suh" };
+    const prep_out = [_][*:0]const u8{"xp"};
+
+    /// K slices: gate/up over hidden/16 tiles in KS x 2 parts, down over inter/16 tiles in KS2 x 4 parts; each part
+    /// at least 4 tiles.
+    pub fn init(geo: Geometry, bt: u32) !Kernels3 {
+        if (!geo.admitted() or (bt != 8 and bt != 4 and bt != 2)) return error.BadExl3Shape;
+        var ks_gu: u32 = 4;
+        while (ks_gu > 1 and (geo.hidden / 16) % (ks_gu * 2) != 0) ks_gu /= 2;
+        var ks_dn: u32 = 4;
+        while (ks_dn > 1 and ((geo.inter / 16) % (ks_dn * 4) != 0 or (geo.inter / 16) / (ks_dn * 4) < 2)) ks_dn /= 2;
+        const unf = @import("unfused.zig");
+        return .{
+            .geo = geo,
+            .ks_gu = ks_gu,
+            .ks_dn = ks_dn,
+            .bt = bt,
+            .prep = ks.newKernel("exl3lib_prep", &prep_in, &prep_out, unf.text_prep, header, true) orelse return error.KernelCreateFailed,
+            .gu = ks.newKernel("exl3lib_gu3", &gu3_inputs, &gu3_outputs, text_gu3, header, true) orelse return error.KernelCreateFailed,
+            .fin = ks.newKernel("exl3lib_fin3", &fin3_inputs, &fin3_outputs, text_fin3, header, true) orelse return error.KernelCreateFailed,
+            .down = ks.newKernel("exl3lib_down3", &down3_inputs, &down3_outputs, text_down3, header, true) orelse return error.KernelCreateFailed,
+            .dfin = ks.newKernel("exl3lib_dfin3", &dfin3_inputs, &down_outputs, text_dfin3, header, true) orelse return error.KernelCreateFailed,
+        };
+    }
+
+    pub fn deinit(self: *Kernels3) void {
+        for (&self.cfg) |*c| if (c.*) |cc| {
+            inline for (.{ cc.prep_h, cc.gu, cc.fin, cc.down, cc.dfin }) |k| _ = mlx.mlx_fast_metal_kernel_config_free(k);
+            c.* = null;
+        };
+        inline for (.{ self.prep, self.gu, self.fin, self.down, self.dfin }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+    }
+
+    fn cfgs(self: *Kernels3, rows: usize) !Cfg {
+        if (rows == 0 or rows > Kernels.max_rows) return error.BadExl3Shape;
+        if (self.cfg[rows]) |c| return c;
+        const g = self.geo;
+        const rk: u32 = @as(u32, @intCast(rows)) * g.topk;
+        const rkc: c_int = @intCast(rk);
+        const H: c_int = @intCast(g.hidden);
+        const I: c_int = @intCast(g.inter);
+        const nhw = ks.TemplateArg{ .name = "NHW", .value = .{ .int = @intCast(g.rate.n) } };
+        const cb = ks.TemplateArg{ .name = "CODEBOOK", .value = .{ .int = @backingInt(g.dec.codebook) } };
+        const wb = ks.TemplateArg{ .name = "WBITS", .value = .{ .int = @intCast(g.dec.window.bits()) } };
+        const hid = ks.TemplateArg{ .name = "HID", .value = .{ .int = H } };
+        const inter_t = ks.TemplateArg{ .name = "INTER", .value = .{ .int = I } };
+        const rkt = ks.TemplateArg{ .name = "RKC", .value = .{ .int = rkc } };
+        const topk = ks.TemplateArg{ .name = "TOPK", .value = .{ .int = @intCast(g.topk) } };
+        const ks_gu_t = ks.TemplateArg{ .name = "KS", .value = .{ .int = @intCast(self.ks_gu) } };
+        const ks_dn_t = ks.TemplateArg{ .name = "KS", .value = .{ .int = @intCast(self.ks_dn) } };
+        const bt_t = ks.TemplateArg{ .name = "BT", .value = .{ .int = @intCast(self.bt) } };
+        const bw: u32 = 16 * self.bt;
+        const c: Cfg = .{
+            .prep_h = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 32, rk, 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, H }}, .out_dtypes = &.{.float16}, .template = &.{ .{ .name = "DIM", .value = .{ .int = H } }, topk } }),
+            .gu = try ks.buildConfig(.{ .grid = .{ (g.inter / bw) * 128, rk, self.ks_gu }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{ &[_]c_int{ @intCast(self.ks_gu), rkc, I }, &[_]c_int{ @intCast(self.ks_gu), rkc, I } }, .out_dtypes = &.{ .float32, .float32 }, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_gu_t, bt_t } }),
+            .fin = try ks.buildConfig(.{ .grid = .{ (g.inter / 128) * 128, rk, 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, I }}, .out_dtypes = &.{.float16}, .template = &.{ inter_t, rkt, ks_gu_t } }),
+            .down = try ks.buildConfig(.{ .grid = .{ (g.hidden / bw) * 128, rk, self.ks_dn }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(self.ks_dn), rkc, H }}, .out_dtypes = &.{.float32}, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_dn_t, bt_t } }),
+            .dfin = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 128, @intCast(rows), 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(rows), H }}, .out_dtypes = &.{.float32}, .template = &.{ hid, topk, rkt, ks_dn_t } }),
+        };
+        self.cfg[rows] = c;
+        return c;
+    }
+
+    fn one(k: mlx.mlx_fast_metal_kernel, c: mlx.mlx_fast_metal_kernel_config, ins: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        var outs: [1]mlx.mlx_array = undefined;
+        try ks.applyConfig(k, c, ins, &outs, s);
+        return outs[0];
+    }
+
+    /// The six launches; the caller frees y.
+    pub fn moe(self: *Kernels3, s: mlx.mlx_stream, x: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, bank: Kernels.Bank, rows: usize) !mlx.mlx_array {
+        const c = try self.cfgs(rows);
+        const xg = try one(self.prep, c.prep_h, &.{ x, slots, bank.gate_suh }, s);
+        defer _ = mlx.mlx_array_free(xg);
+        const xu = try one(self.prep, c.prep_h, &.{ x, slots, bank.up_suh }, s);
+        defer _ = mlx.mlx_array_free(xu);
+        var planes: [2]mlx.mlx_array = undefined;
+        try ks.applyConfig(self.gu, c.gu, &.{ xg, xu, slots, bank.gate_t, bank.up_t }, &planes, s);
+        defer _ = mlx.mlx_array_free(planes[0]);
+        defer _ = mlx.mlx_array_free(planes[1]);
+        const hd = try one(self.fin, c.fin, &.{ planes[0], planes[1], slots, bank.gate_svh, bank.up_svh, bank.down_suh }, s);
+        defer _ = mlx.mlx_array_free(hd);
+        const zd = try one(self.down, c.down, &.{ hd, slots, bank.down_t }, s);
+        defer _ = mlx.mlx_array_free(zd);
+        return one(self.dfin, c.dfin, &.{ zd, slots, scores, bank.down_svh }, s);
     }
 };
