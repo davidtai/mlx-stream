@@ -494,27 +494,20 @@ const metal_gemv_core =
     \\template <uint N, uint WMASK, int CB, uint OUT_TILES, uint BT>
     \\inline void exl3lib_gemv_core(const device uint* wbase, const device half* xrow, uint tk0, uint tk1, uint blk, uint L, thread float (&a)[BT][2]) {
     \\  constexpr uint NW = N / 2u;
-    \\  constexpr bool INTK = (N % 16u) == 0u;
-    \\  const uint base = INTK ? exl3_int_qb<N>(L) : exl3_lane_base<N>(L);
-    \\  const uint ia = INTK ? exl3_int_a<N>(L) : 0u;
-    \\  const uint ib = INTK ? exl3_int_b<N>(L) : 0u;
-    \\  uint off[8];
-    \\  for (uint m = 0; m < 8u; ++m) off[m] = INTK ? 0u : exl3_lane_off<N>(L, m, base);
+    \\  // the general fast path (every even N): one select, one shift, one mask per weight
+    \\  const uint qb = exl3_gen_qb<N>(L);
+    \\  const uint ga = exl3_gen_a<N>(L);
+    \\  const uint lp = exl3_gen_lp<N>(L);
     \\  for (uint tk = tk0; tk < tk1; ++tk) {
     \\    const half4 x4 = *reinterpret_cast<const device half4*>(xrow + tk * 16u);
     \\    const float xr[4] = { float(x4.x), float(x4.y), float(x4.z), float(x4.w) };
     \\    for (uint t = 0; t < BT; ++t) {
     \\      const device uint* tile = wbase + (ulong(tk) * OUT_TILES + blk * BT + t) * ulong(NW);
-    \\      if (INTK) {
-    \\        const IntWords ww = exl3_int_words<N>(tile, base, ia);
-    \\        uint cw[8];
-    \\        cw[0] = exl3_int_cw<N, WMASK, 0>(ww, ib); cw[1] = exl3_int_cw<N, WMASK, 1>(ww, ib); cw[2] = exl3_int_cw<N, WMASK, 2>(ww, ib); cw[3] = exl3_int_cw<N, WMASK, 3>(ww, ib);
-    \\        cw[4] = exl3_int_cw<N, WMASK, 4>(ww, ib); cw[5] = exl3_int_cw<N, WMASK, 5>(ww, ib); cw[6] = exl3_int_cw<N, WMASK, 6>(ww, ib); cw[7] = exl3_int_cw<N, WMASK, 7>(ww, ib);
-    \\        for (uint m = 0; m < 8u; ++m) a[t][m >> 2] = fma(xr[m & 3u], float(exl3_decode<CB>(cw[m])), a[t][m >> 2]);
-    \\      } else {
-    \\        const LaneWords ww = exl3_lane_words<N>(tile, base);
-    \\        for (uint m = 0; m < 8u; ++m) a[t][m >> 2] = fma(xr[m & 3u], float(exl3_decode<CB>(exl3_lane_cw<WMASK>(ww, off[m]))), a[t][m >> 2]);
-    \\      }
+    \\      const IntWords ww = exl3_int_words<N>(tile, qb, ga);
+    \\      uint cw[8];
+    \\      cw[0] = exl3_gen_cw<N, WMASK, 0>(ww, lp); cw[1] = exl3_gen_cw<N, WMASK, 1>(ww, lp); cw[2] = exl3_gen_cw<N, WMASK, 2>(ww, lp); cw[3] = exl3_gen_cw<N, WMASK, 3>(ww, lp);
+    \\      cw[4] = exl3_gen_cw<N, WMASK, 4>(ww, lp); cw[5] = exl3_gen_cw<N, WMASK, 5>(ww, lp); cw[6] = exl3_gen_cw<N, WMASK, 6>(ww, lp); cw[7] = exl3_gen_cw<N, WMASK, 7>(ww, lp);
+    \\      for (uint m = 0; m < 8u; ++m) a[t][m >> 2] = fma(xr[m & 3u], float(exl3_decode<CB>(cw[m])), a[t][m >> 2]);
     \\    }
     \\  }
     \\}

@@ -120,6 +120,39 @@ pub fn laneCodewordsInt(words: []const u16, rate: format.Rate, l: u32, out: *[8]
     }
 }
 
+/// The general fast path (every even n): 8 L n is a multiple of 16 when n is even, so window m of lane L ends at
+/// e_m = (8 L n) / 16 + (((m + 1) n) >> 4): a lane constant plus the compile-time constant C_m = (((m + 1) n) >> 4) - (n >> 4)
+/// past the lane's first window. With s = e_0 - 16 (+ one period) the lane's start bit, qb = s >> 5 its word, a = (s >> 4) & 1
+/// its halfword and lp = s & 15, window m starts lp + C_m bits past halfword a of word qb, so it is the 16 bits at offset
+/// (lp + C_m) & 15 from the top of H_j, j = (lp + C_m) >> 4, which is J_m = C_m >> 4 or J_m + 1 (one select). The integer
+/// path (`intPlan`) is the special case lp in {0, 8}.
+pub const GenPlan = struct { qb: u32, a: u32, lp: u32 };
+
+pub fn genPlan(rate: format.Rate, l: u32) GenPlan {
+    const n = rate.n;
+    std.debug.assert(n % 2 == 0);
+    const e0 = ((8 * l + 1) * n) >> 4;
+    const s = e0 + 16 * n - 16;
+    return .{ .qb = s >> 5, .a = (s >> 4) & 1, .lp = s & 15 };
+}
+
+pub fn genOffset(rate: format.Rate, m: u32) u32 {
+    return (((m + 1) * rate.n) >> 4) - (rate.n >> 4);
+}
+
+pub fn laneCodewordsGen(words: []const u16, rate: format.Rate, l: u32, out: *[8]u16) void {
+    const p = genPlan(rate, l);
+    var m: u32 = 0;
+    while (m < 8) : (m += 1) {
+        const pos = p.lp + genOffset(rate, m);
+        const j = pos >> 4;
+        std.debug.assert(j == (genOffset(rate, m) >> 4) or j == (genOffset(rate, m) >> 4) + 1);
+        const r = pos & 15;
+        const h = hword(words, rate, p.qb, j + p.a);
+        out[m] = @truncate((h >> @intCast(16 - r)) & 0xFFFF);
+    }
+}
+
 /// The Metal text of the helpers every exl3lib kernel includes, each templated on what the kernel body binds from its
 /// template ints (`NHW` the rate's halfwords, `WBITS` the window, `CODEBOOK` 0 MUL1 / 1 MCG): `exl3_lane_words<N>` loads
 /// a lane's four words, `exl3_lane_cw<WMASK>` extracts window m, `exl3_decode<CB>` turns a codeword into the f16 weight.
@@ -165,6 +198,19 @@ pub const metal_helpers =
     \\  constexpr uint K = N / 16u; constexpr uint CM = (K % 8u) + K * M; constexpr uint JC = CM >> 4u; constexpr bool CARRY_IF_B = (CM & 15u) >= 8u;
     \\  const uint hsel = (CARRY_IF_B && b != 0u) ? w.h[JC + 1u] : w.h[JC];
     \\  const uint r = (8u * b + CM) & 15u;
+    \\  return ((hsel >> (16u - r)) & 0xffffu) & WMASK;
+    \\}
+    \\// the general fast path (every even N; lane.zig GenPlan): the lane's start bit s, its word qb, halfword a, offset lp
+    \\template <uint N> inline uint exl3_gen_s(uint L) { return (((8u * L + 1u) * N) >> 4u) + 16u * N - 16u; }
+    \\template <uint N> inline uint exl3_gen_qb(uint L) { return exl3_gen_s<N>(L) >> 5u; }
+    \\template <uint N> inline uint exl3_gen_a(uint L) { return (exl3_gen_s<N>(L) >> 4u) & 1u; }
+    \\template <uint N> inline uint exl3_gen_lp(uint L) { return exl3_gen_s<N>(L) & 15u; }
+    \\// window m: C_m = ((m + 1) N >> 4) - (N >> 4) past the lane's start; j = (lp + C_m) >> 4 is J or J + 1
+    \\template <uint N, uint WMASK, uint M> inline uint exl3_gen_cw(IntWords w, uint lp) {
+    \\  constexpr uint CM = (((M + 1u) * N) >> 4u) - (N >> 4u); constexpr uint J = CM >> 4u;
+    \\  const uint pos = lp + CM;
+    \\  const uint hsel = ((pos >> 4u) == J) ? w.h[J] : w.h[J + 1u];
+    \\  const uint r = pos & 15u;
     \\  return ((hsel >> (16u - r)) & 0xffffu) & WMASK;
     \\}
     \\template <int CB> inline half exl3_decode(uint cw) {
@@ -234,6 +280,28 @@ test "exl3lib lane plan: the integer-rate fast path equals unpackTile at K1..K8 
             var l: u32 = 0;
             while (l < 32) : (l += 1) {
                 laneCodewordsInt(words[0..rate.n], rate, l, &got);
+                for (got, 0..) |cw, m| try testing.expectEqual(ref[8 * l + m], cw);
+            }
+        }
+    }
+}
+
+test "exl3lib lane plan: the general fast path equals unpackTile at every even n in [16, 128] (the Metal arithmetic)" {
+    var prng = std.Random.DefaultPrng.init(0x6E4E);
+    const rnd = prng.random();
+    var words: [format.Rate.max_n]u16 = undefined;
+    var ref: [format.TILE_VALUES]u16 = undefined;
+    var got: [8]u16 = undefined;
+    var n: u64 = 16;
+    while (n <= 128) : (n += 2) {
+        const rate = format.Rate.fromN(n).?;
+        var trial: u32 = 0;
+        while (trial < 4) : (trial += 1) {
+            for (words[0..rate.n]) |*w| w.* = rnd.int(u16);
+            format.unpackTile(words[0..rate.n], rate, &ref);
+            var l: u32 = 0;
+            while (l < 32) : (l += 1) {
+                laneCodewordsGen(words[0..rate.n], rate, l, &got);
                 for (got, 0..) |cw, m| try testing.expectEqual(ref[8 * l + m], cw);
             }
         }
