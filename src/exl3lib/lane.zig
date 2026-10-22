@@ -217,6 +217,13 @@ pub const metal_helpers =
     \\  const uint cw = metal::extract_bits(hsel, 16u - (pos & 15u), 16u);
     \\  return (WMASK == 0xffffu) ? cw : (cw & WMASK);
     \\}
+    \\// MUL1's codeword as its byte sum t in [0, 1020]: the decoded weight is A t + C with A = half 0x1EEE and
+    \\// C = 1024 A + half 0xC931 = -3.453125, both exact in f32, so a GEMV can sum x t and apply A and C once per output
+    \\inline float exl3_mul1_t(uint cw) {
+    \\  const uint rr = cw * 0x83DCD12Du;
+    \\  const uint bs = (rr & 0x00FF00FFu) + ((rr >> 8u) & 0x00FF00FFu);
+    \\  return float((bs * 0x00010001u) >> 16u);
+    \\}
     \\template <int CB> inline half exl3_decode(uint cw) {
     \\  if (CB == 1) {
     \\    const uint mixed = cw * 0xCBAC1FEDu; const uint pair = 0x3B603B60u ^ (mixed & 0x8FFF8FFFu);

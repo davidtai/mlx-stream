@@ -35,6 +35,34 @@ pub const text_prep =
     \\
 ;
 
+/// prepare for the multi-row GEMV: text_prep in lane order plus xs f32 [rows, IN/128], the sum of each 128-block's rounded
+/// values (what a deferred MUL1 affine map needs: sum_i x_i (A t_i + C) = A sum_i x_i t_i + C sum_i x_i)
+pub const text_prep_s =
+    \\    constexpr uint DIMC = uint(DIM);
+    \\    constexpr uint NB = DIMC / 128u;
+    \\    constexpr float HAD_SCALE = 0.08838834764831845f;
+    \\    const uint b = threadgroup_position_in_grid.x;
+    \\    const uint row = threadgroup_position_in_grid.y;
+    \\    const uint L = thread_index_in_simdgroup;
+    \\    float v[4];
+    \\    for (uint j = 0; j < 4u; ++j) { const uint i = b * 128u + L + 32u * j; v[j] = float(half(float(x[row * DIMC + i]))) * float(suh[i]); }
+    \\    for (uint s = 0; s < 5u; ++s) { const uint bit = 1u << s; for (uint j = 0; j < 4u; ++j) { const float p = simd_shuffle_xor(v[j], ushort(bit)); v[j] = (L & bit) ? (p - v[j]) : (v[j] + p); } }
+    \\    { float t0 = v[0] + v[1], t1 = v[0] - v[1], t2 = v[2] + v[3], t3 = v[2] - v[3]; v[0] = t0 + t2; v[1] = t1 + t3; v[2] = t0 - t2; v[3] = t1 - t3; }
+    \\    float sum = 0.0f;
+    \\    for (uint j = 0; j < 4u; ++j) {
+    \\        const uint i = b * 128u + L + 32u * j;
+    \\        const uint r = i & 15u;
+    \\        const uint q = (r & 7u) >> 1u;
+    \\        const uint m = (r & 1u) | ((r >> 3u) << 1u);
+    \\        const half hv = half(v[j] * HAD_SCALE);
+    \\        xp[row * DIMC + (i & ~15u) + 4u * q + m] = hv;
+    \\        sum += float(hv);
+    \\    }
+    \\    sum = simd_sum(sum);
+    \\    if (L == 0u) xs[row * NB + b] = sum;
+    \\
+;
+
 /// finish for a dense linear: y OUT_T [rows, OUT] = f16(H128(f16(z)) * svh) per 128-block; z f32 (decode) or f16 (prefill)
 pub const text_finish =
     \\    constexpr uint DIMC = uint(DIM);
@@ -130,7 +158,8 @@ pub const text_dgemv =
     \\            cw[0] = exl3_gen_cw<N, WMASK, 0>(ww, lp); cw[1] = exl3_gen_cw<N, WMASK, 1>(ww, lp); cw[2] = exl3_gen_cw<N, WMASK, 2>(ww, lp); cw[3] = exl3_gen_cw<N, WMASK, 3>(ww, lp);
     \\            cw[4] = exl3_gen_cw<N, WMASK, 4>(ww, lp); cw[5] = exl3_gen_cw<N, WMASK, 5>(ww, lp); cw[6] = exl3_gen_cw<N, WMASK, 6>(ww, lp); cw[7] = exl3_gen_cw<N, WMASK, 7>(ww, lp);
     \\            for (uint m = 0; m < 8u; ++m) {
-    \\                const float wv = float(exl3_decode<CB>(cw[m]));
+    \\                // DEFER: MUL1's byte sum t; the finish applies A and C (C times the row's input sum)
+    \\                const float wv = (DEFER != 0) ? exl3_mul1_t(cw[m]) : float(exl3_decode<CB>(cw[m]));
     \\                for (uint r = 0; r < RBC; ++r) a[r][t][m >> 2] = fma(xr[r][m & 3u], wv, a[r][t][m >> 2]);
     \\            }
     \\        }
@@ -154,11 +183,17 @@ pub const text_dfinish =
     \\    const uint b = threadgroup_position_in_grid.x;
     \\    const uint row = threadgroup_position_in_grid.y;
     \\    const uint L = thread_index_in_simdgroup;
+    \\    constexpr uint INB = uint(INBLK);
+    \\    const float MUL1_A = float(as_type<half>(ushort(0x1EEEu)));
+    \\    const float MUL1_C = 1024.0f * MUL1_A + float(as_type<half>(ushort(0xC931u)));
+    \\    float xsum = 0.0f;
+    \\    if (DEFER != 0) for (uint q = 0; q < INB; ++q) xsum += xs[row * INB + q];
     \\    float v[4];
     \\    for (uint j = 0; j < 4u; ++j) {
     \\        const uint o = b * 128u + L + 32u * j;
     \\        float acc = z[ulong(row) * ulong(DIMC) + o];
     \\        for (uint k = 1u; k < KSC; ++k) acc += z[(ulong(k) * ulong(ROWSC) + row) * ulong(DIMC) + o];
+    \\        if (DEFER != 0) acc = fma(acc, MUL1_A, MUL1_C * xsum);
     \\        v[j] = float(half(acc));
     \\    }
     \\    for (uint s = 0; s < 5u; ++s) { const uint bit = 1u << s; for (uint j = 0; j < 4u; ++j) { const float p = simd_shuffle_xor(v[j], ushort(bit)); v[j] = (L & bit) ? (p - v[j]) : (v[j] + p); } }
@@ -175,7 +210,8 @@ const finish_in = [_][*:0]const u8{ "z", "svh" };
 const finish_out = [_][*:0]const u8{"y"};
 const dequant_in = [_][*:0]const u8{"w"};
 const dgemv_in = [_][*:0]const u8{ "xp", "w" };
-const dfinish_in = [_][*:0]const u8{ "z", "svh" };
+const dfinish_in = [_][*:0]const u8{ "z", "svh", "xs" };
+const prep_s_out = [_][*:0]const u8{ "xp", "xs" };
 const dequant_out = [_][*:0]const u8{"W"};
 
 pub const Shape = struct { in: u32, out: u32, rate: format.Rate, dec: format.Decode, out_dtype: mlx.mlx_dtype };
@@ -189,6 +225,10 @@ pub const Dense = struct {
     dequant: mlx.mlx_fast_metal_kernel,
     dgemv: mlx.mlx_fast_metal_kernel,
     dfinish: mlx.mlx_fast_metal_kernel,
+    prep_s: mlx.mlx_fast_metal_kernel,
+    /// MUL1 packs: the GEMV sums x times the codeword's byte sum and the finish applies the affine map once per output
+    /// (MLX_SERVE_EXL3LIB_DENSE_DEFER=0 decodes every weight to its f16 value instead, the reference's rounding)
+    defer_affine: bool,
     /// K slices of the multi-row GEMV: fixed per shape (so a row's summation order is too)
     ks_split: u32,
     /// MLX_SERVE_EXL3LIB_DENSE=rowslot: the per-row-slot GEMV (every row decodes the trellis again), for A/B
@@ -247,6 +287,11 @@ pub const Dense = struct {
             .dequant = ks.newKernel("exl3lib_dense_dequant", &dequant_in, &dequant_out, text_dequant, decode.header, true) orelse return error.KernelCreateFailed,
             .dgemv = ks.newKernel("exl3lib_dense_dgemv", &dgemv_in, &gemv_out, text_dgemv, decode.header, true) orelse return error.KernelCreateFailed,
             .dfinish = ks.newKernel("exl3lib_dense_dfinish", &dfinish_in, &finish_out, text_dfinish, decode.header, true) orelse return error.KernelCreateFailed,
+            .prep_s = ks.newKernel("exl3lib_dense_prep_s", &prep_in, &prep_s_out, text_prep_s, decode.header, true) orelse return error.KernelCreateFailed,
+            .defer_affine = shape.dec.codebook == .mul1 and blk: {
+                const v = std.c.getenv("MLX_SERVE_EXL3LIB_DENSE_DEFER") orelse break :blk true;
+                break :blk v[0] != '0';
+            },
             .ks_split = ksFor(shape.in, shape.out),
             .rowslot = blk: {
                 const v = std.c.getenv("MLX_SERVE_EXL3LIB_DENSE") orelse break :blk false;
@@ -261,7 +306,7 @@ pub const Dense = struct {
             c.* = null;
         };
         if (self.dequant_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        inline for (.{ self.prep, self.gemv, self.finish, self.dequant, self.dgemv, self.dfinish }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+        inline for (.{ self.prep, self.gemv, self.finish, self.dequant, self.dgemv, self.dfinish, self.prep_s }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
     }
 
     fn templ(self: *const Dense) [3]ks.TemplateArg {
@@ -292,10 +337,11 @@ pub const Dense = struct {
         const chunks: u32 = (@as(u32, @intCast(rows)) + rb - 1) / rb;
         const ksv: c_int = @intCast(self.ks_split);
         const out_t = ks.TemplateArg{ .name = "OUT_T", .value = .{ .dtype = self.shape.out_dtype } };
+        const defer_t = ks.TemplateArg{ .name = "DEFER", .value = .{ .int = if (self.defer_affine) 1 else 0 } };
         return .{
-            .prep = try ks.buildConfig(.{ .grid = .{ (self.shape.in / 128) * 32, @intCast(rows), 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{&[_]c_int{ r, IN }}, .out_dtypes = &.{.float16}, .template = &.{ .{ .name = "DIM", .value = .{ .int = IN } }, .{ .name = "LANE_ORDER", .value = .{ .int = 1 } } } }),
-            .gemv = try ks.buildConfig(.{ .grid = .{ (self.shape.out / 16 / bt) * 128, chunks, self.ks_split }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ ksv * r, OUT }}, .out_dtypes = &.{.float32}, .template = &.{ t[0], t[1], t[2], .{ .name = "IN", .value = .{ .int = IN } }, .{ .name = "OUT", .value = .{ .int = OUT } }, .{ .name = "KS", .value = .{ .int = ksv } }, .{ .name = "BT", .value = .{ .int = @intCast(bt) } }, .{ .name = "RB", .value = .{ .int = @intCast(rb) } }, .{ .name = "ROWS", .value = .{ .int = r } } } }),
-            .finish = try ks.buildConfig(.{ .grid = .{ (self.shape.out / 128) * 32, @intCast(rows), 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{&[_]c_int{ r, OUT }}, .out_dtypes = &.{self.shape.out_dtype}, .template = &.{ .{ .name = "DIM", .value = .{ .int = OUT } }, out_t, .{ .name = "KS", .value = .{ .int = ksv } }, .{ .name = "ROWS", .value = .{ .int = r } } } }),
+            .prep = try ks.buildConfig(.{ .grid = .{ (self.shape.in / 128) * 32, @intCast(rows), 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{ &[_]c_int{ r, IN }, &[_]c_int{ r, @intCast(self.shape.in / 128) } }, .out_dtypes = &.{ .float16, .float32 }, .template = &.{.{ .name = "DIM", .value = .{ .int = IN } }} }),
+            .gemv = try ks.buildConfig(.{ .grid = .{ (self.shape.out / 16 / bt) * 128, chunks, self.ks_split }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ ksv * r, OUT }}, .out_dtypes = &.{.float32}, .template = &.{ t[0], t[1], t[2], .{ .name = "IN", .value = .{ .int = IN } }, .{ .name = "OUT", .value = .{ .int = OUT } }, .{ .name = "KS", .value = .{ .int = ksv } }, .{ .name = "BT", .value = .{ .int = @intCast(bt) } }, .{ .name = "RB", .value = .{ .int = @intCast(rb) } }, .{ .name = "ROWS", .value = .{ .int = r } }, defer_t } }),
+            .finish = try ks.buildConfig(.{ .grid = .{ (self.shape.out / 128) * 32, @intCast(rows), 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{&[_]c_int{ r, OUT }}, .out_dtypes = &.{self.shape.out_dtype}, .template = &.{ .{ .name = "DIM", .value = .{ .int = OUT } }, out_t, .{ .name = "KS", .value = .{ .int = ksv } }, .{ .name = "ROWS", .value = .{ .int = r } }, .{ .name = "INBLK", .value = .{ .int = @intCast(self.shape.in / 128) } }, defer_t } }),
         };
     }
 
@@ -332,13 +378,18 @@ pub const Dense = struct {
     pub fn linear(self: *Dense, s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, rows: usize) !mlx.mlx_array {
         if (rows <= decode.Kernels.max_rows) {
             const c = try self.cfgs(rows);
+            if (!self.rowslot) {
+                var po: [2]mlx.mlx_array = undefined;
+                try ks.applyConfig(self.prep_s, c.prep, &.{ x, suh }, &po, s);
+                defer for (po) |a| {
+                    _ = mlx.mlx_array_free(a);
+                };
+                const z = try one(self.dgemv, c.gemv, &.{ po[0], trellis }, s);
+                defer _ = mlx.mlx_array_free(z);
+                return one(self.dfinish, c.finish, &.{ z, svh, po[1] }, s);
+            }
             const xp = try one(self.prep, c.prep, &.{ x, suh }, s);
             defer _ = mlx.mlx_array_free(xp);
-            if (!self.rowslot) {
-                const z = try one(self.dgemv, c.gemv, &.{ xp, trellis }, s);
-                defer _ = mlx.mlx_array_free(z);
-                return one(self.dfinish, c.finish, &.{ z, svh }, s);
-            }
             // every row-slot is row r of expert 0: a zero slot per row
             var slots = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(slots);
