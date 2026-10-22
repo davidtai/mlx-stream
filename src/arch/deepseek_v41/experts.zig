@@ -1959,6 +1959,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 if (comptime @hasDecl(S, "holdBase")) if (defer_base) self.source.releaseHeld();
             }
             tp = wide_profile.now();
+            // P7 overlap (a source with `planWide`): every group of the call planned now, its reads posted as their rows
+            // free up; the routes below activate the planned groups in this order. The stock schedule plans nothing here.
+            if (comptime @hasDecl(S, "planWide")) try self.source.planWide(layer, groups.d, @intCast(sa));
             for (0..@min(depth, n_groups)) |gi| calls[gi % depth] = try self.source.route(layer, groups.of(gi), &.{});
             wide_profile.charge(.route, tp);
             for (0..n_groups) |gi| {
@@ -2177,7 +2180,7 @@ fn testConfig(hidden: u32, inter: u32, n_layers: u8) v41.Config {
 test "dsv41 experts: the fake and the stream adapter are expert sources" {
     comptime assertSource(StreamSource);
     comptime assertSource(FakeSource);
-    try testing.expectEqual(@as(usize, expert_stream.max_wide_depth + 1), StreamSource.n_routes);
+    try testing.expectEqual(@as(usize, expert_stream.route_capacity), StreamSource.n_routes);
 }
 
 test "dsv41 experts: a decode call runs the residents, then each part's gate/up after waitGu and its down after waitDown" {
@@ -4435,8 +4438,9 @@ test "dsv41 experts: wide depth 5 (the served default): five groups live, the re
     const k = 6;
     var ids: [n * k]u16 = undefined;
     for (&ids, 0..) |*e, i| e.* = @intCast(((i % k) * 40 + i / k) % 240);
-    const depth = expert_stream.max_wide_depth;
-    try testing.expectEqual(@as(u8, 5), depth);
+    // The served default (the stream takes up to `max_wide_depth`, 8 since the transient stage).
+    const depth: u8 = 5;
+    try testing.expect(depth <= expert_stream.max_wide_depth);
     const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 1024 }, .wide_depth = depth, .transient_rows = depth * max_route_ids });
     defer s.deinit();
     StreamRec.stream = s;

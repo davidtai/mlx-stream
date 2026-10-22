@@ -118,6 +118,10 @@ pub const RouteOverrides = struct {
     engram_posted: ?bool = null,
     /// The DIG-X prefill waves' fused down GEMM (the down GEMM and rot_widen1 in one launch; null / false: stock).
     prefill_fused_down: ?bool = null,
+    /// The compressed layers' attention core as one fused launch (q3_ph_flash_cmp; null / false: the three-kernel chain).
+    prefill_attn_fused: ?bool = null,
+    /// The compressed layers' attention chain on bf16 operand fragments (null / false: f32 fragments).
+    prefill_attn_bf16mma: ?bool = null,
     /// The verify-row routes (C23 softmax, C27 select, C28 smallm, C29 mxfp8 rows).
     decode_attn_softmax: ?bool = null,
     decode_index_topk: ?bool = null,
@@ -767,6 +771,12 @@ pub const Module = struct {
             if (v and !tier.routes.prefill_attn) return error.PrefillOprojNeedsPrefillAttn;
             tier.routes.prefill_oproj = v;
         }
+        if (config.prefill_attn_fused) |v| tier.routes.prefill_attn_fused = v;
+        if (ov.prefill_attn_fused) |v| tier.routes.prefill_attn_fused = v;
+        if (tier.routes.prefill_attn_fused and !tier.routes.prefill_attn) return error.PrefillAttnFusedNeedsPrefillAttn;
+        if (config.prefill_attn_bf16mma) |v| tier.routes.prefill_attn_bf16mma = v;
+        if (ov.prefill_attn_bf16mma) |v| tier.routes.prefill_attn_bf16mma = v;
+        if (tier.routes.prefill_attn_bf16mma and !tier.routes.prefill_attn) return error.PrefillAttnBf16MmaNeedsPrefillAttn;
         // kv16-opt route switches (model settings, construction only; default: the tier's route, on).
         if (config.kv16_oproj_bf16) |v| tier.routes.prefill_oproj_bf16 = v;
         if (config.kv16_hcpost) |v| tier.routes.prefill_hcpost = v;
@@ -797,7 +807,7 @@ pub const Module = struct {
             self.model.engram.?.posted = true;
         }
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .grow_fill = t.arm.stream.grow_fill, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .hoist_first = t.arm.hook.hoistFirst(), .devroute = t.arm.hook.devRoute() },
+            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prompt_overlap = t.arm.stream.prompt_reads == .overlap, .prompt_stage = t.arm.stream.stage_transient, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .prefill_attn_fused = self.model.tier.routes.prefill_attn_fused, .prefill_attn_bf16mma = self.model.tier.routes.prefill_attn_bf16mma, .transient_release = t.arm.stream.release_installed, .grow_fill = t.arm.stream.grow_fill, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .hoist_first = t.arm.hook.hoistFirst(), .devroute = t.arm.hook.devRoute() },
         };
         // DEVROUTE: exact by construction (the same banked texts per routed pair, the slots the host's plan names; the join
         // takes the miss parts' rows for their pairs).
@@ -1570,7 +1580,7 @@ pub const Module = struct {
         const ahead = switch (self.arm) {
             inline else => |t| t.arm.hook.wide_route.read_ahead,
         };
-        if (ahead) log.info("NATIVE prefill read-ahead: {d} records posted, {d} hits at the barriers, {d} seed records on demand, {d} B read ahead\n", .{ d.ahead_posted, d.ahead_hits, d.ahead_demand, d.ahead_bytes });
+        if (ahead) log.info("NATIVE prefill read-ahead: {d} records posted, {d} hits at the barriers, {d} seed records on demand, {d} B read ahead, {d} staged in the transient windows\n", .{ d.ahead_posted, d.ahead_hits, d.ahead_demand, d.ahead_bytes, d.staged });
     }
 
     /// Positions a request's bounded lanes hold: its reservation (else the prompt plus the shell's
@@ -1918,6 +1928,12 @@ const VmMark = struct {
 
 /// The prefill routes a module installed (read back from the trunk's tier and the arm's hook and stream).
 pub const Installed = struct {
+    /// P7: the prompt pass's read schedule (`expert_prompt_overlap`): every group planned at the call's start and the
+    /// read-ahead posted beside the attention (true), or the stock schedule (false).
+    prompt_overlap: bool = false,
+    /// P7 transient staging (`expert_prompt_stage`): the predicted records no persistent row takes staged into the first
+    /// wide windows during the attention (true), or not (false).
+    prompt_stage: bool = false,
     layer_major: bool = false,
     wide: xp.Wide = .{},
     stream_windows: u8 = 1,
@@ -1927,6 +1943,10 @@ pub const Installed = struct {
     prefill_unjoined: bool = false,
     /// The DIG-X waves launch the fused down GEMM (installed, past its self-checks).
     prefill_fused_down: bool = false,
+    /// The compressed layers' attention core is the fused launch (q3_ph_flash_cmp).
+    prefill_attn_fused: bool = false,
+    /// The compressed layers' attention chain runs on bf16 operand fragments.
+    prefill_attn_bf16mma: bool = false,
     /// The phase change's transient release (installed in the stream at construction).
     transient_release: bool = false,
     /// The decode read-ahead's speculative records per layer call (the stream's selector; 0 = none).
@@ -1993,13 +2013,13 @@ pub const Installed = struct {
     }
 
     pub fn callSites(self: Installed, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}, unjoined waves {}, engram posted {}, deferred base calls {}, hc post {}, fused down {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows, self.prefill_unjoined, self.engram_posted, self.wide.defer_base, self.prefill_hc_post, self.prefill_fused_down }) catch buf[0..0];
+        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}, unjoined waves {}, engram posted {}, deferred base calls {}, hc post {}, fused down {}, attention fused {}, attention bf16 mma {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows, self.prefill_unjoined, self.engram_posted, self.wide.defer_base, self.prefill_hc_post, self.prefill_fused_down, self.prefill_attn_fused, self.prefill_attn_bf16mma }) catch buf[0..0];
     }
 
     /// The construction log line the gates assert.
     pub fn line(self: Installed, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "NATIVE prefill routes installed: prefill layer-major {}, wide feed {}, wide depth {d}, stream windows {d}, cold rows {d}, seed {}, hot-first {}", .{
-            self.layer_major, self.wide.seed and self.wide.hot_first, self.wide.depth, self.stream_windows, self.wide.cold_rows, self.wide.seed, self.wide.hot_first,
+        return std.fmt.bufPrint(buf, "NATIVE prefill routes installed: prefill layer-major {}, wide feed {}, wide depth {d}, stream windows {d}, cold rows {d}, seed {}, hot-first {}, prompt overlap {}, prompt stage {}", .{
+            self.layer_major, self.wide.seed and self.wide.hot_first, self.wide.depth, self.stream_windows, self.wide.cold_rows, self.wide.seed, self.wide.hot_first, self.prompt_overlap, self.prompt_stage,
         }) catch buf[0..0];
     }
 };
@@ -2260,6 +2280,13 @@ pub fn armOptions(config: *const settings.Config, ceiling: expert_admission.Ceil
         .wide_depth = config.dsv41WideDepth(),
         // Off by default (ratio 0: no tally, as before it existed); on only where the model's settings ask for it.
         .tally = if (config.tally.enabled()) .{ .ratio = config.tally.ratio, .window = config.tally.window } else null,
+        // P7 overlap (`expert_prompt_overlap`, off by default: the stock schedule is the control): every group of a wide
+        // call planned at its start, the read-ahead posted whole beside the attention and trimmed at the plans.
+        .prompt_reads = if (config.dsv41PromptOverlap()) .overlap else .stock,
+        .prompt_ahead = if (config.dsv41PromptOverlap()) .whole_trim else .head,
+        .stage_transient = config.dsv41PromptStage(),
+        // The deferred base holds each group's base-bank rows to the call's end: the overlap plans must not evict them.
+        .plan_holds_call = config.dsv41PromptOverlap() and config.dsv41WideDeferBase(),
     };
 }
 
@@ -3531,11 +3558,11 @@ test "dsv41 module: the envelope admission (the old rule) admits today's 154 dec
 test "dsv41 module: the installed-routes line reads the routes as built, on and off (the gates' assert can fail)" {
     var buf: [192]u8 = undefined;
     const on: Installed = .{ .layer_major = true, .wide = .{ .seed = true, .hot_first = true, .depth = 2 }, .stream_windows = 2 };
-    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed true, wide depth 2, stream windows 2, cold rows 0, seed true, hot-first true", on.line(&buf));
+    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed true, wide depth 2, stream windows 2, cold rows 0, seed true, hot-first true, prompt overlap false, prompt stage false", on.line(&buf));
     const seed_only: Installed = .{ .layer_major = true, .wide = .{ .seed = true, .depth = 2 }, .stream_windows = 2 };
-    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed false, wide depth 2, stream windows 2, cold rows 0, seed true, hot-first false", seed_only.line(&buf));
+    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed false, wide depth 2, stream windows 2, cold rows 0, seed true, hot-first false, prompt overlap false, prompt stage false", seed_only.line(&buf));
     const off: Installed = .{};
-    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major false, wide feed false, wide depth 1, stream windows 1, cold rows 0, seed false, hot-first false", off.line(&buf));
+    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major false, wide feed false, wide depth 1, stream windows 1, cold rows 0, seed false, hot-first false, prompt overlap false, prompt stage false", off.line(&buf));
 }
 
 test "dsv41 module: the fill's decode granule is a row unless set; the records are the Module's to derive" {

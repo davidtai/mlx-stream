@@ -1153,6 +1153,9 @@ const CellReceipt = struct {
     prefill_hc_post: ?bool = null,
     /// The DIG-X waves' fused down GEMM, as installed (read back from the Module).
     prefill_fused_down: ?bool = null,
+    /// The compressed layers' fused attention core, as installed (read back from the Module).
+    prefill_attn_fused: ?bool = null,
+    prefill_attn_bf16mma: ?bool = null,
     /// The decode read-ahead's speculative records per layer call, as installed (read back from the Module).
     lookahead_budget: ?u32 = null,
     /// (v9) ENGRAM=prefetch and the wide call's deferred base-bank rows, as installed (read back from the Module).
@@ -1640,6 +1643,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .embedding_rows = md.installed.embedding_rows,
         .prefill_hc_post = md.installed.prefill_hc_post,
         .prefill_fused_down = md.installed.prefill_fused_down,
+        .prefill_attn_fused = md.installed.prefill_attn_fused,
+        .prefill_attn_bf16mma = md.installed.prefill_attn_bf16mma,
         .lookahead_budget = md.installed.lookahead_budget,
         .engram_posted = md.installed.engram_posted,
         .deferred_base = md.installed.wide.defer_base,
@@ -1767,11 +1772,15 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_PREFILL_JOINLESS")) |v| ov.prefill_joinless = try cellBool("DSV41_CELL_PREFILL_JOINLESS", v);
     if (envStr("DSV41_CELL_PREFILL_HC_POST")) |v| ov.prefill_hc_post = try cellBool("DSV41_CELL_PREFILL_HC_POST", v);
     if (envStr("DSV41_CELL_PREFILL_FUSED_DOWN")) |v| ov.prefill_fused_down = try cellBool("DSV41_CELL_PREFILL_FUSED_DOWN", v);
+    if (envStr("DSV41_CELL_PREFILL_ATTN_FUSED")) |v| ov.prefill_attn_fused = try cellBool("DSV41_CELL_PREFILL_ATTN_FUSED", v);
+    if (envStr("DSV41_CELL_PREFILL_ATTN_BF16MMA")) |v| ov.prefill_attn_bf16mma = try cellBool("DSV41_CELL_PREFILL_ATTN_BF16MMA", v);
     if (envStr("DSV41_CELL_ENGRAM_POSTED")) |v| ov.engram_posted = try cellBool("DSV41_CELL_ENGRAM_POSTED", v);
     if (envStr("DSV41_CELL_WIDE_DEFER_BASE")) |v| config.expert_wide_defer_base = try cellBool("DSV41_CELL_WIDE_DEFER_BASE", v);
     if (envStr("DSV41_CELL_WIDE_READ_AHEAD")) |v| config.expert_wide_read_ahead = try cellBool("DSV41_CELL_WIDE_READ_AHEAD", v);
     if (envStr("DSV41_CELL_WIDE_BASE_AT_SEED")) |v| config.expert_wide_base_at_seed = try cellBool("DSV41_CELL_WIDE_BASE_AT_SEED", v);
     if (envStr("DSV41_CELL_WIDE_SEED_ALIGNED")) |v| config.expert_wide_seed_aligned = try cellBool("DSV41_CELL_WIDE_SEED_ALIGNED", v);
+    if (envStr("DSV41_CELL_PROMPT_OVERLAP")) |v| config.expert_prompt_overlap = try cellBool("DSV41_CELL_PROMPT_OVERLAP", v);
+    if (envStr("DSV41_CELL_PROMPT_STAGE")) |v| config.expert_prompt_stage = try cellBool("DSV41_CELL_PROMPT_STAGE", v);
     if (envStr("DSV41_CELL_EMBEDDING_ROWS")) |v| config.embedding_host_rows = try cellBool("DSV41_CELL_EMBEDDING_ROWS", v);
     if (envStr("DSV41_CELL_DECODE_ATTN_SOFTMAX")) |v| ov.decode_attn_softmax = try cellBool("DSV41_CELL_DECODE_ATTN_SOFTMAX", v);
     if (envStr("DSV41_CELL_DECODE_INDEX_TOPK")) |v| ov.decode_index_topk = try cellBool("DSV41_CELL_DECODE_INDEX_TOPK", v);
@@ -3549,8 +3558,8 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     }.f;
     var total: u64 = 0;
     for (probe.ns[0..probe.n]) |x| total += x;
-    std.debug.print("\nPREFILL_PROFILE {{\"prompt_tokens\": {d}, \"probed_wall_s\": {d:.3}, \"stage_sum_s\": {d:.3}, \"chunks\": {d}, \"read_bytes\": {d}, \"read_busy_s\": {d:.3}, \"misses\": {d}, \"routed_read_busy_s\": {d:.3}}}\n", .{
-        inputs.prompt.len, wall_s, secs(total), probe.layers_done / probe.n_layers, d.expert_bytes_read, secs(d.read_wall_ns), d.expert_cache_misses, secs(probe.read_wall_ns),
+    std.debug.print("\nPREFILL_PROFILE {{\"prompt_tokens\": {d}, \"probed_wall_s\": {d:.3}, \"stage_sum_s\": {d:.3}, \"chunks\": {d}, \"read_bytes\": {d}, \"read_busy_s\": {d:.3}, \"misses\": {d}, \"routed_read_busy_s\": {d:.3}, \"ahead_posted\": {d}, \"staged\": {d}, \"staged_adopted\": {d}}}\n", .{
+        inputs.prompt.len, wall_s, secs(total), probe.layers_done / probe.n_layers, d.expert_bytes_read, secs(d.read_wall_ns), d.expert_cache_misses, secs(probe.read_wall_ns), d.ahead_posted, d.staged, d.staged_adopted,
     });
     for (probe.names[0..probe.n], probe.ns[0..probe.n]) |name, ns| std.debug.print("PREFILL_PROFILE_STAGE {{\"stage\": \"{s}\", \"s\": {d:.3}, \"share\": {d:.4}}}\n", .{ name, secs(ns), @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
     // Per stage, MLX's high-water mark above the pass's start (the constructed residents): which stage sets the transient.

@@ -40,6 +40,8 @@ pub const Plan = struct {
     /// Non-resident experts, in admission order.
     misses: [max_route_ids]u16 = undefined,
     n_loads: u32 = 0,
+    /// P7 transient staging: misses that took the staged row already holding their record (`PlanOpts.staged`).
+    n_adopted: u32 = 0,
     /// Persistent loads in admission order, then transient loads.
     loads: [max_route_ids]Load = undefined,
     /// The persistent loads: `loads[0..n_persistent]`.
@@ -128,7 +130,16 @@ pub const LayerPolicy = struct {
     /// never victims, and its transient loads take rows from `transient_base`.
     /// `held` is a prefill plan's: a decode plan takes none (the stream's phase
     /// change leaves decode one window and no held base).
-    pub const PlanOpts = struct { transient_base: u32 = 0, held: []const u32 = &.{} };
+    /// `adopt` (P7 transient staging): the call's transient rows, shared by every group's plan, each row's last claiming
+    /// group (`owner[t]`, `no_owner` none) and the staged record it still holds (`staged_of_row[t]`, `no_expert` none;
+    /// `slot_of[e]` its inverse). A row is free for group g when no group claimed it or its owner is `depth` or more
+    /// groups back (released before g routes, the stock schedule's own order). A miss whose staged row is free takes it,
+    /// whichever window it lies in; the others take the lowest free row of their window, else the lowest free row of the
+    /// scratch (at most depth - 1 other groups are live, each owning at most `width` rows: one is always free). A claim
+    /// over another staged record forgets that record's row.
+    pub const Adopt = struct { slot_of: []u32, owner: []u8, staged_of_row: []u16, width: u32, depth: u8 };
+    pub const no_owner: u8 = std.math.maxInt(u8);
+    pub const PlanOpts = struct { transient_base: u32 = 0, held: []const u32 = &.{}, adopt: ?*const Adopt = null, group: u8 = 0 };
 
     pub fn init(a: std.mem.Allocator, n_experts: u32, capacity: u32) !LayerPolicy {
         if (n_experts == 0 or n_experts >= no_expert or capacity > n_experts) return error.InvalidCapacity;
@@ -577,7 +588,53 @@ pub const LayerPolicy = struct {
             },
         }
         out.n_persistent = out.n_loads;
-        for (transient_buf[0..n_transient], 0..) |e, k| {
+        if (opts.adopt) |ad| {
+            const g = opts.group;
+            const Claim = struct {
+                fn free(a: *const Adopt, grp: u8, t: u32) bool {
+                    const o = a.owner[t];
+                    return o == no_owner or @as(u32, o) + @as(u32, a.depth) <= @as(u32, grp);
+                }
+                fn take(a: *const Adopt, grp: u8, t: u32, e: u16) void {
+                    const was = a.staged_of_row[t];
+                    if (was != no_expert and was != e) {
+                        a.slot_of[was] = no_slot;
+                        a.staged_of_row[t] = no_expert;
+                    }
+                    a.owner[t] = grp;
+                }
+            };
+            // Staged rows first: a miss whose staged row is free keeps it, whichever window it lies in.
+            var row_of: [max_route_ids]u32 = undefined;
+            for (transient_buf[0..n_transient], 0..) |e, k| {
+                row_of[k] = no_slot;
+                const t = ad.slot_of[e];
+                if (t == no_slot or !Claim.free(ad, g, t)) continue;
+                Claim.take(ad, g, t, e);
+                row_of[k] = t;
+                out.n_adopted += 1;
+            }
+            // The rest: the lowest free row of this window, else of the scratch.
+            const win_end: u32 = opts.transient_base + ad.width;
+            var next: u32 = opts.transient_base;
+            for (transient_buf[0..n_transient], 0..) |e, k| {
+                var t = row_of[k];
+                if (t == no_slot) {
+                    while (next < win_end and !Claim.free(ad, g, next)) next += 1;
+                    if (next < win_end) {
+                        t = next;
+                    } else {
+                        var any: u32 = 0;
+                        while (any < ad.owner.len and !Claim.free(ad, g, any)) any += 1;
+                        std.debug.assert(any < ad.owner.len);
+                        t = any;
+                    }
+                    Claim.take(ad, g, t, e);
+                }
+                out.loads[out.n_loads] = .{ .expert = e, .slot = p.capacity + t, .persistent = false };
+                out.n_loads += 1;
+            }
+        } else for (transient_buf[0..n_transient], 0..) |e, k| {
             out.loads[out.n_loads] = .{ .expert = e, .slot = p.capacity + opts.transient_base + @as(u32, @intCast(k)), .persistent = false };
             out.n_loads += 1;
         }
@@ -832,4 +889,41 @@ pub fn boundedParts(offsets: []const u64, lengths: []const u64, per_part: u32, e
         start = end;
     }
     return ends[0..n_parts];
+}
+
+test "expert policy: adoption takes a staged row in any window, frees a row a depth later, falls back to any free row" {
+    const a = std.testing.allocator;
+    var p = try LayerPolicy.init(a, 16, 0); // no persistent rows: every miss is transient
+    defer p.deinit(a);
+    const width: u32 = 2;
+    const depth: u8 = 2;
+    var slot_of: [16]u32 = @splat(no_slot);
+    var owner: [4]u8 = @splat(LayerPolicy.no_owner);
+    var staged_of_row: [4]u16 = @splat(no_expert);
+    slot_of[5] = 2; // expert 5 staged in window 1's first row
+    staged_of_row[2] = 5;
+    const ad: LayerPolicy.Adopt = .{ .slot_of = &slot_of, .owner = &owner, .staged_of_row = &staged_of_row, .width = width, .depth = depth };
+    var plan: Plan = undefined;
+    // Group 0 (window 0): 5 adopts its row in the other window; 6 takes window 0's first free row.
+    p.planWith(&.{ 5, 6 }, .prefill, &plan, .{ .transient_base = 0, .adopt = &ad, .group = 0 });
+    try std.testing.expectEqual(@as(u32, 1), plan.n_adopted);
+    try std.testing.expectEqual(@as(u32, 2), plan.loads[0].slot);
+    try std.testing.expectEqual(@as(u32, 0), plan.loads[1].slot);
+    // Group 1 (window 1): row 2 is live (group 0), so 7 takes row 3; the window is out, 8 takes the scratch's free row 1.
+    p.planWith(&.{ 7, 8 }, .prefill, &plan, .{ .transient_base = 2, .adopt = &ad, .group = 1 });
+    try std.testing.expectEqual(@as(u32, 0), plan.n_adopted);
+    try std.testing.expectEqual(@as(u32, 3), plan.loads[0].slot);
+    try std.testing.expectEqual(@as(u32, 1), plan.loads[1].slot);
+    // Group 2 (window 0 again): group 0's rows are free, group 1's are not: 9 takes row 0, 10 falls back to row 2 and
+    // overwrites the staged record of 5, which forgets its row.
+    p.planWith(&.{ 9, 10 }, .prefill, &plan, .{ .transient_base = 0, .adopt = &ad, .group = 2 });
+    try std.testing.expectEqual(@as(u32, 0), plan.loads[0].slot);
+    try std.testing.expectEqual(@as(u32, 2), plan.loads[1].slot);
+    try std.testing.expectEqual(no_slot, slot_of[5]);
+    try std.testing.expectEqual(no_expert, staged_of_row[2]);
+    try std.testing.expectEqual(@as(u8, 2), owner[0]);
+    try std.testing.expectEqual(@as(u8, 1), owner[1]);
+    try std.testing.expectEqual(@as(u8, 2), owner[2]);
+    try std.testing.expectEqual(@as(u8, 1), owner[3]);
+    for (plan.loads[0..plan.n_loads]) |l| try std.testing.expect(!l.persistent);
 }

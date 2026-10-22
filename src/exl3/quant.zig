@@ -3177,9 +3177,15 @@ test "dsv41 smoke 0b: fused down: the fused down GEMM's words equal the 128-row 
             std.debug.print("fused down self-checks refused: {s}\n", .{kd.message()});
             return e;
         };
+        // one fused self-check per bank K (K = 3 and, since the K = 2 twins, K = 2), each passing
         var fused: usize = 0;
-        for (report.results.items) |r| fused += @intFromBool(r.check == .fused and r.ok and r.bad == 0 and r.words > 0);
-        try testing.expectEqual(@as(usize, 1), fused);
+        var fused_bad: usize = 0;
+        for (report.results.items) |r| if (r.check == .fused) {
+            fused += @intFromBool(r.ok and r.bad == 0 and r.words > 0);
+            fused_bad += @intFromBool(!(r.ok and r.bad == 0 and r.words > 0));
+        };
+        try testing.expect(fused >= 1);
+        try testing.expectEqual(@as(usize, 0), fused_bad);
     }
     // layer 0's first 16 experts, read by the stream into 16 persistent MLX rows (the base bank)
     var bdiag: eb.Diag = .{};

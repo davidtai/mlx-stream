@@ -95,6 +95,15 @@ pub const Options = struct {
     grow_fill: expert_stream.GrowFill = .zeros,
     /// The stream's rate tally (`expert_stream.Options.tally`; null: off).
     tally: ?expert_stream.Tally = null,
+    /// P7: the prompt pass's read schedule (`expert_stream.Options.prompt_reads`; `.stock` is the control) and, under
+    /// `.overlap`, how much of the read-ahead posts beside the attention (`prompt_ahead`). The Module's route.
+    prompt_reads: expert_stream.PromptReads = .stock,
+    prompt_ahead: expert_stream.AheadPost = .head,
+    /// P7 transient staging (`expert_stream.Options.stage_transient`; needs `.overlap`).
+    stage_transient: bool = false,
+    /// P7 overlap: the plans hold every earlier group's persistent rows (`expert_stream.Options.plan_holds_call`; the
+    /// deferred base keeps them pinned to the call's end).
+    plan_holds_call: bool = false,
     /// The draft head's resident bytes for the admission: null charges the
     /// envelope's own head, 0 the full DSpark head (the binding sets it for a
     /// DSpark decode); a `draft_subset` sets it to the subset's pruned bytes.
@@ -297,6 +306,10 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
                 .transient_release = opt.transient_release,
                 .grow_fill = opt.grow_fill,
                 .tally = opt.tally,
+                .prompt_reads = opt.prompt_reads,
+                .prompt_ahead = opt.prompt_ahead,
+                .stage_transient = opt.stage_transient,
+                .plan_holds_call = opt.plan_holds_call,
                 .read_ahead_probe = if (comptime expert_stream.read_ahead_probed) .{ .barrier = prefill_timers.readAheadBarrier, .admission = prefill_timers.readAheadAdmission, .posted = prefill_timers.readAheadPosted } else {},
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
             errdefer self.stream.deinit();

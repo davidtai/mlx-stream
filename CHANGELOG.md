@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- DeepSeek-V4.1: the prompt pass's attention chain on bf16 operand fragments, a model setting (`prefill_attn_bf16mma`, off by
+  default). Twins of the compressed layers' QK and PV texts (`q3_ph_qkrope_cmp_bf16mma`, `q3_ph_pvrope_cmp_bf16mma`) keep the
+  chain's tile schedule and launches but hand the tensor ops bf16 fragments (f32 accumulation; the softmax's ex rounded to
+  bf16 in the PV load): the path the GPU runs at its bf16 rate (62 TFLOPS measured on an M5 Max) instead of the f32-fragment
+  path (42). Not bit-identical to the chain (max |diff| 1.8e-4 on outputs of 9e-2 in the GPU parity test, which times it as
+  BF16MMA_TIMING); the cell harness takes `DSV41_CELL_PREFILL_ATTN_BF16MMA`; the call-sites line names it ("attention bf16 mma").
+- DeepSeek-V4.1: the fused attention core for the prompt pass's compressed layers, a model setting (`prefill_attn_fused`,
+  off by default: the three-kernel chain is the control). One Metal kernel (`q3_ph_flash_cmp`) per query row and 16-head
+  block replaces QK, the ATTN_FUSE softmax and PV: each simdgroup keeps its query quarter in bf16 fragments, gathers its
+  quarter of a 32-key chunk of the row's selected keys once and uses it for the partial scores and as the values; the
+  scores stay in the threadgroup (an online softmax with the sink as the first key, the probabilities in bf16). The keys
+  are read once instead of twice and the f32 scores never round-trip memory. Not bit-identical to the chain (another
+  summation order, bf16 probabilities): max |diff| 1.8e-4 on outputs of 9e-2 in the GPU parity test (`DSV41_KERNELS_GPU=1`,
+  "dsv41 kernels flash gpu", which also times both). `PrefillAttn.fuse` takes it for the ropefuse compressed core on the
+  bf16 stream only; `scripts/dsv41_flash_manifest.py` registers the text; the cell harness takes
+  `DSV41_CELL_PREFILL_ATTN_FUSED`; the installed call-sites line names it ("attention fused").
+- DeepSeek-V4.1: the prompt pass's P7 overlap read schedule, a model setting (`expert_prompt_overlap`, off by default: the
+  stock schedule is the control). On, the wide executor hands each layer's hot-ordered call to the stream before its
+  first group route (`StreamSource.planWide`): every group is planned at once with the stock plans' slots and windows
+  (the shared `Stream.planCall`, which now takes the executor's seed-aligned split), the read-ahead posts whole beside
+  the attention and is trimmed at the plans (`whole_trim`), and each group's reads go out as soon as its rows are free;
+  the routes then activate the planned groups in order (`activateP7`), MiMo's and GLM5-next's schedule. Exact: the same
+  records land in the same rows before any kernel reads them. The shared stream's route ring grows from 6 to 10 so a
+  384-expert layer's 8 groups (10 with the seed split) can all be planned; the cell harness takes
+  `DSV41_CELL_PROMPT_OVERLAP`.
 - Expert stream, every arch: P1's read-ahead takes rows when none is empty. `LayerPolicy.admitReadAhead` (and
   `admitReadAheadHeld`, the stream's call with the live routes' slots held) replaces the coldest residents the
   prediction left out, never a protected, pinned or held one, so a server whose prompt rows a usage-profile seed or

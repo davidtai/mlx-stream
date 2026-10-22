@@ -89,6 +89,9 @@ pub const kernels = [_]Kernel{
     .q3_ph_pvrope_win__kvf32,
     .q3_ph_pvrope_cmp,
     .q3_ph_pvrope_cmp__kvbf16,
+    .q3_ph_flash_cmp,
+    .q3_ph_qkrope_cmp_bf16mma,
+    .q3_ph_pvrope_cmp_bf16mma,
     .q3pf_hc_mix_rsqrt,
     .q3pf_hc_pre_norm,
     .q3pf_hc_mix_rsqrt__f32,
@@ -1014,11 +1017,16 @@ pub fn PrefillAttn(comptime G: type) type {
         pub const max_kc = 512;
         kind: CoreKind,
         cmp: bool,
+        q_dt: Dtype,
+        ring_dt: Dtype,
         qk: *const Entry,
         pv: *const Entry,
         s32: *const Entry,
         s128: *const Entry,
         statics: Statics(G),
+        /// The fused core (`fuse`): one launch per call in place of QK, softmax and PV, with its own static scale.
+        flash: ?*const Entry = null,
+        flash_statics: Statics(G) = .{},
 
         /// `q` the query dtype (bf16 on the tier), `ring` the window store's dtype, `cmp` a
         /// compressed layer (its store f32). A dtype set the lane does not warm is refused
@@ -1035,11 +1043,34 @@ pub fn PrefillAttn(comptime G: type) type {
             const qk = instantiation(reg, qb, q, ring) orelse return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: {t} has no instantiation at q {t}, window store {t}", .{ qb, q, ring });
             const pv = instantiation(reg, pb, q, ring) orelse return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: {t} has no instantiation at window store {t}", .{ pb, ring });
             const s32 = reg.get(.q3_attnfuse_softmax);
-            return .{ .kind = kind, .cmp = cmp, .qk = qk, .pv = pv, .s32 = s32, .s128 = reg.get(.q3_attnfuse_softmax__ls128), .statics = try Statics(G).init(g, s32) };
+            return .{ .kind = kind, .cmp = cmp, .q_dt = q, .ring_dt = ring, .qk = qk, .pv = pv, .s32 = s32, .s128 = reg.get(.q3_attnfuse_softmax__ls128), .statics = try Statics(G).init(g, s32) };
+        }
+
+        /// The fused attention core (`q3_ph_flash_cmp`): the row's keys read once, the scores kept in the
+        /// threadgroup. Registered for the ropefuse compressed core on the bf16 stream only; another kind,
+        /// a window-only layer or another dtype set is refused (TemplateNotRegistered) and the route keeps
+        /// its three launches.
+        pub fn fuse(self: *Self, g: *G, reg: *const xk.Registry, diag: ?*xk.Diag) !void {
+            if (self.kind != .rope or !self.cmp) return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: q3_ph_flash_cmp fuses the ropefuse compressed core only", .{});
+            const e = instantiation(reg, .q3_ph_flash_cmp, self.q_dt, self.ring_dt) orelse return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: q3_ph_flash_cmp has no instantiation at q {t}, window store {t}", .{ self.q_dt, self.ring_dt });
+            self.flash_statics = try Statics(G).init(g, e);
+            self.flash = e;
+        }
+
+        /// The chain on bf16 operand fragments (`q3_ph_qkrope_cmp_bf16mma`, `q3_ph_pvrope_cmp_bf16mma`): the same
+        /// three launches, the QK and PV tensor ops on bf16 fragments (f32 accumulation; ex rounded to bf16).
+        /// Registered for the ropefuse compressed core on the bf16 stream only (TemplateNotRegistered otherwise).
+        pub fn bf16Mma(self: *Self, reg: *const xk.Registry, diag: ?*xk.Diag) !void {
+            if (self.kind != .rope or !self.cmp) return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: the bf16-fragment chain is the ropefuse compressed core only", .{});
+            const qk = instantiation(reg, .q3_ph_qkrope_cmp_bf16mma, self.q_dt, self.ring_dt) orelse return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: q3_ph_qkrope_cmp_bf16mma has no instantiation at q {t}, window store {t}", .{ self.q_dt, self.ring_dt });
+            const pv = instantiation(reg, .q3_ph_pvrope_cmp_bf16mma, self.q_dt, self.ring_dt) orelse return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: q3_ph_pvrope_cmp_bf16mma has no instantiation at window store {t}", .{self.ring_dt});
+            self.qk = qk;
+            self.pv = pv;
         }
 
         pub fn deinit(self: *Self, g: *G) void {
             self.statics.deinit(g);
+            self.flash_statics.deinit(g);
         }
 
         /// q [1, S, 64, 512] (UN-roped for rope), win [1, T, 512] (the window store), widx int32 /
@@ -1079,9 +1110,16 @@ pub fn PrefillAttn(comptime G: type) type {
                 kv[n_kv] = x;
                 n_kv += 1;
             };
-            var ins: [9]G.T = undefined; // q | ex, denom; then the kv operands
+            var ins: [10]G.T = undefined; // q | ex, denom; then the kv operands (fused: q, kv, sink, scale)
             ins[0] = q;
             @memcpy(ins[1 .. 1 + n_kv], kv[0..n_kv]);
+            if (self.flash) |fe| {
+                ins[1 + n_kv] = sink;
+                ins[2 + n_kv] = self.flash_statics.arrays[2 + n_kv];
+                var fo: [1]G.T = undefined;
+                try launchRule(G, g, fe, &vars, ins[0 .. 3 + n_kv], &fo);
+                return fo[0];
+            }
             var sv: [2]G.T = undefined;
             try launchRule(G, g, self.qk, &vars, ins[0 .. 1 + n_kv], &sv);
             var soft_vars: Vars = .initFill(0);
@@ -1629,6 +1667,62 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
         defer pr.deinit(&t);
         try testing.expectEqual(Kernel.q3_ph_qkrope_cmp__kvbf16, pr.qk.kernel);
         try testing.expectEqual(Kernel.q3_ph_pvrope_cmp__kvbf16, pr.pv.kernel);
+        // the fused core: the corevec and the window-only routes refuse it; the ropefuse compressed bf16 route
+        // takes it and attends in ONE launch (q, the kv operands, the rope, the sink, its registered scale)
+        try testing.expectError(error.TemplateNotRegistered, pa.fuse(&t, &reg, null));
+        {
+            var pw = try PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, .bfloat16, .bfloat16, false, null);
+            defer pw.deinit(&t);
+            try testing.expectError(error.TemplateNotRegistered, pw.fuse(&t, &reg, null));
+        }
+        // the bf16-fragment chain: refused off the ropefuse compressed route; on it the same three launches
+        try testing.expectError(error.TemplateNotRegistered, pa.bf16Mma(&reg, null));
+        {
+            var pm = try PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, .bfloat16, .bfloat16, true, null);
+            defer pm.deinit(&t);
+            try pm.bf16Mma(&reg, null);
+            try testing.expectEqual(Kernel.q3_ph_qkrope_cmp_bf16mma, pm.qk.kernel);
+            try testing.expectEqual(Kernel.q3_ph_pvrope_cmp_bf16mma, pm.pv.kernel);
+            const s = &pm.qk.samples[0];
+            const n_s: c_int = @intCast(s.vars.get(.rows));
+            const kc: c_int = @intCast(s.vars.get(.kc));
+            const q = try t.node(&.{ 1, n_s, 64, 512 }, .bfloat16, &.{});
+            const win = try t.node(&.{ 1, @intCast(s.vars.get(.ring)), 512 }, .bfloat16, &.{});
+            const ckv = try t.node(&.{ 1, @intCast(s.vars.get(.store)), 512 }, .bfloat16, &.{});
+            const cidx = try t.node(&.{ 1, n_s, kc }, .int32, &.{});
+            const qc = try t.node(&.{ n_s, 32 }, .float32, &.{});
+            const n_launch = t.launches.items.len;
+            _ = try pm.attend(&t, q, win, try t.node(&.{ n_s, 128 }, .int32, &.{}), try t.node(&.{ n_s, 128 }, .bool_, &.{}), .{ ckv, cidx }, sink, .{ qc, qc });
+            try testing.expectEqual(n_launch + 3, t.launches.items.len);
+            try testing.expectEqual(Kernel.q3_ph_qkrope_cmp_bf16mma, t.back(3).k);
+            try testing.expectEqual(Kernel.q3_ph_pvrope_cmp_bf16mma, t.back(1).k);
+        }
+        try pr.fuse(&t, &reg, null);
+        const fe = pr.flash.?;
+        try testing.expectEqual(Kernel.q3_ph_flash_cmp, fe.kernel);
+        try testing.expect(fe.samples.len > 0);
+        for (fe.samples) |*s| {
+            const n_s: c_int = @intCast(s.vars.get(.rows));
+            const kc: c_int = @intCast(s.vars.get(.kc));
+            const q = try t.node(&.{ 1, n_s, 64, 512 }, .bfloat16, &.{});
+            const win = try t.node(&.{ 1, @intCast(s.vars.get(.ring)), 512 }, .bfloat16, &.{});
+            const widx = try t.node(&.{ n_s, 128 }, .int32, &.{});
+            const wval = try t.node(&.{ n_s, 128 }, .bool_, &.{});
+            const ckv = try t.node(&.{ 1, @intCast(s.vars.get(.store)), 512 }, .bfloat16, &.{});
+            const cidx = try t.node(&.{ 1, n_s, kc }, .int32, &.{});
+            const qc = try t.node(&.{ n_s, 32 }, .float32, &.{});
+            const qs = try t.node(&.{ n_s, 32 }, .float32, &.{});
+            const n_launch = t.launches.items.len;
+            const o = try pr.attend(&t, q, win, widx, wval, .{ ckv, cidx }, sink, .{ qc, qs });
+            try testing.expectEqual(n_launch + 1, t.launches.items.len);
+            const l = t.back(1);
+            try testing.expect(!l.prepared);
+            try testing.expectEqual(o, l.outs[0]);
+            try testing.expectEqualSlices(c_int, &.{ 8, n_s, 4096 }, t.shapeOf(o).slice());
+            try expectLaunch(l, fe, s, &.{ q, win, l.inputs[2], l.inputs[3], ckv, cidx, qc, qs, sink, pr.flash_statics.arrays[9] });
+            try testing.expectEqual(widx, t.root(l.inputs[2]));
+            try testing.expectEqual([3]u32{ 512, 1, @intCast(n_s) }, l.cfg.grid); // 4 head blocks x 128 threads per row
+        }
     }
     try testing.expectError(error.TemplateNotRegistered, PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, .float16, .float32, false, null));
     {
@@ -1760,4 +1854,217 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
     };
     try testing.expectEqual(@as(isize, 0), t.keeps);
     try testing.expectEqual(@as(isize, 0), t.prepared_live);
+}
+
+// GPU only: DSV41_KERNELS_GPU=1. The fused core against the QK -> softmax -> PV chain on random inputs at the
+// served tier's dtypes (a tolerance: the online softmax sums in another order), then both timed at prompt rows
+// (FLASH_TIMING lines: us per row, and the implied seconds per 16K prompt over 40 layers).
+test "dsv41 kernels flash gpu: q3_ph_flash_cmp attends as the chain does, within tolerance; both timed" {
+    _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    const ops = @import("ops.zig");
+    const G = ops.MlxOps;
+    const a = testing.allocator;
+    const io = testing.io;
+    mlx.installErrorHandler();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var kd: xk.Diag = .{};
+    const set = ks.Set.init(a, .{ .device = .{ .stream = s } }, &kd) catch |e| {
+        std.debug.print("kernel set refused: {s}\n", .{kd.message()});
+        return e;
+    };
+    defer set.deinit();
+    set.install(G, &g);
+    const reg = &set.reg;
+    var st: u64 = 0x5EED_F1A5;
+    const Rnd = struct {
+        fn u(state: *u64) f32 {
+            return @as(f32, @floatFromInt(xk.splitmix64(state) >> 40)) / 16777216.0;
+        }
+        fn bf16(gg: *G, al: Allocator, state: *u64, shape: []const c_int, scale: f32) !G.T {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const b = try al.alloc(u8, n * 2);
+            defer al.free(b);
+            for (0..n) |i| std.mem.writeInt(u16, b[2 * i ..][0..2], ops.bf16Bits((u(state) + u(state) - 1.0) * scale), .little);
+            return gg.hostArray(b, shape, .bfloat16);
+        }
+        fn f32s(gg: *G, al: Allocator, shape: []const c_int, vals: []const f32) !G.T {
+            const b = try al.alloc(u8, vals.len * 4);
+            defer al.free(b);
+            for (vals, 0..) |v, i| std.mem.writeInt(u32, b[4 * i ..][0..4], @bitCast(v), .little);
+            return gg.hostArray(b, shape, .float32);
+        }
+        fn i32s(gg: *G, al: Allocator, shape: []const c_int, vals: []const i32) !G.T {
+            const b = try al.alloc(u8, vals.len * 4);
+            defer al.free(b);
+            for (vals, 0..) |v, i| std.mem.writeInt(i32, b[4 * i ..][0..4], v, .little);
+            return gg.hostArray(b, shape, .int32);
+        }
+    };
+    const Case = struct { rows: u32, timed: bool };
+    for ([_]Case{ .{ .rows = 33, .timed = false }, .{ .rows = 512, .timed = true } }) |cs| {
+        const rows = cs.rows;
+        const ring: u32 = rows + 161;
+        const store: u32 = 4096;
+        const kc: u32 = 476;
+        const mk0 = g.mark();
+        defer g.resetTo(mk0);
+        var r = try PrefillAttn(G).init(&g, reg, &.derived, .rope, .bfloat16, .bfloat16, true, &kd);
+        defer r.deinit(&g);
+        const q = try Rnd.bf16(&g, a, &st, &.{ 1, @intCast(rows), 64, 512 }, 1.0);
+        const win = try Rnd.bf16(&g, a, &st, &.{ 1, @intCast(ring), 512 }, 1.0);
+        const ckv = try Rnd.bf16(&g, a, &st, &.{ 1, @intCast(store), 512 }, 1.0);
+        // the window selection: 128 ring rows per query, ~10% invalid; the compressed selection: kc store rows, ~5% none
+        const widx_v = try a.alloc(i32, rows * 128);
+        defer a.free(widx_v);
+        const wval_b = try a.alloc(u8, rows * 128);
+        defer a.free(wval_b);
+        for (widx_v, wval_b) |*x, *v| {
+            x.* = @intCast(@as(u64, @intFromFloat(Rnd.u(&st) * @as(f32, @floatFromInt(ring)))) % ring);
+            v.* = @intFromBool(Rnd.u(&st) < 0.9);
+        }
+        const widx = try Rnd.i32s(&g, a, &.{ @intCast(rows), 128 }, widx_v);
+        const wval = try g.hostArray(wval_b, &.{ @intCast(rows), 128 }, .bool_);
+        const cidx_v = try a.alloc(i32, rows * kc);
+        defer a.free(cidx_v);
+        for (cidx_v) |*x| x.* = if (Rnd.u(&st) < 0.95) @intCast(@as(u64, @intFromFloat(Rnd.u(&st) * @as(f32, @floatFromInt(store)))) % store) else -1;
+        const cidx = try Rnd.i32s(&g, a, &.{ 1, @intCast(rows), @intCast(kc) }, cidx_v);
+        const cos_v = try a.alloc(f32, rows * 32);
+        defer a.free(cos_v);
+        const sin_v = try a.alloc(f32, rows * 32);
+        defer a.free(sin_v);
+        for (cos_v, sin_v) |*c, *sn| {
+            const ang = Rnd.u(&st) * 6.2831853;
+            c.* = @cos(ang);
+            sn.* = @sin(ang);
+        }
+        const qc = try Rnd.f32s(&g, a, &.{ @intCast(rows), 32 }, cos_v);
+        const qs = try Rnd.f32s(&g, a, &.{ @intCast(rows), 32 }, sin_v);
+        var sink_v: [64]f32 = undefined;
+        for (&sink_v) |*x| x.* = (Rnd.u(&st) - 0.5) * 4.0;
+        const sink = try Rnd.f32s(&g, a, &.{ 1, 1, 64, 1 }, &sink_v);
+        // the chain, then the fused core
+        const o1 = try r.attend(&g, q, win, widx, wval, .{ ckv, cidx }, sink, .{ qc, qs });
+        try g.evalAll(&.{o1});
+        r.fuse(&g, reg, &kd) catch |e| {
+            std.debug.print("fuse refused: {s}\n", .{kd.message()});
+            return e;
+        };
+        const o2 = try r.attend(&g, q, win, widx, wval, .{ ckv, cidx }, sink, .{ qc, qs });
+        g.evalAll(&.{o2}) catch |e| {
+            var buf: [512]u8 = undefined;
+            std.debug.print("fused launch failed: {s}\n", .{mlx.takeError(&buf) orelse ""});
+            return e;
+        };
+        const n: usize = 8 * rows * 4096;
+        const h1 = try a.alloc(f32, n);
+        defer a.free(h1);
+        const h2 = try a.alloc(f32, n);
+        defer a.free(h2);
+        _ = try g.hostF32(o1, h1);
+        _ = try g.hostF32(o2, h2);
+        var max_abs: f32 = 0;
+        var max_ref: f32 = 0;
+        var nan: usize = 0;
+        var sum_abs: f64 = 0;
+        for (h1, h2) |x, y| {
+            if (std.math.isNan(y) or std.math.isInf(y)) nan += 1;
+            max_ref = @max(max_ref, @abs(x));
+            const d = @abs(x - y);
+            max_abs = @max(max_abs, d);
+            sum_abs += d;
+        }
+        std.debug.print("FLASH_PARITY {{\"rows\": {d}, \"max_abs\": {e:.3}, \"mean_abs\": {e:.3}, \"max_ref\": {e:.3}, \"bad\": {d}}}\n", .{ rows, max_abs, sum_abs / @as(f64, @floatFromInt(n)), max_ref, nan });
+        // where the error lives: per head block (32), per o-dim quarter (128), the rope dims (>= 448) apart, per row
+        {
+            var by_hb: [2]f32 = .{ 0, 0 };
+            var by_dq: [4]f32 = .{ 0, 0, 0, 0 };
+            var rope_max: f32 = 0;
+            var plain_max: f32 = 0;
+            var by_row_first: [4]f32 = .{ 0, 0, 0, 0 };
+            var by_head: [64]f32 = @splat(0);
+            for (0..64) |h| for (0..rows) |z| for (0..512) |d| {
+                const idx = ((h / 8) * rows + z) * 4096 + (h % 8) * 512 + d;
+                const e = @abs(h1[idx] - h2[idx]);
+                by_hb[h / 32] = @max(by_hb[h / 32], e);
+                by_dq[d / 128] = @max(by_dq[d / 128], e);
+                by_head[h] = @max(by_head[h], e);
+                if (d >= 448) rope_max = @max(rope_max, e) else plain_max = @max(plain_max, e);
+                if (z < 4) by_row_first[z] = @max(by_row_first[z], e);
+            };
+            std.debug.print("FLASH_PARITY_WHERE {{\"by_head_block\": [{e:.2}, {e:.2}], \"by_dim_quarter\": [{e:.2}, {e:.2}, {e:.2}, {e:.2}], \"rope_dims\": {e:.2}, \"plain_dims\": {e:.2}, \"rows0_3\": [{e:.2}, {e:.2}, {e:.2}, {e:.2}]}}\n", .{ by_hb[0], by_hb[1], by_dq[0], by_dq[1], by_dq[2], by_dq[3], rope_max, plain_max, by_row_first[0], by_row_first[1], by_row_first[2], by_row_first[3] });
+            std.debug.print("FLASH_PARITY_HEADS [", .{});
+            for (by_head, 0..) |e, h| std.debug.print("{s}{e:.1}", .{ if (h == 0) "" else ", ", e });
+            std.debug.print("]\n", .{});
+        }
+        try testing.expectEqual(@as(usize, 0), nan);
+        try testing.expect(max_abs <= 2e-3 * @max(max_ref, 1.0));
+        const fe_keep = r.flash;
+        // the bf16-fragment chain against the f32-fragment chain
+        {
+            r.flash = null;
+            const qk0 = r.qk;
+            const pv0 = r.pv;
+            try r.bf16Mma(reg, &kd);
+            const o3 = try r.attend(&g, q, win, widx, wval, .{ ckv, cidx }, sink, .{ qc, qs });
+            g.evalAll(&.{o3}) catch |e| {
+                var buf: [512]u8 = undefined;
+                std.debug.print("bf16mma launch failed: {s}\n", .{mlx.takeError(&buf) orelse ""});
+                return e;
+            };
+            const h3 = try a.alloc(f32, n);
+            defer a.free(h3);
+            _ = try g.hostF32(o3, h3);
+            var mx3: f32 = 0;
+            var bad3: usize = 0;
+            for (h1, h3) |x, y| {
+                if (std.math.isNan(y) or std.math.isInf(y)) bad3 += 1;
+                mx3 = @max(mx3, @abs(x - y));
+            }
+            std.debug.print("BF16MMA_PARITY {{\"rows\": {d}, \"max_abs\": {e:.3}, \"max_ref\": {e:.3}, \"bad\": {d}}}\n", .{ rows, mx3, max_ref, bad3 });
+            try testing.expectEqual(@as(usize, 0), bad3);
+            try testing.expect(mx3 <= 2e-3 * @max(max_ref, 1.0));
+            if (cs.timed) {
+                var best: u64 = std.math.maxInt(u64);
+                for (0..4) |run| {
+                    const mk = g.mark();
+                    defer g.resetTo(mk);
+                    var outs: [4]G.T = undefined;
+                    const t0 = std.Io.Timestamp.now(io, .boot);
+                    for (&outs) |*o| o.* = try r.attend(&g, q, win, widx, wval, .{ ckv, cidx }, sink, .{ qc, qs });
+                    try g.evalAll(&outs);
+                    const ns: u64 = @intCast(t0.untilNow(io, .boot).nanoseconds);
+                    if (run > 0) best = @min(best, ns);
+                }
+                const per_row_s = @as(f64, @floatFromInt(best)) / 4.0 / @as(f64, @floatFromInt(rows)) / 1e9;
+                std.debug.print("BF16MMA_TIMING {{\"rows\": {d}, \"us_per_row\": {d:.2}, \"s_per_16k_x40\": {d:.2}}}\n", .{ rows, per_row_s * 1e6, per_row_s * 16384.0 * 40.0 });
+            }
+            r.qk = qk0;
+            r.pv = pv0;
+            r.flash = fe_keep;
+        }
+        if (cs.timed) {
+            const fe = r.flash;
+            for ([_]bool{ false, true }) |fused| {
+                r.flash = if (fused) fe else null;
+                var best: u64 = std.math.maxInt(u64);
+                for (0..4) |run| {
+                    const mk = g.mark();
+                    defer g.resetTo(mk);
+                    var outs: [4]G.T = undefined;
+                    const t0 = std.Io.Timestamp.now(io, .boot);
+                    for (&outs) |*o| o.* = try r.attend(&g, q, win, widx, wval, .{ ckv, cidx }, sink, .{ qc, qs });
+                    try g.evalAll(&outs);
+                    const ns: u64 = @intCast(t0.untilNow(io, .boot).nanoseconds);
+                    if (run > 0) best = @min(best, ns);
+                }
+                const per_row_s = @as(f64, @floatFromInt(best)) / 4.0 / @as(f64, @floatFromInt(rows)) / 1e9;
+                std.debug.print("FLASH_TIMING {{\"fused\": {}, \"rows\": {d}, \"us_per_row\": {d:.2}, \"s_per_16k_x40\": {d:.2}}}\n", .{ fused, rows, per_row_s * 1e6, per_row_s * 16384.0 * 40.0 });
+            }
+            r.flash = fe;
+        }
+    }
 }

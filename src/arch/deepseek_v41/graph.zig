@@ -141,6 +141,10 @@ pub const Routes = struct {
     /// roped in the QK load and o handed on inverse-roped in the o-LoRA group layout (no gathered
     /// KVg, no eager core); one route per (query dtype, window-store dtype, compressed) kind.
     prefill_attn: bool = false,
+    /// The compressed layers' attention core as one fused launch (`PrefillAttn.fuse`, q3_ph_flash_cmp).
+    prefill_attn_fused: bool = false,
+    /// The compressed layers' attention chain on bf16 operand fragments (`PrefillAttn.bf16Mma`).
+    prefill_attn_bf16mma: bool = false,
     /// The prefill indexer (ATTNHALF idxscore + INDEX_TOPK select): at rows above
     /// `attn_compile_max_rows` an index source's reach-masked scores in one launch and its top
     /// `index_topk` as ascending indices and the mask in one more (no eager einsum / relu / sum,
@@ -517,6 +521,8 @@ pub fn Trunk(comptime G: type) type {
                         if (k.prefill_attn[kind] == null) {
                             const dt: ops.Dtype = .bfloat16;
                             k.prefill_attn[kind] = try kr.PrefillAttn(G).init(g, reg, &geo, .rope, dt, dt, kind == 2, null);
+                            if (rt.prefill_attn_fused and kind == 2) try k.prefill_attn[kind].?.fuse(g, reg, null);
+                            if (rt.prefill_attn_bf16mma and kind == 2) try k.prefill_attn[kind].?.bf16Mma(reg, null);
                         }
                     }
                 }
