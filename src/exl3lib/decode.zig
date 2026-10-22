@@ -1205,10 +1205,19 @@ pub const Kernels3 = struct {
         inline for (.{ self.prep, self.gu, self.fin, self.down, self.dfin }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
     }
 
+    /// K slices for a row count: the ceiling at one row, halved at 2-3 rows, quartered from 4 rows (the row-slots fill
+    /// the GPU by themselves and every slice adds a plane of f32 partial sums to write and read back).
+    fn slicesFor(ks_max: u32, rows: usize) u32 {
+        const div: u32 = if (rows == 1) 1 else if (rows <= 3) 2 else 4;
+        return @max(1, ks_max / div);
+    }
+
     fn cfgs(self: *Kernels3, rows: usize) !Cfg {
         if (rows == 0 or rows > Kernels.max_rows) return error.BadExl3Shape;
         if (self.cfg[rows]) |c| return c;
         const g = self.geo;
+        const ks_gu_r = slicesFor(self.ks_gu, rows);
+        const ks_dn_r = slicesFor(self.ks_dn, rows);
         const rk: u32 = @as(u32, @intCast(rows)) * g.topk;
         const rkc: c_int = @intCast(rk);
         const H: c_int = @intCast(g.hidden);
@@ -1220,15 +1229,15 @@ pub const Kernels3 = struct {
         const inter_t = ks.TemplateArg{ .name = "INTER", .value = .{ .int = I } };
         const rkt = ks.TemplateArg{ .name = "RKC", .value = .{ .int = rkc } };
         const topk = ks.TemplateArg{ .name = "TOPK", .value = .{ .int = @intCast(g.topk) } };
-        const ks_gu_t = ks.TemplateArg{ .name = "KS", .value = .{ .int = @intCast(self.ks_gu) } };
-        const ks_dn_t = ks.TemplateArg{ .name = "KS", .value = .{ .int = @intCast(self.ks_dn) } };
+        const ks_gu_t = ks.TemplateArg{ .name = "KS", .value = .{ .int = @intCast(ks_gu_r) } };
+        const ks_dn_t = ks.TemplateArg{ .name = "KS", .value = .{ .int = @intCast(ks_dn_r) } };
         const bt_t = ks.TemplateArg{ .name = "BT", .value = .{ .int = @intCast(self.bt) } };
         const bw: u32 = 16 * self.bt;
         const c: Cfg = .{
             .prep_h = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 32, rk, 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{ &[_]c_int{ rkc, H }, &[_]c_int{ rkc, H } }, .out_dtypes = &.{ .float16, .float16 }, .template = &.{ .{ .name = "DIM", .value = .{ .int = H } }, topk } }),
-            .gu = try ks.buildConfig(.{ .grid = .{ (g.inter / bw) * 128, rk, self.ks_gu }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{ &[_]c_int{ @intCast(self.ks_gu), rkc, I }, &[_]c_int{ @intCast(self.ks_gu), rkc, I } }, .out_dtypes = &.{ .float32, .float32 }, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_gu_t, bt_t } }),
+            .gu = try ks.buildConfig(.{ .grid = .{ (g.inter / bw) * 128, rk, ks_gu_r }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{ &[_]c_int{ @intCast(ks_gu_r), rkc, I }, &[_]c_int{ @intCast(ks_gu_r), rkc, I } }, .out_dtypes = &.{ .float32, .float32 }, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_gu_t, bt_t } }),
             .fin = try ks.buildConfig(.{ .grid = .{ (g.inter / 128) * 128, rk, 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, I }}, .out_dtypes = &.{.float16}, .template = &.{ inter_t, rkt, ks_gu_t } }),
-            .down = try ks.buildConfig(.{ .grid = .{ (g.hidden / bw) * 128, rk, self.ks_dn }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(self.ks_dn), rkc, H }}, .out_dtypes = &.{.float32}, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_dn_t, bt_t } }),
+            .down = try ks.buildConfig(.{ .grid = .{ (g.hidden / bw) * 128, rk, ks_dn_r }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(ks_dn_r), rkc, H }}, .out_dtypes = &.{.float32}, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_dn_t, bt_t } }),
             .dfin = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 128, @intCast(rows), 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(rows), H }}, .out_dtypes = &.{.float32}, .template = &.{ hid, topk, rkt, ks_dn_t } }),
         };
         self.cfg[rows] = c;
