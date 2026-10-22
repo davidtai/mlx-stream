@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- exl3lib (M1 of the EXL3 fused GEMM library, `src/exl3lib/`): the EXL3 trellis format reference and the pack contract,
+  API-compatible with Sushi's `sushi_exl3` module so a host switches engines by import. `format.zig` (ported from Sushi's
+  reference decoder, MIT) decodes every admitted rate (even n in [16, 128]: K1..K8, fractional included), both codebooks
+  (MUL1, MCG) and every codeword window (8..16): rates, window ends, the funnel `unpackTile` checked against a bit-by-bit
+  definition at every n and against exllamav3's packer (`packSymbols`) at K1..K8, the tensor-core permutation, H128, suh/svh,
+  and the scalar `project` every kernel is held to (Sushi's MUL1 pins 49896 / 14625 / 47511). `spec.zig` parses `expert_quant`
+  (`k` integer or fractional, `codebook`, `window`) with Sushi's error names, `admitTopK`, `trellisAdmitted`,
+  `DECODE_ROWS_MAX` (16), `usesPrefillArm`. `root.zig` exports `Spec`, `Bank{gate,up,down: Proj}`, `moe`, `moeWithShared`,
+  `moeClamped` with the loader's shape and dtype refusals; the GPU chains refuse `Exl3EngineNotImplemented` until M2 (decode)
+  and M3 (prefill). 24 hermetic tests (`zig test src/exl3lib/{format,spec}.zig`; the host step with `-Dtest-filter=exl3lib`).
 - DeepSeek-V4.1: the prompt pass's attention chain on bf16 operand fragments, a model setting (`prefill_attn_bf16mma`, off by
   default). Twins of the compressed layers' QK and PV texts (`q3_ph_qkrope_cmp_bf16mma`, `q3_ph_pvrope_cmp_bf16mma`) keep the
   chain's tile schedule and launches but hand the tensor ops bf16 fragments (f32 accumulation; the softmax's ex rounded to
