@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- tools/qwen38: `fetch_exl3_trunk.py` (turboderp's non-expert tensors by HTTP byte range), `restack_exl3_full.py` (the fully EXL3
+  Qwen3.8-Flash-Next pack for mlx-serve: hard-linked experts and n-gram table, trunk trellises under host names, conv1d layout,
+  f16 -> bf16 plain tensors, the MTP mixer carried from the hybrid pack) and `qwen_smoke_step.sh` (boot + one greedy request in a
+  guarded window).
 - exl3lib dense linear (`src/exl3lib/dense.zig`, `root.linear`): one trellis [in/16, out/16, n] with suh/svh as a dense
   projection at exllamav3's rounding points, for a fully EXL3 trunk (attention, indexer, GDN, shared expert, lm_head, MTP).
   Decode rows (<= 16) run prepare (lane order), the single-expert trellis GEMV and finish (output in x's dtype); wider calls

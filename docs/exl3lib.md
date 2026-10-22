@@ -143,6 +143,9 @@ A pack whose trunk is EXL3 too (turboderp's as published) carries, beside `exper
   [rows, 1 + row_dim*k/16]: an f16 scale word then row_dim k-bit symbols; state_i stacks the symbols of i, i-1, i-2) with the
   per-hash-head bias tensor `...ple.ple_embedding.head_bias` F16 [heads, row_dim] in the trunk shards. The
   host's n-gram table reader decodes rows on the CPU (mul1 codebook) and adds the bias of the row's head (rows are head-minor).
+- Layout differences from the HF-style source the restack resolves: conv1d weights are stored MLX-style [C, K, 1] (PyTorch's
+  [C, 1, K] has the same bytes, so only the shape changes); plain f16 tensors become bf16 (lossless for bf16-origin values);
+  the MTP hyper-connection mixer, which turboderp's pack lacks, is carried from the hybrid pack (affine 8-bit).
 - Expert shards and the table are hard links of the source files; `restack_exl3_full.py` on the box builds the pack from the
   hybrid pack (experts, tokenizer, vision) and a fetched trunk directory (`fetch_exl3_trunk.py`: the non-expert tensors by
   HTTP byte range).
