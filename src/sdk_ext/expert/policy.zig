@@ -128,7 +128,9 @@ pub const LayerPolicy = struct {
     /// never victims, and its transient loads take rows from `transient_base`.
     /// `held` is a prefill plan's: a decode plan takes none (the stream's phase
     /// change leaves decode one window and no held base).
-    pub const PlanOpts = struct { transient_base: u32 = 0, held: []const u32 = &.{} };
+    /// `staged` (P7 transient staging): per transient row of the plan's window, the expert a staged read holds there (or
+    /// `no_expert`); a miss the window already holds takes that row, the others the lowest rows left.
+    pub const PlanOpts = struct { transient_base: u32 = 0, held: []const u32 = &.{}, staged: ?*const [max_route_ids]u16 = null };
 
     pub fn init(a: std.mem.Allocator, n_experts: u32, capacity: u32) !LayerPolicy {
         if (n_experts == 0 or n_experts >= no_expert or capacity > n_experts) return error.InvalidCapacity;
@@ -577,7 +579,30 @@ pub const LayerPolicy = struct {
             },
         }
         out.n_persistent = out.n_loads;
-        for (transient_buf[0..n_transient], 0..) |e, k| {
+        if (opts.staged) |st| {
+            // Staged rows first: a miss the window holds keeps its row; the rest take the lowest rows no staged miss keeps.
+            var taken: [max_route_ids]bool = @splat(false);
+            var row_of: [max_route_ids]u32 = undefined;
+            for (transient_buf[0..n_transient], 0..) |e, k| {
+                row_of[k] = no_slot;
+                for (st, 0..) |se, t| if (se == e and !taken[t]) {
+                    taken[t] = true;
+                    row_of[k] = @intCast(t);
+                    break;
+                };
+            }
+            var next: u32 = 0;
+            for (transient_buf[0..n_transient], 0..) |e, k| {
+                var t = row_of[k];
+                if (t == no_slot) {
+                    while (taken[next]) next += 1;
+                    t = next;
+                    taken[next] = true;
+                }
+                out.loads[out.n_loads] = .{ .expert = e, .slot = p.capacity + opts.transient_base + t, .persistent = false };
+                out.n_loads += 1;
+            }
+        } else for (transient_buf[0..n_transient], 0..) |e, k| {
             out.loads[out.n_loads] = .{ .expert = e, .slot = p.capacity + opts.transient_base + @as(u32, @intCast(k)), .persistent = false };
             out.n_loads += 1;
         }

@@ -487,6 +487,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// record and reads nothing: the record is read once, not twice. Needs `overlap` and one slot geometry (every
             /// layer's rows interchangeable with the transient rows); off (the control): every such record is read again.
             prompt_relocate: bool = false,
+            /// P7 `overlap` transient staging (dsv41/prompt-stage): the read-ahead's predicted records that found no persistent
+            /// row (every row protected, as a usage-seeded fill leaves them) are read into the first `wide_depth` transient
+            /// windows during the layer's attention, in rank order; the call's plans adopt a staged row that holds the group's
+            /// expert (`PlanOpts.staged`) and overwrite the rest after their reads land. Needs `overlap`. Exact: a plan's row
+            /// holds its record before any kernel reads it either way; only when the read runs changes.
+            stage_transient: bool = false,
             /// The rate tally (`expert.tally`, `LayerPolicy.setTally`) on every layer: null, off.
             tally: ?Tally = null,
         };
@@ -765,6 +771,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             ahead_cap: ?u32 = null,
             /// P7 overlap relocation (`Options.prompt_relocate`), fixed at construction.
             prompt_relocate: bool = false,
+            /// P7 overlap transient staging (`Options.stage_transient`), fixed at construction.
+            stage_transient: bool = false,
             /// P7 overlap: the prompt call being scheduled; per row (a layer's persistent slots [0, n_experts), then the
             /// transient rows) the record its plans leave and its last reader; per persistent slot the read-ahead job
             /// writing it (`no_job`: none). Empty under `stock`.
@@ -959,6 +967,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 // P7 overlap: a job is a bit of a part's blockers (u64), groups index the route ring.
                 if (opt.prompt_reads == .overlap and ahead_parts.len > 64) return error.InvalidOptions;
                 if (opt.prompt_ahead != .head and opt.prompt_reads != .overlap) return error.InvalidOptions;
+                if (opt.stage_transient and opt.prompt_reads != .overlap) return error.InvalidOptions;
                 // Relocation copies a layer's persistent row into a transient row: one geometry, rows interchangeable.
                 if (opt.prompt_relocate) {
                     if (opt.prompt_reads != .overlap or alt_layer != null) return error.InvalidOptions;
@@ -966,7 +975,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
                 const p7_rows: []P7Row = if (opt.prompt_reads == .overlap) try a.alloc(P7Row, bank.n_experts + opt.transient_rows) else &.{};
                 errdefer if (p7_rows.len > 0) a.free(p7_rows);
-                const ahead_job: []u8 = if (opt.prompt_reads == .overlap) try a.alloc(u8, bank.n_experts) else &.{};
+                // Indexed by `p7Index`: the persistent slots, then the transient rows (a staged record's job).
+                const ahead_job: []u8 = if (opt.prompt_reads == .overlap) try a.alloc(u8, bank.n_experts + opt.transient_rows) else &.{};
                 errdefer if (ahead_job.len > 0) a.free(ahead_job);
                 @memset(ahead_job, no_job);
                 const pool = try expert_io.Pool.start(a, pool_opt);
@@ -1009,6 +1019,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .prompt_ahead = opt.prompt_ahead,
                     .ahead_cap = opt.ahead_cap,
                     .prompt_relocate = opt.prompt_relocate,
+                    .stage_transient = opt.stage_transient,
                     .p7_rows = p7_rows,
                     .ahead_job = ahead_job,
                 };
@@ -1890,7 +1901,26 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     for (top) |e| blocked += @intFromBool(pol.slotOf(e) == null);
                     pr.admission(layer, top, @intCast(admitted.len), blocked);
                 };
-                const n: u32 = @intCast(admitted.len);
+                var n: u32 = @intCast(admitted.len);
+                // Transient staging: the predicted records no persistent row took, into the first `wide_depth` windows in rank
+                // order (window 0's rows first), while no route is live (the previous call released every window). Bounded
+                // by the ticket ring like the persistent admissions.
+                if (self.stage_transient and self.n_free == route_capacity and self.held_base.items.len == 0 and !self.p7.live) {
+                    const pol = &self.layers[layer].policy;
+                    const cap = pol.capacity;
+                    const room: u32 = @min(@as(u32, self.wide_depth) * self.max_route_ids, self.transient.rows);
+                    var t: u32 = 0;
+                    for (experts) |e| {
+                        if (n >= fit or t >= room) break;
+                        if (e >= pol.n_experts or pol.expert_to_slot[e] != expert_policy.no_slot) continue;
+                        const m = self.locate(layer, cap + t).meta;
+                        if (m.pins != 0 or m.state == .loading) break;
+                        ah.loads[n] = .{ .expert = e, .slot = cap + t };
+                        n += 1;
+                        t += 1;
+                    }
+                    self.counters.staged += t;
+                }
                 ah.* = .{ .layer = layer, .n = n, .loads = ah.loads, .reads = ah.reads, .parts = ah.parts, .landed = ah.landed };
                 if (n == 0) return;
                 const now: u32 = switch (self.prompt_reads) {
@@ -1907,7 +1937,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         .whole, .whole_trim => n,
                     },
                 };
-                for (admitted, ah.reads[0..n]) |l, *rd| {
+                for (ah.loads[0..n], ah.reads[0..n]) |l, *rd| {
                     const m = self.locate(layer, l.slot).meta;
                     if (m.pins != 0 or m.state == .loading) return self.fail(error.SlotStillPinned);
                     rd.* = !(m.state == .ready and m.layer == layer and m.expert == l.expert);
@@ -1934,7 +1964,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     var nr: u32 = 0;
                     var posted: u32 = 0;
                     for (ah.loads[start..end], ah.reads[start..end]) |l, rd| {
-                        if (self.ahead_job.len > 0) self.ahead_job[l.slot] = @intCast(ah.n_parts);
+                        if (self.ahead_job.len > 0) self.ahead_job[self.p7Index(layer, l.slot)] = @intCast(ah.n_parts);
                         if (!rd) continue;
                         nr = self.entries(layer, l.slot, l.expert, &rows, &gu, &down, nr);
                         posted += 1;
@@ -1992,7 +2022,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     };
                     for (ah.loads[p.first..][0..p.n], ah.reads[p.first..][0..p.n]) |l, rd| if (rd) {
                         self.locate(ah.layer, l.slot).meta.state = if (ok) .ready else .failed;
-                        if (!ok) policy.invalidate(l.expert);
+                        // A staged (transient) record is no resident: nothing for the policy to forget.
+                        if (!ok and l.slot < policy.capacity) policy.invalidate(l.expert);
                     };
                     if (!ok) failure = if (waited) |_| error.ReadFailed else |e| e;
                 }
@@ -2013,8 +2044,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// (0 otherwise).
             fn aheadJobBit(self: *const Stream, layer: u32, slot: u32) u64 {
                 const ah = &self.ahead;
-                if (!ah.live or ah.layer != layer or slot >= self.layers[layer].policy.capacity) return 0;
-                const j = self.ahead_job[slot];
+                if (!ah.live or ah.layer != layer) return 0;
+                const j = self.ahead_job[self.p7Index(layer, slot)];
                 if (j == no_job or ah.landed[j]) return 0;
                 return @as(u64, 1) << @intCast(j);
             }
@@ -2071,7 +2102,16 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     r.* = .{ .layer = layer, .window = window, .state = .live };
                     p.route[g] = ri;
                     p.window[g] = window;
-                    ls.policy.planWith(self.p7Group(g), .prefill, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held.items });
+                    // Transient staging: the experts the window's rows hold for this layer (a staged read landed or in flight),
+                    // so the plan gives each such expert its staged row instead of the next free one.
+                    var staged: [max_route_ids]u16 = @splat(expert_policy.no_expert);
+                    if (self.stage_transient) for (0..self.max_route_ids) |t| {
+                        const slot = cap + @as(u32, window) * self.max_route_ids + @as(u32, @intCast(t));
+                        const m = self.locate(layer, slot).meta;
+                        const in_flight = m.state == .loading and self.ahead_job[self.p7Index(layer, slot)] != no_job;
+                        if ((m.state == .ready or in_flight) and m.layer == layer) staged[t] = m.expert;
+                    };
+                    ls.policy.planWith(self.p7Group(g), .prefill, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held.items, .staged = if (self.stage_transient) &staged else null });
                     for (r.plan.hitsOf(), r.hit_slots[0..r.plan.n_hits]) |e, *slot| slot.* = ls.policy.slotOf(e).?;
                 }
                 if (self.prompt_ahead == .whole_trim) try self.p7Withdraw(layer);
@@ -2124,7 +2164,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (first == ah.n_parts) return;
                 const from = ah.parts[first].first;
                 // Their rows wait for the plans again: no job writes them (`p7Tail` posts the kept ones anew).
-                for (ah.loads[from..ah.n]) |l| self.ahead_job[l.slot] = no_job;
+                for (ah.loads[from..ah.n]) |l| self.ahead_job[self.p7Index(layer, l.slot)] = no_job;
                 ah.n_parts = first;
                 ah.posted = from;
                 // `ahead_posted` counts records read ahead: the withdrawn reads never ran (`p7Tail` counts the kept again).
@@ -2249,9 +2289,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     if (m.state == .loading and !ra) return self.fail(error.SlotStillPinned);
                     v.* = .{ .layer = m.layer, .expert = m.expert, .ready = m.state == .ready or (m.state == .loading and ra), .reader = -1 };
                 }
-                for (self.p7_rows[n_e..][0..self.transient.rows], self.transient_meta[0..self.transient.rows]) |*v, m| {
-                    if (m.state == .loading) return self.fail(error.SlotStillPinned);
-                    v.* = .{ .layer = m.layer, .expert = m.expert, .ready = m.state == .ready, .reader = -1 };
+                for (self.p7_rows[n_e..][0..self.transient.rows], self.transient_meta[0..self.transient.rows], 0..) |*v, m, t| {
+                    const ra = ra_live and self.ahead_job[n_e + t] != no_job;
+                    if (m.state == .loading and !ra) return self.fail(error.SlotStillPinned);
+                    v.* = .{ .layer = m.layer, .expert = m.expert, .ready = m.state == .ready or (m.state == .loading and ra), .reader = -1 };
                 }
             }
 

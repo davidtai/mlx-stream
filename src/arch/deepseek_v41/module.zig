@@ -797,7 +797,7 @@ pub const Module = struct {
             self.model.engram.?.posted = true;
         }
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prompt_overlap = t.arm.stream.prompt_reads == .overlap, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .grow_fill = t.arm.stream.grow_fill, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .hoist_first = t.arm.hook.hoistFirst(), .devroute = t.arm.hook.devRoute() },
+            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prompt_overlap = t.arm.stream.prompt_reads == .overlap, .prompt_stage = t.arm.stream.stage_transient, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .grow_fill = t.arm.stream.grow_fill, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .hoist_first = t.arm.hook.hoistFirst(), .devroute = t.arm.hook.devRoute() },
         };
         // DEVROUTE: exact by construction (the same banked texts per routed pair, the slots the host's plan names; the join
         // takes the miss parts' rows for their pairs).
@@ -1570,7 +1570,7 @@ pub const Module = struct {
         const ahead = switch (self.arm) {
             inline else => |t| t.arm.hook.wide_route.read_ahead,
         };
-        if (ahead) log.info("NATIVE prefill read-ahead: {d} records posted, {d} hits at the barriers, {d} seed records on demand, {d} B read ahead\n", .{ d.ahead_posted, d.ahead_hits, d.ahead_demand, d.ahead_bytes });
+        if (ahead) log.info("NATIVE prefill read-ahead: {d} records posted, {d} hits at the barriers, {d} seed records on demand, {d} B read ahead, {d} staged in the transient windows\n", .{ d.ahead_posted, d.ahead_hits, d.ahead_demand, d.ahead_bytes, d.staged });
     }
 
     /// Positions a request's bounded lanes hold: its reservation (else the prompt plus the shell's
@@ -1921,6 +1921,9 @@ pub const Installed = struct {
     /// P7: the prompt pass's read schedule (`expert_prompt_overlap`): every group planned at the call's start and the
     /// read-ahead posted beside the attention (true), or the stock schedule (false).
     prompt_overlap: bool = false,
+    /// P7 transient staging (`expert_prompt_stage`): the predicted records no persistent row takes staged into the first
+    /// wide windows during the attention (true), or not (false).
+    prompt_stage: bool = false,
     layer_major: bool = false,
     wide: xp.Wide = .{},
     stream_windows: u8 = 1,
@@ -2001,8 +2004,8 @@ pub const Installed = struct {
 
     /// The construction log line the gates assert.
     pub fn line(self: Installed, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "NATIVE prefill routes installed: prefill layer-major {}, wide feed {}, wide depth {d}, stream windows {d}, cold rows {d}, seed {}, hot-first {}, prompt overlap {}", .{
-            self.layer_major, self.wide.seed and self.wide.hot_first, self.wide.depth, self.stream_windows, self.wide.cold_rows, self.wide.seed, self.wide.hot_first, self.prompt_overlap,
+        return std.fmt.bufPrint(buf, "NATIVE prefill routes installed: prefill layer-major {}, wide feed {}, wide depth {d}, stream windows {d}, cold rows {d}, seed {}, hot-first {}, prompt overlap {}, prompt stage {}", .{
+            self.layer_major, self.wide.seed and self.wide.hot_first, self.wide.depth, self.stream_windows, self.wide.cold_rows, self.wide.seed, self.wide.hot_first, self.prompt_overlap, self.prompt_stage,
         }) catch buf[0..0];
     }
 };
@@ -2267,6 +2270,7 @@ pub fn armOptions(config: *const settings.Config, ceiling: expert_admission.Ceil
         // call planned at its start, the read-ahead posted whole beside the attention and trimmed at the plans.
         .prompt_reads = if (config.dsv41PromptOverlap()) .overlap else .stock,
         .prompt_ahead = if (config.dsv41PromptOverlap()) .whole_trim else .head,
+        .stage_transient = config.dsv41PromptStage(),
     };
 }
 
@@ -3538,11 +3542,11 @@ test "dsv41 module: the envelope admission (the old rule) admits today's 154 dec
 test "dsv41 module: the installed-routes line reads the routes as built, on and off (the gates' assert can fail)" {
     var buf: [192]u8 = undefined;
     const on: Installed = .{ .layer_major = true, .wide = .{ .seed = true, .hot_first = true, .depth = 2 }, .stream_windows = 2 };
-    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed true, wide depth 2, stream windows 2, cold rows 0, seed true, hot-first true, prompt overlap false", on.line(&buf));
+    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed true, wide depth 2, stream windows 2, cold rows 0, seed true, hot-first true, prompt overlap false, prompt stage false", on.line(&buf));
     const seed_only: Installed = .{ .layer_major = true, .wide = .{ .seed = true, .depth = 2 }, .stream_windows = 2 };
-    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed false, wide depth 2, stream windows 2, cold rows 0, seed true, hot-first false, prompt overlap false", seed_only.line(&buf));
+    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed false, wide depth 2, stream windows 2, cold rows 0, seed true, hot-first false, prompt overlap false, prompt stage false", seed_only.line(&buf));
     const off: Installed = .{};
-    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major false, wide feed false, wide depth 1, stream windows 1, cold rows 0, seed false, hot-first false, prompt overlap false", off.line(&buf));
+    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major false, wide feed false, wide depth 1, stream windows 1, cold rows 0, seed false, hot-first false, prompt overlap false, prompt stage false", off.line(&buf));
 }
 
 test "dsv41 module: the fill's decode granule is a row unless set; the records are the Module's to derive" {
