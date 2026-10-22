@@ -781,6 +781,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             stage_transient: bool = false,
             /// P7 overlap: the plans hold every earlier group's persistent rows (`Options.plan_holds_call`).
             plan_holds_call: bool = false,
+            /// Transient staging: the call-wide adoption scratch (`planCall`): a row per expert; per transient row its last
+            /// claiming group and the staged record it holds.
+            adopt_slot_of: []u32 = &.{},
+            adopt_owner: []u8 = &.{},
+            adopt_staged_of_row: []u16 = &.{},
             /// The staged layer's prediction: each expert's rank in it (`no_rank`: not predicted), so the arch's hot order
             /// can group the call as the stage grouped the windows (`predictedRank`).
             pred_rank: []u16 = &.{},
@@ -991,6 +996,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const ahead_job: []u8 = if (opt.prompt_reads == .overlap) try a.alloc(u8, bank.n_experts + opt.transient_rows) else &.{};
                 const pred_rank: []u16 = if (opt.stage_transient) try a.alloc(u16, bank.n_experts) else &.{};
                 errdefer if (pred_rank.len > 0) a.free(pred_rank);
+                const adopt_slot_of: []u32 = if (opt.stage_transient) try a.alloc(u32, bank.n_experts) else &.{};
+                errdefer if (adopt_slot_of.len > 0) a.free(adopt_slot_of);
+                const adopt_owner: []u8 = if (opt.stage_transient) try a.alloc(u8, opt.transient_rows) else &.{};
+                errdefer if (adopt_owner.len > 0) a.free(adopt_owner);
+                const adopt_staged_of_row: []u16 = if (opt.stage_transient) try a.alloc(u16, opt.transient_rows) else &.{};
+                errdefer if (adopt_staged_of_row.len > 0) a.free(adopt_staged_of_row);
                 errdefer if (ahead_job.len > 0) a.free(ahead_job);
                 @memset(ahead_job, no_job);
                 const pool = try expert_io.Pool.start(a, pool_opt);
@@ -1036,6 +1047,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .stage_transient = opt.stage_transient,
                     .plan_holds_call = opt.plan_holds_call,
                     .pred_rank = pred_rank,
+                    .adopt_slot_of = adopt_slot_of,
+                    .adopt_owner = adopt_owner,
+                    .adopt_staged_of_row = adopt_staged_of_row,
                     .p7_rows = p7_rows,
                     .ahead_job = ahead_job,
                 };
@@ -1077,6 +1091,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.p7_rows.len > 0) a.free(self.p7_rows);
                 if (self.ahead_job.len > 0) a.free(self.ahead_job);
                 if (self.pred_rank.len > 0) a.free(self.pred_rank);
+                if (self.adopt_slot_of.len > 0) a.free(self.adopt_slot_of);
+                if (self.adopt_owner.len > 0) a.free(self.adopt_owner);
+                if (self.adopt_staged_of_row.len > 0) a.free(self.adopt_staged_of_row);
                 a.destroy(self);
             }
 
@@ -2116,6 +2133,28 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const ls = &self.layers[layer];
                 const cap = ls.policy.capacity;
                 const depth: u32 = self.wide_depth;
+                // Transient staging: the call's staged rows (a staged read of this layer landed or in flight), shared by
+                // every group's plan (`PlanOpts.adopt`): the row each expert holds, the rows claimed so far, and per
+                // window the rows groups other than its own may claim, the rest kept for its own group's non-residents.
+                var adopt: expert_policy.LayerPolicy.Adopt = .{ .slot_of = &.{}, .owner = &.{}, .staged_of_row = &.{}, .width = self.max_route_ids, .depth = @intCast(depth) };
+                if (self.stage_transient) {
+                    const t_rows: usize = @min(self.transient.rows, @as(u32, depth) * self.max_route_ids);
+                    adopt.slot_of = self.adopt_slot_of;
+                    adopt.owner = self.adopt_owner[0..t_rows];
+                    adopt.staged_of_row = self.adopt_staged_of_row[0..t_rows];
+                    @memset(adopt.slot_of, expert_policy.no_slot);
+                    @memset(adopt.owner, expert_policy.LayerPolicy.no_owner);
+                    @memset(adopt.staged_of_row, expert_policy.no_expert);
+                    for (0..t_rows) |ti| {
+                        const slot = cap + @as(u32, @intCast(ti));
+                        const m = self.locate(layer, slot).meta;
+                        const in_flight = m.state == .loading and self.ahead_job[self.p7Index(layer, slot)] != no_job;
+                        if ((m.state == .ready or in_flight) and m.layer == layer and m.expert < adopt.slot_of.len) {
+                            adopt.slot_of[m.expert] = @intCast(ti);
+                            adopt.staged_of_row[ti] = m.expert;
+                        }
+                    }
+                }
                 for (0..n_groups) |gi| {
                     const g: u32 = @intCast(gi);
                     // The stock schedule routes group g beside groups g - depth + 1 .. g - 1 (`route`): their windows are
@@ -2147,16 +2186,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     r.* = .{ .layer = layer, .window = window, .state = .live };
                     p.route[g] = ri;
                     p.window[g] = window;
-                    // Transient staging: the experts the window's rows hold for this layer (a staged read landed or in flight),
-                    // so the plan gives each such expert its staged row instead of the next free one.
-                    var staged: [max_route_ids]u16 = @splat(expert_policy.no_expert);
-                    if (self.stage_transient) for (0..self.max_route_ids) |t| {
-                        const slot = cap + @as(u32, window) * self.max_route_ids + @as(u32, @intCast(t));
-                        const m = self.locate(layer, slot).meta;
-                        const in_flight = m.state == .loading and self.ahead_job[self.p7Index(layer, slot)] != no_job;
-                        if ((m.state == .ready or in_flight) and m.layer == layer) staged[t] = m.expert;
-                    };
-                    ls.policy.planWith(self.p7Group(g), .prefill, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held.items, .staged = if (self.stage_transient) &staged else null });
+                    ls.policy.planWith(self.p7Group(g), .prefill, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held.items, .adopt = if (self.stage_transient) &adopt else null, .group = @intCast(g) });
                     self.counters.staged_adopted += r.plan.n_adopted;
                     for (r.plan.hitsOf(), r.hit_slots[0..r.plan.n_hits]) |e, *slot| slot.* = ls.policy.slotOf(e).?;
                 }

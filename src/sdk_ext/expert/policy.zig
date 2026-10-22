@@ -130,9 +130,16 @@ pub const LayerPolicy = struct {
     /// never victims, and its transient loads take rows from `transient_base`.
     /// `held` is a prefill plan's: a decode plan takes none (the stream's phase
     /// change leaves decode one window and no held base).
-    /// `staged` (P7 transient staging): per transient row of the plan's window, the expert a staged read holds there (or
-    /// `no_expert`); a miss the window already holds takes that row, the others the lowest rows left.
-    pub const PlanOpts = struct { transient_base: u32 = 0, held: []const u32 = &.{}, staged: ?*const [max_route_ids]u16 = null };
+    /// `adopt` (P7 transient staging): the call's transient rows, shared by every group's plan, each row's last claiming
+    /// group (`owner[t]`, `no_owner` none) and the staged record it still holds (`staged_of_row[t]`, `no_expert` none;
+    /// `slot_of[e]` its inverse). A row is free for group g when no group claimed it or its owner is `depth` or more
+    /// groups back (released before g routes, the stock schedule's own order). A miss whose staged row is free takes it,
+    /// whichever window it lies in; the others take the lowest free row of their window, else the lowest free row of the
+    /// scratch (at most depth - 1 other groups are live, each owning at most `width` rows: one is always free). A claim
+    /// over another staged record forgets that record's row.
+    pub const Adopt = struct { slot_of: []u32, owner: []u8, staged_of_row: []u16, width: u32, depth: u8 };
+    pub const no_owner: u8 = std.math.maxInt(u8);
+    pub const PlanOpts = struct { transient_base: u32 = 0, held: []const u32 = &.{}, adopt: ?*const Adopt = null, group: u8 = 0 };
 
     pub fn init(a: std.mem.Allocator, n_experts: u32, capacity: u32) !LayerPolicy {
         if (n_experts == 0 or n_experts >= no_expert or capacity > n_experts) return error.InvalidCapacity;
@@ -581,28 +588,50 @@ pub const LayerPolicy = struct {
             },
         }
         out.n_persistent = out.n_loads;
-        if (opts.staged) |st| {
-            // Staged rows first: a miss the window holds keeps its row; the rest take the lowest rows no staged miss keeps.
-            var taken: [max_route_ids]bool = @splat(false);
+        if (opts.adopt) |ad| {
+            const g = opts.group;
+            const Claim = struct {
+                fn free(a: *const Adopt, grp: u8, t: u32) bool {
+                    const o = a.owner[t];
+                    return o == no_owner or @as(u32, o) + @as(u32, a.depth) <= @as(u32, grp);
+                }
+                fn take(a: *const Adopt, grp: u8, t: u32, e: u16) void {
+                    const was = a.staged_of_row[t];
+                    if (was != no_expert and was != e) {
+                        a.slot_of[was] = no_slot;
+                        a.staged_of_row[t] = no_expert;
+                    }
+                    a.owner[t] = grp;
+                }
+            };
+            // Staged rows first: a miss whose staged row is free keeps it, whichever window it lies in.
             var row_of: [max_route_ids]u32 = undefined;
             for (transient_buf[0..n_transient], 0..) |e, k| {
                 row_of[k] = no_slot;
-                for (st, 0..) |se, t| if (se == e and !taken[t]) {
-                    taken[t] = true;
-                    row_of[k] = @intCast(t);
-                    out.n_adopted += 1;
-                    break;
-                };
+                const t = ad.slot_of[e];
+                if (t == no_slot or !Claim.free(ad, g, t)) continue;
+                Claim.take(ad, g, t, e);
+                row_of[k] = t;
+                out.n_adopted += 1;
             }
-            var next: u32 = 0;
+            // The rest: the lowest free row of this window, else of the scratch.
+            const win_end: u32 = opts.transient_base + ad.width;
+            var next: u32 = opts.transient_base;
             for (transient_buf[0..n_transient], 0..) |e, k| {
                 var t = row_of[k];
                 if (t == no_slot) {
-                    while (taken[next]) next += 1;
-                    t = next;
-                    taken[next] = true;
+                    while (next < win_end and !Claim.free(ad, g, next)) next += 1;
+                    if (next < win_end) {
+                        t = next;
+                    } else {
+                        var any: u32 = 0;
+                        while (any < ad.owner.len and !Claim.free(ad, g, any)) any += 1;
+                        std.debug.assert(any < ad.owner.len);
+                        t = any;
+                    }
+                    Claim.take(ad, g, t, e);
                 }
-                out.loads[out.n_loads] = .{ .expert = e, .slot = p.capacity + opts.transient_base + t, .persistent = false };
+                out.loads[out.n_loads] = .{ .expert = e, .slot = p.capacity + t, .persistent = false };
                 out.n_loads += 1;
             }
         } else for (transient_buf[0..n_transient], 0..) |e, k| {
