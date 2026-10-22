@@ -267,7 +267,7 @@ pub fn For(comptime bank_mod: type, comptime params: Params) type {
                     if (self.pending.len > 0 and self.pending_layer == rel and ids.ptr == self.pending.ptr) {
                         const call = self.pending;
                         self.pending = &.{};
-                        try st.planCall(rel, call, st.max_route_ids);
+                        try st.planCall(rel, call, st.max_route_ids, 0);
                         return st.activateP7(ids);
                     }
                 }

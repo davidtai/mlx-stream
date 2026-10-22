@@ -436,6 +436,7 @@ Settings (`model-settings.json`):
 | `expert_event_gates` | the GPU waits on the reads' events (`true`) or the host waits (`false`) | `true` |
 | `layer_major_prefill` | the prompt layer by layer (`true`) or chunk by chunk (`false`) | `true` |
 | `expert_wide_depth` | prompt expert groups read ahead per layer, 1 to 5 | 5 |
+| `expert_prompt_overlap` | the prompt pass's read schedule: `true` plans every expert group of a layer's call at its start and posts the read-ahead beside the attention (MiMo's and GLM5-next's schedule, exact); `false` the stock schedule | `false` |
 | `mtp_depth` | the MTP draft lane's drafts per round, 0 to 5 (6 or more is refused at load) | 0 (off) |
 | `mtp_acceptance` | `exact` or `typical` | `exact` |
 | `mtp_typical_delta` | the typical acceptance's delta, read only under `typical` | 0.2 |

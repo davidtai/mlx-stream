@@ -642,7 +642,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         };
 
         /// The route being served plus released ones awaiting the next flush: every wide window live, and one more.
-        pub const route_capacity = max_wide_depth + 1;
+        /// The route ring: the stock schedule holds at most `max_wide_depth` live routes and one more being planned; the
+        /// P7 overlap schedule plans EVERY group of a call up front (`planCall`), so the ring must hold a whole layer's
+        /// groups: DeepSeek-V4.1's 384 experts are 8 groups of 48, 10 with a seed-aligned split (MiMo's 256 and GLM's 288
+        /// fit in 6). Bounded by the pool's gates (the assert below).
+        pub const route_capacity = 10;
         /// Prefill routes one layer may hold live at once (`Options.wide_depth`; P1c: 5, the served default).
         pub const max_wide_depth = 5;
         comptime {
@@ -796,6 +800,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 layer: u32 = 0,
                 distinct: []const u16 = &.{},
                 width: u32 = 0,
+                /// A seed-aligned call (`planCall`'s `split`): the groups before `split` end at it (the last one short), the
+                /// stream's groups start there; 0 = one run of `width`-wide groups.
+                split: u32 = 0,
                 n_groups: u32 = 0,
                 activated: u32 = 0,
                 released: u32 = 0,
@@ -2020,7 +2027,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// records (`whole_trim`: with its jobs still queued, withdrawn: `p7Withdraw`) resolved by the plans (`p7Tail`);
             /// every read whose row is free posted, in group order. The executor then routes the groups in order
             /// (`activateP7`) and releases them in order (`releaseP7`).
-            pub fn planCall(self: *Stream, layer: u32, distinct: []const u16, width: u32) Error!void {
+            pub fn planCall(self: *Stream, layer: u32, distinct: []const u16, width: u32, split: u32) Error!void {
                 if (self.failed) return error.StreamFailed;
                 std.debug.assert(self.prompt_reads == .overlap and self.phase == .prefill);
                 self.prompt_started = true;
@@ -2028,10 +2035,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 try self.flush();
                 if (self.n_free != route_capacity or self.held_base.items.len > 0) return self.fail(error.RoutesLive);
                 if (width == 0 or width > self.max_route_ids) return self.fail(error.RoutesExhausted);
-                const n_groups: u32 = @intCast((distinct.len + width - 1) / width);
+                if (split > distinct.len) return self.fail(error.RoutesExhausted);
+                // DeepSeek's seed-aligned executor (`Groups`): the seed's ranks [0, split) in groups of their own, the stream's
+                // experts after them; split 0 (MiMo, GLM): one run.
+                const n_groups: u32 = @intCast((split + width - 1) / width + (distinct.len - split + width - 1) / width);
                 if (n_groups == 0 or n_groups > route_capacity) return self.fail(error.RoutesExhausted);
                 const p = &self.p7;
-                p.* = .{ .live = true, .layer = layer, .distinct = distinct, .width = width, .n_groups = n_groups };
+                p.* = .{ .live = true, .layer = layer, .distinct = distinct, .width = width, .split = split, .n_groups = n_groups };
                 const ls = &self.layers[layer];
                 const cap = ls.policy.capacity;
                 const depth: u32 = self.wide_depth;
@@ -2075,7 +2085,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// Group `g` of the scheduled call: its ids, as the executor routes them.
             fn p7Group(self: *const Stream, g: u32) []const u16 {
                 const p = &self.p7;
-                return p.distinct[g * p.width .. @min((g + 1) * p.width, p.distinct.len)];
+                const seed_groups: u32 = @intCast((p.split + p.width - 1) / p.width);
+                if (g < seed_groups) return p.distinct[g * p.width .. @min((g + 1) * p.width, p.split)];
+                const s0: usize = p.split + (g - seed_groups) * p.width;
+                return p.distinct[s0..@min(s0 + p.width, p.distinct.len)];
             }
 
             /// A row's index in `p7_rows`: persistent slots first, the transient rows after `n_experts`.

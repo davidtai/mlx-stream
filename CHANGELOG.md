@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- DeepSeek-V4.1: the prompt pass's P7 overlap read schedule, a model setting (`expert_prompt_overlap`, off by default: the
+  stock schedule is the control). On, the wide executor hands each layer's hot-ordered call to the stream before its
+  first group route (`StreamSource.planWide`): every group is planned at once with the stock plans' slots and windows
+  (the shared `Stream.planCall`, which now takes the executor's seed-aligned split), the read-ahead posts whole beside
+  the attention and is trimmed at the plans (`whole_trim`), and each group's reads go out as soon as its rows are free;
+  the routes then activate the planned groups in order (`activateP7`), MiMo's and GLM5-next's schedule. Exact: the same
+  records land in the same rows before any kernel reads them. The shared stream's route ring grows from 6 to 10 so a
+  384-expert layer's 8 groups (10 with the seed split) can all be planned; the cell harness takes
+  `DSV41_CELL_PROMPT_OVERLAP`.
 - Expert stream, every arch: P1's read-ahead takes rows when none is empty. `LayerPolicy.admitReadAhead` (and
   `admitReadAheadHeld`, the stream's call with the live routes' slots held) replaces the coldest residents the
   prediction left out, never a protected, pinned or held one, so a server whose prompt rows a usage-profile seed or

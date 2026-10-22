@@ -54,7 +54,9 @@ const SlotState = S.SlotState;
 const SlotMeta = S.SlotMeta;
 pub const Part = S.Part;
 pub const Route = S.Route;
-const route_capacity = S.route_capacity;
+pub const route_capacity = S.route_capacity;
+pub const PromptReads = S.PromptReads;
+pub const AheadPost = S.AheadPost;
 pub const max_wide_depth = S.max_wide_depth;
 pub const phase_change_releases_wide_windows = S.phase_change_releases_wide_windows;
 pub const transient_release_default = S.transient_release_default;
@@ -156,8 +158,18 @@ pub const StreamSource = struct {
         return &self.calls[i];
     }
 
+    /// P7 overlap (`Options.prompt_reads = .overlap`, mimo/p7-prefill-reads; GLM's prompt lever 1 family): the wide
+    /// executor hands the call's hot-ordered experts over before its first group route (`planWide`), every group is
+    /// planned at once and its reads posted as their rows free up, and each `route` then activates the next planned group
+    /// (`Stream.activateP7`) in the order the executor routes them. The stock schedule (`.stock`): nothing planned here.
+    pub fn planWide(self: *StreamSource, layer: u32, distinct: []const u16, split: u32) Error!void {
+        if (self.stream.prompt_reads != .overlap or self.stream.phase != .prefill) return;
+        try self.stream.planCall(layer, distinct, max_route_ids, split);
+    }
+
     pub fn route(self: *StreamSource, layer: u32, ids: []const u16, scores: []const f32) Error!*Call {
-        const r = try self.stream.route(layer, ids, scores);
+        const st = self.stream;
+        const r = if (st.p7.live and st.p7.layer == layer) try st.activateP7(ids) else try st.route(layer, ids, scores);
         const call = self.callOf(r);
         call.* = .{ .route = r, .n_ids = @intCast(ids.len) };
         _ = self.stream.refsOf(r, &call.refs);
@@ -192,7 +204,9 @@ pub const StreamSource = struct {
     }
 
     pub fn release(self: *StreamSource, call: *Call) void {
-        self.stream.release(call.route.?);
+        const r = call.route.?;
+        const st = self.stream;
+        if (st.p7.live and st.p7.layer == r.layer) st.releaseP7(r) else st.release(r);
     }
 
     pub fn flush(self: *StreamSource) Error!void {
@@ -232,8 +246,11 @@ pub const StreamSource = struct {
         return self.stream.readAheadSeed(layer, experts);
     }
 
-    /// P1: the layer's read-ahead landed (`Stream.awaitReadAhead`).
+    /// P1: the layer's read-ahead landed (`Stream.awaitReadAhead`). Under P7 overlap the executor's await before the seed
+    /// lands nothing: the call's plans land the read-ahead records a group hits (`Stream.planCall`), the rest are dropped
+    /// or withdrawn (`whole_trim`), as MiMo's `awaitNone`.
     pub fn awaitReadAhead(self: *StreamSource, layer: u32) Error!void {
+        if (self.stream.prompt_reads == .overlap) return;
         return self.stream.awaitReadAhead(layer);
     }
 

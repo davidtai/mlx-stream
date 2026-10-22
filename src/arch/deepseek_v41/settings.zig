@@ -70,6 +70,11 @@ pub const Config = struct {
     expert_wide_base_at_seed: ?bool = null,
     /// P1c: the seed's ranks grouped apart from the stream's, the base call after the last seed group.
     expert_wide_seed_aligned: ?bool = null,
+    /// P7: the wide calls' read schedule. true: every group of a call planned at its start and the read-ahead posted
+    /// whole beside the attention, trimmed at the plans (the shared stream's `overlap` + `whole_trim`, MiMo's and
+    /// GLM5-next's prompt schedule). null / false: the stock schedule (the control). Exact: the same records land in the
+    /// same rows before any kernel reads them.
+    expert_prompt_overlap: ?bool = null,
     /// The input embedding read from its host rows from construction (null = on).
     embedding_host_rows: ?bool = null,
     /// kv16-opt: the DENSE16 o-projection returns wo_b's bf16 product as the stream's bf16 (`Routes.prefill_oproj_bf16`),
@@ -116,7 +121,7 @@ pub const Config = struct {
             else => return,
         };
         var any = false;
-        inline for (.{ "expert_event_gates", "layer_major_prefill", "expert_wide_feed", "expert_wide_seed", "expert_wide_hot_first", "embedding_host_rows", "kv16_oproj_bf16", "kv16_hcpost", "prefill_shared_mid", "decode_stack4", "kv16_expert_bf16" }) |key| {
+        inline for (.{ "expert_event_gates", "layer_major_prefill", "expert_wide_feed", "expert_wide_seed", "expert_wide_hot_first", "embedding_host_rows", "kv16_oproj_bf16", "kv16_hcpost", "prefill_shared_mid", "decode_stack4", "kv16_expert_bf16", "expert_prompt_overlap" }) |key| {
             if (obj.get(key)) |v| if (v == .bool) {
                 @field(c, key) = v.bool;
                 any = true;
@@ -150,14 +155,14 @@ pub const Config = struct {
             if (v.integer <= max_ctx_size) c.max_context_tokens = @intCast(v.integer) else c.ctx_size_over_limit = v.integer;
             any = true;
         };
-        if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s} kv16_oproj_bf16={s} kv16_hcpost={s} prefill_shared_mid={s} decode_stack4={s} kv16_expert_bf16={s} billed_context={d}\n", .{
+        if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s} kv16_oproj_bf16={s} kv16_hcpost={s} prefill_shared_mid={s} decode_stack4={s} kv16_expert_bf16={s} prompt_overlap={s} billed_context={d}\n", .{
             onOff(c.expert_event_gates),  if (c.numeric_tier) |t| @tagName(t) else "default",
             onOff(c.layer_major_prefill), onOff(c.expert_wide_feed),
             onOff(c.expert_wide_seed),    onOff(c.expert_wide_hot_first),
             c.expert_wide_depth orelse 0, c.expert_wide_cold_rows orelse 0,
             onOff(c.embedding_host_rows),     onOff(c.kv16_oproj_bf16),     onOff(c.kv16_hcpost),
             onOff(c.prefill_shared_mid),  onOff(c.decode_stack4),
-            onOff(c.kv16_expert_bf16),
+            onOff(c.kv16_expert_bf16),    onOff(c.expert_prompt_overlap),
             c.max_context_tokens orelse 0,
         });
     }
@@ -211,6 +216,11 @@ pub const Config = struct {
     }
 
     /// P1c's seed-aligned groups: the setting, else on wherever the base call at the seed and the hottest-first order are.
+    /// P7 overlap (`expert_prompt_overlap`): off unless the settings ask for it.
+    pub fn dsv41PromptOverlap(self: *const Config) bool {
+        return self.expert_prompt_overlap orelse false;
+    }
+
     pub fn dsv41WideSeedAligned(self: *const Config) bool {
         return self.expert_wide_seed_aligned orelse (self.dsv41WideBaseAtSeed() and self.dsv41WideHotFirst());
     }
@@ -274,6 +284,14 @@ test "dsv41 settings: the prefill routes are a bool, a bool and a depth of 1 to 
     try testing.expectEqual(@as(?bool, null), c.expert_wide_seed);
     // Not an object: nothing set.
     try testing.expectEqual(Config{}, try settingsOf("[1]"));
+}
+
+test "dsv41 settings: expert_prompt_overlap is a bool, off by default; anything else is unset" {
+    try testing.expectEqual(@as(?bool, true), (try settingsOf("{\"expert_prompt_overlap\": true}")).expert_prompt_overlap);
+    try testing.expect((try settingsOf("{\"expert_prompt_overlap\": true}")).dsv41PromptOverlap());
+    try testing.expect(!(try settingsOf("{\"expert_prompt_overlap\": false}")).dsv41PromptOverlap());
+    try testing.expect(!(try settingsOf("{}")).dsv41PromptOverlap());
+    try testing.expectEqual(@as(?bool, null), (try settingsOf("{\"expert_prompt_overlap\": \"on\"}")).expert_prompt_overlap);
 }
 
 test "dsv41 settings: ctx_size bills every prompt up to it; anything else leaves the standard request's" {

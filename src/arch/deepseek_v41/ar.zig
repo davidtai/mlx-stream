@@ -1772,6 +1772,7 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_WIDE_READ_AHEAD")) |v| config.expert_wide_read_ahead = try cellBool("DSV41_CELL_WIDE_READ_AHEAD", v);
     if (envStr("DSV41_CELL_WIDE_BASE_AT_SEED")) |v| config.expert_wide_base_at_seed = try cellBool("DSV41_CELL_WIDE_BASE_AT_SEED", v);
     if (envStr("DSV41_CELL_WIDE_SEED_ALIGNED")) |v| config.expert_wide_seed_aligned = try cellBool("DSV41_CELL_WIDE_SEED_ALIGNED", v);
+    if (envStr("DSV41_CELL_PROMPT_OVERLAP")) |v| config.expert_prompt_overlap = try cellBool("DSV41_CELL_PROMPT_OVERLAP", v);
     if (envStr("DSV41_CELL_EMBEDDING_ROWS")) |v| config.embedding_host_rows = try cellBool("DSV41_CELL_EMBEDDING_ROWS", v);
     if (envStr("DSV41_CELL_DECODE_ATTN_SOFTMAX")) |v| ov.decode_attn_softmax = try cellBool("DSV41_CELL_DECODE_ATTN_SOFTMAX", v);
     if (envStr("DSV41_CELL_DECODE_INDEX_TOPK")) |v| ov.decode_index_topk = try cellBool("DSV41_CELL_DECODE_INDEX_TOPK", v);

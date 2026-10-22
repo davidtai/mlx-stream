@@ -2260,6 +2260,10 @@ pub fn armOptions(config: *const settings.Config, ceiling: expert_admission.Ceil
         .wide_depth = config.dsv41WideDepth(),
         // Off by default (ratio 0: no tally, as before it existed); on only where the model's settings ask for it.
         .tally = if (config.tally.enabled()) .{ .ratio = config.tally.ratio, .window = config.tally.window } else null,
+        // P7 overlap (`expert_prompt_overlap`, off by default: the stock schedule is the control): every group of a wide
+        // call planned at its start, the read-ahead posted whole beside the attention and trimmed at the plans.
+        .prompt_reads = if (config.dsv41PromptOverlap()) .overlap else .stock,
+        .prompt_ahead = if (config.dsv41PromptOverlap()) .whole_trim else .head,
     };
 }
 
