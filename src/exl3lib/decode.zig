@@ -540,7 +540,7 @@ const metal_gemv_core =
     \\// the core over M members (row-slots that chose this expert): every weight is read and decoded once and fed to each
     \\// member's accumulators in the one-member order, so a member's bytes equal the one-member kernel's; folds into
     \\// red_sg[j * 16 BT + output]
-    \\template <uint N, uint WMASK, int CB, uint OUT_TILES, uint BT, uint M>
+    \\template <uint N, uint WMASK, int CB, uint OUT_TILES, uint BT, uint M, uint DEF = 0u>
     \\inline void exl3lib_gemv_members(const device uint* wbase, const device half* xrow0, const device half* xrow1, uint tk0, uint tk1, uint blk, uint L, threadgroup float* red_sg) {
     \\  constexpr uint NW = N / 2u;
     \\  const uint qb = exl3_gen_qb<N>(L);
@@ -560,7 +560,8 @@ const metal_gemv_core =
     \\      cw[0] = exl3_gen_cw<N, WMASK, 0>(ww, lp); cw[1] = exl3_gen_cw<N, WMASK, 1>(ww, lp); cw[2] = exl3_gen_cw<N, WMASK, 2>(ww, lp); cw[3] = exl3_gen_cw<N, WMASK, 3>(ww, lp);
     \\      cw[4] = exl3_gen_cw<N, WMASK, 4>(ww, lp); cw[5] = exl3_gen_cw<N, WMASK, 5>(ww, lp); cw[6] = exl3_gen_cw<N, WMASK, 6>(ww, lp); cw[7] = exl3_gen_cw<N, WMASK, 7>(ww, lp);
     \\      for (uint m = 0; m < 8u; ++m) {
-    \\        const float w = float(exl3_decode<CB>(cw[m]));
+    \\        // DEF: MUL1's byte sum t (the finish applies A and C): no half FMA or half->float convert per weight
+    \\        const float w = (DEF != 0u) ? exl3_mul1_t(cw[m]) : float(exl3_decode<CB>(cw[m]));
     \\        a[0][t][m >> 2] = fma(xr0[m & 3u], w, a[0][t][m >> 2]);
     \\        if (M > 1u) a[M - 1u][t][m >> 2] = fma(xr1[m & 3u], w, a[M - 1u][t][m >> 2]);
     \\      }
@@ -1077,8 +1078,8 @@ pub const text_gu3 =
     \\    const device half* xrow1 = xbase + ulong(members[1]) * ulong(HIDC);
     \\    const uint per = IN_TILES / (KSC * 2u);
     \\    const uint tk0 = (ks * 2u + khalf) * per;
-    \\    if (m == 1u) exl3lib_gemv_members<N, WMASK, CB, OUT_TILES, BTC, 1u>(wbase, xrow0, xrow0, tk0, tk0 + per, blk, L, red[sg]);
-    \\    else exl3lib_gemv_members<N, WMASK, CB, OUT_TILES, BTC, 2u>(wbase, xrow0, xrow1, tk0, tk0 + per, blk, L, red[sg]);
+    \\    if (m == 1u) exl3lib_gemv_members<N, WMASK, CB, OUT_TILES, BTC, 1u, uint(DEFER)>(wbase, xrow0, xrow0, tk0, tk0 + per, blk, L, red[sg]);
+    \\    else exl3lib_gemv_members<N, WMASK, CB, OUT_TILES, BTC, 2u, uint(DEFER)>(wbase, xrow0, xrow1, tk0, tk0 + per, blk, L, red[sg]);
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\    if (tid < 16u * BTC * m) {
     \\        const uint j = tid / (16u * BTC);
@@ -1104,6 +1105,14 @@ pub const text_fin3 =
     \\    const uint o = blk * 128u + tid;
     \\    float g = 0.0f, u = 0.0f;
     \\    for (uint ks = 0; ks < KSC; ++ks) { const ulong i = (ulong(ks) * ulong(RKC) + rk) * ulong(INTC) + o; g += zg[i]; u += zu[i]; }
+    \\    const float MUL1_A = float(as_type<half>(ushort(0x1EEEu)));
+    \\    const float MUL1_C = 1024.0f * MUL1_A + float(as_type<half>(ushort(0xC931u)));
+    \\    if (DEFER != 0) {
+    \\        float sgx = 0.0f, sux = 0.0f;
+    \\        for (uint q = 0; q < uint(NBH); ++q) { sgx += xsg[ulong(rk) * uint(NBH) + q]; sux += xsu[ulong(rk) * uint(NBH) + q]; }
+    \\        g = fma(g, MUL1_A, MUL1_C * sgx);
+    \\        u = fma(u, MUL1_A, MUL1_C * sux);
+    \\    }
     \\    g = exl3lib_h128(float(half(g)), xch, tid, L);
     \\    u = exl3lib_h128(float(half(u)), xch, tid, L);
     \\    const float gv = float(half(g * HAD_SCALE * float(gate_svh[e * INTC + o])));
@@ -1115,7 +1124,14 @@ pub const text_fin3 =
     \\    const uint r = o & 15u;
     \\    const uint q = (r & 7u) >> 1u;
     \\    const uint m = (r & 1u) | ((r >> 3u) << 1u);
-    \\    hd[ulong(rk) * ulong(INTC) + (o & ~15u) + 4u * q + m] = half(d * HAD_SCALE);
+    \\    const half hh = half(d * HAD_SCALE);
+    \\    hd[ulong(rk) * ulong(INTC) + (o & ~15u) + 4u * q + m] = hh;
+    \\    // this 128-block's sum of the down's rounded input (the down finish's deferred MUL1 map): 4 simdgroup sums via xch
+    \\    const float hsum = simd_sum(float(hh));
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    if (L == 0u) xch[simdgroup_index_in_threadgroup] = hsum;
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    if (tid == 0u) hs[ulong(rk) * ulong(INTC / 128u) + blk] = ((xch[0] + xch[1]) + xch[2]) + xch[3];
     \\
 ;
 
@@ -1147,8 +1163,8 @@ pub const text_down3 =
     \\    const device half* xrow1 = xbase + ulong(members[1]) * ulong(INTC);
     \\    const uint per = IN_TILES / (KSC * 4u);
     \\    const uint tk0 = (ks * 4u + sg) * per;
-    \\    if (m == 1u) exl3lib_gemv_members<N, WMASK, CB, OUT_TILES, BTC, 1u>(wbase, xrow0, xrow0, tk0, tk0 + per, blk, L, red[sg]);
-    \\    else exl3lib_gemv_members<N, WMASK, CB, OUT_TILES, BTC, 2u>(wbase, xrow0, xrow1, tk0, tk0 + per, blk, L, red[sg]);
+    \\    if (m == 1u) exl3lib_gemv_members<N, WMASK, CB, OUT_TILES, BTC, 1u, uint(DEFER)>(wbase, xrow0, xrow0, tk0, tk0 + per, blk, L, red[sg]);
+    \\    else exl3lib_gemv_members<N, WMASK, CB, OUT_TILES, BTC, 2u, uint(DEFER)>(wbase, xrow0, xrow1, tk0, tk0 + per, blk, L, red[sg]);
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\    if (tid < 16u * BTC * m) {
     \\        const uint j = tid / (16u * BTC);
@@ -1170,12 +1186,19 @@ pub const text_dfin3 =
     \\    const uint tid = thread_index_in_threadgroup;
     \\    threadgroup float xch[128];
     \\    const uint o = blk * 128u + tid;
+    \\    const float MUL1_A = float(as_type<half>(ushort(0x1EEEu)));
+    \\    const float MUL1_C = 1024.0f * MUL1_A + float(as_type<half>(ushort(0xC931u)));
     \\    float acc = 0.0f;
     \\    for (uint k = 0; k < TOPKC; ++k) {
     \\        const uint rk = row * TOPKC + k;
     \\        const uint e = uint(slots[rk]);
     \\        float v = 0.0f;
     \\        for (uint ks = 0; ks < KSC; ++ks) v += zd[(ulong(ks) * ulong(RKC) + rk) * ulong(HIDC) + o];
+    \\        if (DEFER != 0) {
+    \\            float hsum = 0.0f;
+    \\            for (uint q = 0; q < uint(NBI); ++q) hsum += hsx[ulong(rk) * uint(NBI) + q];
+    \\            v = fma(v, MUL1_A, MUL1_C * hsum);
+    \\        }
     \\        v = exl3lib_h128(float(half(v)), xch, tid, L);
     \\        acc = fma(float(scores[rk]), float(half(v * HAD_SCALE * float(down_svh[e * HIDC + o]))), acc);
     \\    }
@@ -1198,25 +1221,34 @@ pub const text_prep2 =
     \\    for (uint s = 0; s < 5u; ++s) { const uint bit = 1u << s; for (uint j = 0; j < 4u; ++j) { const float pg = simd_shuffle_xor(vg[j], ushort(bit)); const float pu = simd_shuffle_xor(vu[j], ushort(bit)); vg[j] = (L & bit) ? (pg - vg[j]) : (vg[j] + pg); vu[j] = (L & bit) ? (pu - vu[j]) : (vu[j] + pu); } }
     \\    { float t0 = vg[0] + vg[1], t1 = vg[0] - vg[1], t2 = vg[2] + vg[3], t3 = vg[2] - vg[3]; vg[0] = t0 + t2; vg[1] = t1 + t3; vg[2] = t0 - t2; vg[3] = t1 - t3; }
     \\    { float t0 = vu[0] + vu[1], t1 = vu[0] - vu[1], t2 = vu[2] + vu[3], t3 = vu[2] - vu[3]; vu[0] = t0 + t2; vu[1] = t1 + t3; vu[2] = t0 - t2; vu[3] = t1 - t3; }
+    \\    float sgv = 0.0f, suv = 0.0f;
     \\    for (uint j = 0; j < 4u; ++j) {
     \\        const uint i = b * 128u + L + 32u * j;
     \\        const uint r = i & 15u; const uint q = (r & 7u) >> 1u; const uint m = (r & 1u) | ((r >> 3u) << 1u);
     \\        const ulong o = ulong(rk) * ulong(DIMC) + (i & ~15u) + 4u * q + m;
-    \\        xg[o] = half(vg[j] * HAD_SCALE);
-    \\        xu[o] = half(vu[j] * HAD_SCALE);
+    \\        const half hg = half(vg[j] * HAD_SCALE);
+    \\        const half hu = half(vu[j] * HAD_SCALE);
+    \\        xg[o] = hg;
+    \\        xu[o] = hu;
+    \\        sgv += float(hg);
+    \\        suv += float(hu);
     \\    }
+    \\    // each 128-block's sum of the rounded inputs (the deferred MUL1 map needs the row-slot's input sum)
+    \\    sgv = simd_sum(sgv);
+    \\    suv = simd_sum(suv);
+    \\    if (L == 0u) { sg[ulong(rk) * ulong(DIMC / 128u) + b] = sgv; su[ulong(rk) * ulong(DIMC / 128u) + b] = suv; }
     \\
 ;
 const prep2_inputs = [_][*:0]const u8{ "x", "slots", "gate_suh", "up_suh" };
-const prep2_outputs = [_][*:0]const u8{ "xg", "xu" };
+const prep2_outputs = [_][*:0]const u8{ "xg", "xu", "sg", "su" };
 
 const gu3_inputs = [_][*:0]const u8{ "xgp", "xup", "slots", "gate_t", "up_t" };
 const gu3_outputs = [_][*:0]const u8{ "zg", "zu" };
-const fin3_inputs = [_][*:0]const u8{ "zg", "zu", "slots", "gate_svh", "up_svh", "down_suh" };
-const fin3_outputs = [_][*:0]const u8{"hd"};
+const fin3_inputs = [_][*:0]const u8{ "zg", "zu", "slots", "gate_svh", "up_svh", "down_suh", "xsg", "xsu" };
+const fin3_outputs = [_][*:0]const u8{ "hd", "hs" };
 const down3_inputs = [_][*:0]const u8{ "hdp", "slots", "down_t" };
 const down3_outputs = [_][*:0]const u8{"zd"};
-const dfin3_inputs = [_][*:0]const u8{ "zd", "slots", "scores", "down_svh" };
+const dfin3_inputs = [_][*:0]const u8{ "zd", "slots", "scores", "down_svh", "hsx" };
 
 /// Form 3: five launches (prepare gate and up, split-K gate/up planes, finish + SwiGLU + down prepare, split-K down
 /// planes, finish + reduce); KS slices fill the GPU at one row.
@@ -1230,6 +1262,9 @@ pub const Kernels3 = struct {
     group: u32,
     /// y's dtype (the x the host passes: bf16 served; f32 in the tests and the bench); set before the first call
     out_dtype: mlx.mlx_dtype = .float32,
+    /// MUL1: the GEMVs sum x times the codeword's byte sum and the finishes apply the affine map once per output
+    /// (MLX_SERVE_EXL3LIB_DEFER=0 decodes every weight to its f16 value, the reference's rounding)
+    defer_affine: bool = false,
     prep: mlx.mlx_fast_metal_kernel,
     gu: mlx.mlx_fast_metal_kernel,
     fin: mlx.mlx_fast_metal_kernel,
@@ -1262,6 +1297,10 @@ pub const Kernels3 = struct {
             .ks_dn = ks_dn,
             .bt = bt,
             .group = group,
+            .defer_affine = geo.dec.codebook == .mul1 and blk: {
+                const v = std.c.getenv("MLX_SERVE_EXL3LIB_DEFER") orelse break :blk true;
+                break :blk v[0] != '0';
+            },
             .prep = ks.newKernel("exl3lib_prep2", &prep2_inputs, &prep2_outputs, text_prep2, header, true) orelse return error.KernelCreateFailed,
             .gu = ks.newKernel("exl3lib_gu3", &gu3_inputs, &gu3_outputs, text_gu3, header, true) orelse return error.KernelCreateFailed,
             .fin = ks.newKernel("exl3lib_fin3", &fin3_inputs, &fin3_outputs, text_fin3, header, true) orelse return error.KernelCreateFailed,
@@ -1307,13 +1346,16 @@ pub const Kernels3 = struct {
         const bt_t = ks.TemplateArg{ .name = "BT", .value = .{ .int = @intCast(self.bt) } };
         const grp_t = ks.TemplateArg{ .name = "GROUP", .value = .{ .int = @intCast(if (rows >= 2) self.group else 1) } };
         const out_t = ks.TemplateArg{ .name = "OUT_T", .value = .{ .dtype = self.out_dtype } };
+        const def_t = ks.TemplateArg{ .name = "DEFER", .value = .{ .int = if (self.defer_affine) 1 else 0 } };
+        const nbh_t = ks.TemplateArg{ .name = "NBH", .value = .{ .int = @intCast(g.hidden / 128) } };
+        const nbi_t = ks.TemplateArg{ .name = "NBI", .value = .{ .int = @intCast(g.inter / 128) } };
         const bw: u32 = 16 * self.bt;
         const c: Cfg = .{
-            .prep_h = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 32, rk, 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{ &[_]c_int{ rkc, H }, &[_]c_int{ rkc, H } }, .out_dtypes = &.{ .float16, .float16 }, .template = &.{ .{ .name = "DIM", .value = .{ .int = H } }, topk } }),
-            .gu = try ks.buildConfig(.{ .grid = .{ (g.inter / bw) * 128, rk, ks_gu_r }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{ &[_]c_int{ @intCast(ks_gu_r), rkc, I }, &[_]c_int{ @intCast(ks_gu_r), rkc, I } }, .out_dtypes = &.{ .float32, .float32 }, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_gu_t, bt_t, grp_t } }),
-            .fin = try ks.buildConfig(.{ .grid = .{ (g.inter / 128) * 128, rk, 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, I }}, .out_dtypes = &.{.float16}, .template = &.{ inter_t, rkt, ks_gu_t } }),
-            .down = try ks.buildConfig(.{ .grid = .{ (g.hidden / bw) * 128, rk, ks_dn_r }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(ks_dn_r), rkc, H }}, .out_dtypes = &.{.float32}, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_dn_t, bt_t, grp_t } }),
-            .dfin = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 128, @intCast(rows), 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(rows), H }}, .out_dtypes = &.{self.out_dtype}, .template = &.{ hid, topk, rkt, ks_dn_t, out_t } }),
+            .prep_h = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 32, rk, 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{ &[_]c_int{ rkc, H }, &[_]c_int{ rkc, H }, &[_]c_int{ rkc, @intCast(g.hidden / 128) }, &[_]c_int{ rkc, @intCast(g.hidden / 128) } }, .out_dtypes = &.{ .float16, .float16, .float32, .float32 }, .template = &.{ .{ .name = "DIM", .value = .{ .int = H } }, topk } }),
+            .gu = try ks.buildConfig(.{ .grid = .{ (g.inter / bw) * 128, rk, ks_gu_r }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{ &[_]c_int{ @intCast(ks_gu_r), rkc, I }, &[_]c_int{ @intCast(ks_gu_r), rkc, I } }, .out_dtypes = &.{ .float32, .float32 }, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_gu_t, bt_t, grp_t, def_t } }),
+            .fin = try ks.buildConfig(.{ .grid = .{ (g.inter / 128) * 128, rk, 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{ &[_]c_int{ rkc, I }, &[_]c_int{ rkc, @intCast(g.inter / 128) } }, .out_dtypes = &.{ .float16, .float32 }, .template = &.{ inter_t, rkt, ks_gu_t, def_t, nbh_t } }),
+            .down = try ks.buildConfig(.{ .grid = .{ (g.hidden / bw) * 128, rk, ks_dn_r }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(ks_dn_r), rkc, H }}, .out_dtypes = &.{.float32}, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_dn_t, bt_t, grp_t, def_t } }),
+            .dfin = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 128, @intCast(rows), 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(rows), H }}, .out_dtypes = &.{self.out_dtype}, .template = &.{ hid, topk, rkt, ks_dn_t, out_t, def_t, nbi_t } }),
         };
         self.cfg[rows] = c;
         return c;
@@ -1328,18 +1370,22 @@ pub const Kernels3 = struct {
     /// The five launches (one prepare for both projections); the caller frees y.
     pub fn moe(self: *Kernels3, s: mlx.mlx_stream, x: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, bank: Kernels.Bank, rows: usize) !mlx.mlx_array {
         const c = try self.cfgs(rows);
-        var xp: [2]mlx.mlx_array = undefined;
+        var xp: [4]mlx.mlx_array = undefined; // xg, xu, and their per-block input sums
         try ks.applyConfig(self.prep, c.prep_h, &.{ x, slots, bank.gate_suh, bank.up_suh }, &xp, s);
-        defer _ = mlx.mlx_array_free(xp[0]);
-        defer _ = mlx.mlx_array_free(xp[1]);
+        defer for (xp) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
         var planes: [2]mlx.mlx_array = undefined;
         try ks.applyConfig(self.gu, c.gu, &.{ xp[0], xp[1], slots, bank.gate_t, bank.up_t }, &planes, s);
         defer _ = mlx.mlx_array_free(planes[0]);
         defer _ = mlx.mlx_array_free(planes[1]);
-        const hd = try one(self.fin, c.fin, &.{ planes[0], planes[1], slots, bank.gate_svh, bank.up_svh, bank.down_suh }, s);
-        defer _ = mlx.mlx_array_free(hd);
-        const zd = try one(self.down, c.down, &.{ hd, slots, bank.down_t }, s);
+        var hd: [2]mlx.mlx_array = undefined; // the down's prepared input and its per-block sums
+        try ks.applyConfig(self.fin, c.fin, &.{ planes[0], planes[1], slots, bank.gate_svh, bank.up_svh, bank.down_suh, xp[2], xp[3] }, &hd, s);
+        defer for (hd) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const zd = try one(self.down, c.down, &.{ hd[0], slots, bank.down_t }, s);
         defer _ = mlx.mlx_array_free(zd);
-        return one(self.dfin, c.dfin, &.{ zd, slots, scores, bank.down_svh }, s);
+        return one(self.dfin, c.dfin, &.{ zd, slots, scores, bank.down_svh, hd[1] }, s);
     }
 };
