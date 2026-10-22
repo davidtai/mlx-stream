@@ -101,6 +101,7 @@ comptime {
     _ = @import("exl3/quant.zig");
     _ = @import("exl3lib/format.zig");
     _ = @import("exl3lib/spec.zig");
+    _ = @import("exl3lib/lane.zig");
     _ = @import("exl3lib/root.zig");
     _ = @import("arch/deepseek_v41/kernel_routes.zig");
     _ = @import("arch/deepseek_v41/kernels_test.zig");

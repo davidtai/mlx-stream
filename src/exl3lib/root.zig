@@ -10,6 +10,7 @@ const std = @import("std");
 const mlx = @import("sdk").mlx;
 pub const format = @import("format.zig");
 pub const spec = @import("spec.zig");
+pub const lane = @import("lane.zig");
 
 pub const Spec = spec.Spec;
 pub const parseExpertQuant = spec.parseExpertQuant;
@@ -115,4 +116,5 @@ pub fn moeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx
 test {
     _ = format;
     _ = spec;
+    _ = lane;
 }
