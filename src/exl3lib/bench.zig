@@ -1,6 +1,7 @@
 //! The decode-chain benchmark (EXL3LIB_GPU=1 EXL3LIB_BENCH=1, else skipped): three arms on the same synthetic banks at
 //! every integer rate K2..K8 (n 32..128) plus the fractional n40, Qwen3.8-Flash-Next's geometry (2560 x 640, top-10),
-//! rows 1 / 4 / 8 (decode and MTP verify widths):
+//! rows 1 / 4 / 8 (decode and MTP verify widths), 48 synthetic experts with rows sharing few of them (Flash-Next's
+//! 512-expert routing shares few slots across verify rows, so weight reuse between rows is not what the bench rewards):
 //!   bNkM    - exl3lib's form 3 (split-K planes in both GEMVs, finish launches fuse SwiGLU, the down prepare and the
 //!             reduce) with N output tiles per GEMV threadgroup (2N f32 accumulators per lane) and up to M K slices
 //!   sushi   - the host's Sushi module chain (`sushi_exl3.moe`, reached through `mlx_host`), the shipped control
@@ -40,7 +41,7 @@ const row_counts = [_]u32{ 1, 4, 8 };
 const hidden: u32 = 2560;
 const inter: u32 = 640;
 const topk: u32 = 10;
-const experts: u32 = 12;
+const experts: u32 = 48;
 const rounds: usize = 20;
 const tolerance: f64 = 5e-3;
 
@@ -92,7 +93,7 @@ fn benchCase(a: std.mem.Allocator, g: *G, s: mlx.mlx_stream, n: u32, rows: u32) 
     for (0..rows) |r| {
         var sum: f32 = 0;
         for (0..topk) |k| {
-            slots[r * topk + k] = @intCast((k + r) % experts); // rows share most of their experts, as a decode step does
+            slots[r * topk + k] = @intCast((k * 5 + r * 11) % experts); // rows share few experts, as Flash-Next's 512-expert routing does
             scores[r * topk + k] = 0.2 + rnd.float(f32);
             sum += scores[r * topk + k];
         }
