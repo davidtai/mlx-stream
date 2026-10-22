@@ -1905,21 +1905,29 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 // Transient staging: the predicted records no persistent row took, into the first `wide_depth` windows in rank
                 // order (window 0's rows first), while no route is live (the previous call released every window). Bounded
                 // by the ticket ring like the persistent admissions.
+                if (self.stage_transient and !self.p7.live and self.held_base.items.len == 0) {
+                    // The previous call's released routes still hold their rows until a flush (`route` flushes on its own):
+                    // flush first, so every window the call let go is free for the stage.
+                    try self.flush();
+                }
                 if (self.stage_transient and self.n_free == route_capacity and self.held_base.items.len == 0 and !self.p7.live) {
                     const pol = &self.layers[layer].policy;
                     const cap = pol.capacity;
                     const room: u32 = @min(@as(u32, self.wide_depth) * self.max_route_ids, self.transient.rows);
                     var t: u32 = 0;
+                    var staged: u32 = 0;
                     for (experts) |e| {
                         if (n >= fit or t >= room) break;
                         if (e >= pol.n_experts or pol.expert_to_slot[e] != expert_policy.no_slot) continue;
-                        const m = self.locate(layer, cap + t).meta;
-                        if (m.pins != 0 or m.state == .loading) break;
+                        // A row a reader still fills or a wave still pins is left alone (the stage takes the next one).
+                        while (t < room and (self.locate(layer, cap + t).meta.pins != 0 or self.locate(layer, cap + t).meta.state == .loading)) t += 1;
+                        if (t >= room) break;
                         ah.loads[n] = .{ .expert = e, .slot = cap + t };
                         n += 1;
                         t += 1;
+                        staged += 1;
                     }
-                    self.counters.staged += t;
+                    self.counters.staged += staged;
                 }
                 ah.* = .{ .layer = layer, .n = n, .loads = ah.loads, .reads = ah.reads, .parts = ah.parts, .landed = ah.landed };
                 if (n == 0) return;

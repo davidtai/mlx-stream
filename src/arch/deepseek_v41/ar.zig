@@ -3551,8 +3551,8 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     }.f;
     var total: u64 = 0;
     for (probe.ns[0..probe.n]) |x| total += x;
-    std.debug.print("\nPREFILL_PROFILE {{\"prompt_tokens\": {d}, \"probed_wall_s\": {d:.3}, \"stage_sum_s\": {d:.3}, \"chunks\": {d}, \"read_bytes\": {d}, \"read_busy_s\": {d:.3}, \"misses\": {d}, \"routed_read_busy_s\": {d:.3}}}\n", .{
-        inputs.prompt.len, wall_s, secs(total), probe.layers_done / probe.n_layers, d.expert_bytes_read, secs(d.read_wall_ns), d.expert_cache_misses, secs(probe.read_wall_ns),
+    std.debug.print("\nPREFILL_PROFILE {{\"prompt_tokens\": {d}, \"probed_wall_s\": {d:.3}, \"stage_sum_s\": {d:.3}, \"chunks\": {d}, \"read_bytes\": {d}, \"read_busy_s\": {d:.3}, \"misses\": {d}, \"routed_read_busy_s\": {d:.3}, \"ahead_posted\": {d}, \"staged\": {d}}}\n", .{
+        inputs.prompt.len, wall_s, secs(total), probe.layers_done / probe.n_layers, d.expert_bytes_read, secs(d.read_wall_ns), d.expert_cache_misses, secs(probe.read_wall_ns), d.ahead_posted, d.staged,
     });
     for (probe.names[0..probe.n], probe.ns[0..probe.n]) |name, ns| std.debug.print("PREFILL_PROFILE_STAGE {{\"stage\": \"{s}\", \"s\": {d:.3}, \"share\": {d:.4}}}\n", .{ name, secs(ns), @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
     // Per stage, MLX's high-water mark above the pass's start (the constructed residents): which stage sets the transient.
