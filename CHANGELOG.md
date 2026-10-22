@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- exl3lib decode: expert-grouped row-slots. From two rows up, row-slots that chose the same expert share one GEMV threadgroup
+  that reads and decodes each weight once and feeds every member's accumulators in the one-member order (bytes unchanged;
+  `exl3lib_members` is a ballot over all row-slots, so 8-row verifies group too where Sushi's 64-slot cap stops). The engine
+  default is now 1 output tile per threadgroup (2 f32 accumulators per lane, 4 grouped), groups of 2, up to 4 K slices
+  (`Kernels3.initWith`; A/B knobs MLX_SERVE_EXL3LIB_GROUP=1, MLX_SERVE_EXL3LIB_BT=2). `root.moe` takes the host's operands as
+  held (bf16/f16/f32 x, i32/u32 indices, bf16/f16/f32 scores) and writes y in x's dtype from the last kernel (`OUT_T`),
+  removing four cast launches per layer. Bench arms: b2k4g / b2k4 / b1k4g / sushi. M5 Max (window 68, box under an e2e test
+  load): grouped 10-20 % faster than ungrouped at 8 rows and faster than Sushi at every rate there; at 4 rows b1k4g wins or
+  ties at every rate but n40/n96 (-2 %); 96/96 parity. Served effect pending the greedy, gated standard cell.
 - exl3lib M2 (`src/exl3lib/decode.zig`, `unfused.zig`, `bench.zig`): the generic decode chain serving EXL3 experts at every even
   rate (K1..K8, fractional included), both codebooks and every window. Form 3: one prepare launch (gate and up, lane order), split-K
   gate/up partial planes, a finish launch (f16 round, H128, svh, f16 round, SwiGLU, the down's rotation), split-K down planes, a

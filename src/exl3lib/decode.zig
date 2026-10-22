@@ -62,7 +62,7 @@ pub const text_gu =
     \\    const uint row = threadgroup_position_in_grid.z;
     \\    const uint sg = simdgroup_index_in_threadgroup;
     \\    const uint L = thread_index_in_simdgroup;
-    \\    const uint e = slots[row * TOPKC + k];
+    \\    const uint e = uint(slots[row * TOPKC + k]);
     \\    threadgroup half xg[HIDC];
     \\    threadgroup half xu[HIDC];
     \\    threadgroup float red_g[4][128];
@@ -209,7 +209,7 @@ pub const text_gu4 =
     \\    const uint row = threadgroup_position_in_grid.z;
     \\    const uint sg = simdgroup_index_in_threadgroup;
     \\    const uint L = thread_index_in_simdgroup;
-    \\    const uint e = slots[row * TOPKC + k];
+    \\    const uint e = uint(slots[row * TOPKC + k]);
     \\    threadgroup float red_g[4][128];
     \\    threadgroup float red_u[4][128];
     \\    const device half* xg = xgp + ulong(row * TOPKC + k) * ulong(HIDC);
@@ -337,8 +337,8 @@ pub const text_down =
     \\    const uint tk_per = IN_TILES / 4u;
     \\    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};              // simdgroup 0's outputs L + 32 j, summed over the slots
     \\    for (uint k = 0; k < TOPKC; ++k) {
-    \\        const uint e = slots[row * TOPKC + k];
-    \\        const float score = scores[row * TOPKC + k];
+    \\        const uint e = uint(slots[row * TOPKC + k]);
+    \\        const float score = float(scores[row * TOPKC + k]);
     \\        // 1. this slot's rotated h: f16 round, down suh, H128, 1/sqrt(128), f16 round
     \\        for (uint b = sg; b < INTC / 128u; b += 4u) {
     \\            float v[4];
@@ -434,8 +434,8 @@ pub const text_down4 =
     \\    const uint tk_per = IN_TILES / 4u;
     \\    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};              // simdgroup 0's outputs L + 32 j, summed over the slots
     \\    for (uint k = 0; k < TOPKC; ++k) {
-    \\        const uint e = slots[row * TOPKC + k];
-    \\        const float score = scores[row * TOPKC + k];
+    \\        const uint e = uint(slots[row * TOPKC + k]);
+    \\        const float score = float(scores[row * TOPKC + k]);
     \\        const device half* hd = hdp + ulong(row * TOPKC + k) * ulong(INTC);
     \\        // 2. the GEMV over this simdgroup's quarter of the input tiles, the block's 8 output tiles
     \\        float a[8][2];
@@ -491,6 +491,26 @@ pub const text_down4 =
 /// The GEMV core every form-3 kernel inlines: lane L of a simdgroup accumulates its 8 tiles x 2 columns over input
 /// tiles [tk0, tk1) of expert `wbase` (the stacked bank's expert base, in uint words), x in lane order.
 const metal_gemv_core =
+    \\// the row-slots that chose expert e, in slot order: slot rk leads when its occurrence index is a multiple of GRP and
+    \\// takes the next GRP - 1 occurrences as its members (GRP is 1 or 2); false for a slot some lead covers
+    \\template <uint GRP, uint RKC, typename S>
+    \\inline bool exl3lib_members(const device S* slots, uint rk, uint e, uint L, thread uint (&members)[2], thread uint& m) {
+    \\  members[0] = rk; members[1] = rk; m = 1u;
+    \\  if (GRP == 1u) return true;
+    \\  uint before = 0u; uint next = 0xffffffffu;
+    \\  for (uint b = 0u; b < RKC; b += 32u) {
+    \\    const uint i = b + L;
+    \\    const bool hit = (i < RKC) && (i != rk) && (uint(slots[i]) == e);
+    \\    const uint mask = uint(static_cast<simd_vote::vote_t>(simd_ballot(hit)));
+    \\    const uint below = (b + 32u <= rk) ? 0xffffffffu : ((b >= rk) ? 0u : ((1u << (rk - b)) - 1u));
+    \\    before += popcount(mask & below);
+    \\    const uint above = mask & ~below;
+    \\    if (next == 0xffffffffu && above != 0u) next = b + ctz(above);
+    \\  }
+    \\  if ((before % GRP) != 0u) return false;
+    \\  if (next != 0xffffffffu) { members[1] = next; m = 2u; }
+    \\  return true;
+    \\}
     \\template <uint N, uint WMASK, int CB, uint OUT_TILES, uint BT>
     \\inline void exl3lib_gemv_core(const device uint* wbase, const device half* xrow, uint tk0, uint tk1, uint blk, uint L, thread float (&a)[BT][2]) {
     \\  constexpr uint NW = N / 2u;
@@ -516,6 +536,37 @@ const metal_gemv_core =
     \\inline void exl3lib_fold(thread float (&a)[BT][2], threadgroup float* red_sg, uint L) {
     \\  for (uint t = 0; t < BT; ++t) for (uint c = 0; c < 2u; ++c) { a[t][c] += simd_shuffle_xor(a[t][c], ushort(1)); a[t][c] += simd_shuffle_xor(a[t][c], ushort(2)); }
     \\  if ((L & 3u) == 0u) for (uint t = 0; t < BT; ++t) { red_sg[t * 16u + (L >> 2)] = a[t][0]; red_sg[t * 16u + (L >> 2) + 8u] = a[t][1]; }
+    \\}
+    \\// the core over M members (row-slots that chose this expert): every weight is read and decoded once and fed to each
+    \\// member's accumulators in the one-member order, so a member's bytes equal the one-member kernel's; folds into
+    \\// red_sg[j * 16 BT + output]
+    \\template <uint N, uint WMASK, int CB, uint OUT_TILES, uint BT, uint M>
+    \\inline void exl3lib_gemv_members(const device uint* wbase, const device half* xrow0, const device half* xrow1, uint tk0, uint tk1, uint blk, uint L, threadgroup float* red_sg) {
+    \\  constexpr uint NW = N / 2u;
+    \\  const uint qb = exl3_gen_qb<N>(L);
+    \\  const uint ga = exl3_gen_a<N>(L);
+    \\  const uint lp = exl3_gen_lp<N>(L);
+    \\  float a[M][BT][2];
+    \\  for (uint j = 0; j < M; ++j) for (uint t = 0; t < BT; ++t) { a[j][t][0] = 0.0f; a[j][t][1] = 0.0f; }
+    \\  for (uint tk = tk0; tk < tk1; ++tk) {
+    \\    const half4 x0 = *reinterpret_cast<const device half4*>(xrow0 + tk * 16u);
+    \\    const float xr0[4] = { float(x0.x), float(x0.y), float(x0.z), float(x0.w) };
+    \\    float xr1[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    \\    if (M > 1u) { const half4 x1 = *reinterpret_cast<const device half4*>(xrow1 + tk * 16u); xr1[0] = float(x1.x); xr1[1] = float(x1.y); xr1[2] = float(x1.z); xr1[3] = float(x1.w); }
+    \\    for (uint t = 0; t < BT; ++t) {
+    \\      const device uint* tile = wbase + (ulong(tk) * OUT_TILES + blk * BT + t) * ulong(NW);
+    \\      const IntWords ww = exl3_int_words<N>(tile, qb, ga);
+    \\      uint cw[8];
+    \\      cw[0] = exl3_gen_cw<N, WMASK, 0>(ww, lp); cw[1] = exl3_gen_cw<N, WMASK, 1>(ww, lp); cw[2] = exl3_gen_cw<N, WMASK, 2>(ww, lp); cw[3] = exl3_gen_cw<N, WMASK, 3>(ww, lp);
+    \\      cw[4] = exl3_gen_cw<N, WMASK, 4>(ww, lp); cw[5] = exl3_gen_cw<N, WMASK, 5>(ww, lp); cw[6] = exl3_gen_cw<N, WMASK, 6>(ww, lp); cw[7] = exl3_gen_cw<N, WMASK, 7>(ww, lp);
+    \\      for (uint m = 0; m < 8u; ++m) {
+    \\        const float w = float(exl3_decode<CB>(cw[m]));
+    \\        a[0][t][m >> 2] = fma(xr0[m & 3u], w, a[0][t][m >> 2]);
+    \\        if (M > 1u) a[M - 1u][t][m >> 2] = fma(xr1[m & 3u], w, a[M - 1u][t][m >> 2]);
+    \\      }
+    \\    }
+    \\  }
+    \\  for (uint j = 0; j < M; ++j) exl3lib_fold<BT>(a[j], red_sg + j * 16u * BT, L);
     \\}
     \\// H128 of 128 values held one per thread (tid): 5 shuffle stages in the simdgroup, 2 exchange stages through xch
     \\inline float exl3lib_h128(float v, threadgroup float* xch, uint tid, uint L) {
@@ -769,7 +820,7 @@ pub const text_gu2 =
     \\    const uint sg = simdgroup_index_in_threadgroup;
     \\    const uint L = thread_index_in_simdgroup;
     \\    const uint tid = thread_index_in_threadgroup;
-    \\    const uint e = slots[rk];
+    \\    const uint e = uint(slots[rk]);
     \\    const uint proj = sg >> 1u;          // 0 gate, 1 up
     \\    const uint khalf = sg & 1u;
     \\    threadgroup float red[4][128];       // [sg][output]
@@ -848,7 +899,7 @@ pub const text_down2 =
     \\    const uint sg = simdgroup_index_in_threadgroup;
     \\    const uint L = thread_index_in_simdgroup;
     \\    const uint tid = thread_index_in_threadgroup;
-    \\    const uint e = slots[rk];
+    \\    const uint e = uint(slots[rk]);
     \\    threadgroup float red[4][128];
     \\    threadgroup float xch[128];
     \\    const uint base = INTK ? exl3_int_qb<N>(L) : exl3_lane_base<N>(L);
@@ -890,7 +941,7 @@ pub const text_down2 =
     \\        v = (tid & bit) ? (p - v) : (v + p);
     \\    }
     \\    const uint o = blk * 128u + tid;
-    \\    yk[ulong(rk) * ulong(HIDC) + o] = scores[rk] * float(half(v * HAD_SCALE * float(down_svh[e * HIDC + o])));
+    \\    yk[ulong(rk) * ulong(HIDC) + o] = float(scores[rk]) * float(half(v * HAD_SCALE * float(down_svh[e * HIDC + o])));
     \\
 ;
 
@@ -1013,21 +1064,25 @@ pub const text_gu3 =
     \\    const uint sg = simdgroup_index_in_threadgroup;
     \\    const uint L = thread_index_in_simdgroup;
     \\    const uint tid = thread_index_in_threadgroup;
-    \\    const uint e = slots[rk];
+    \\    constexpr uint GRP = uint(GROUP);   // row-slots per lead threadgroup (1 or 2)
+    \\    const uint e = uint(slots[rk]);
     \\    const uint proj = sg >> 1u;
     \\    const uint khalf = sg & 1u;
-    \\    threadgroup float red[4][16u * BTC];
-    \\    float a[BTC][2];
-    \\    for (uint t = 0; t < BTC; ++t) { a[t][0] = 0.0f; a[t][1] = 0.0f; }
+    \\    uint members[2]; uint m;
+    \\    if (!exl3lib_members<GRP, uint(RKC)>(slots, rk, e, L, members, m)) return;
+    \\    threadgroup float red[4][2u * 16u * BTC];
     \\    const device uint* wbase = (const device uint*)(proj == 0u ? gate_t : up_t) + ulong(e) * ulong(IN_TILES) * ulong(OUT_TILES) * ulong(N / 2u);
-    \\    const device half* xrow = (proj == 0u ? xgp : xup) + ulong(rk) * ulong(HIDC) + 4u * (L & 3u);
+    \\    const device half* xbase = (proj == 0u ? xgp : xup) + 4u * (L & 3u);
+    \\    const device half* xrow0 = xbase + ulong(members[0]) * ulong(HIDC);
+    \\    const device half* xrow1 = xbase + ulong(members[1]) * ulong(HIDC);
     \\    const uint per = IN_TILES / (KSC * 2u);
     \\    const uint tk0 = (ks * 2u + khalf) * per;
-    \\    exl3lib_gemv_core<N, WMASK, CB, OUT_TILES, BTC>(wbase, xrow, tk0, tk0 + per, blk, L, a);
-    \\    exl3lib_fold<BTC>(a, red[sg], L);
+    \\    if (m == 1u) exl3lib_gemv_members<N, WMASK, CB, OUT_TILES, BTC, 1u>(wbase, xrow0, xrow0, tk0, tk0 + per, blk, L, red[sg]);
+    \\    else exl3lib_gemv_members<N, WMASK, CB, OUT_TILES, BTC, 2u>(wbase, xrow0, xrow1, tk0, tk0 + per, blk, L, red[sg]);
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    if (tid < 16u * BTC) {
-    \\        const ulong o = (ulong(ks) * ulong(RKC) + rk) * ulong(INTC) + blk * (16u * BTC) + tid;
+    \\    if (tid < 16u * BTC * m) {
+    \\        const uint j = tid / (16u * BTC);
+    \\        const ulong o = (ulong(ks) * ulong(RKC) + members[j]) * ulong(INTC) + blk * (16u * BTC) + (tid - j * 16u * BTC);
     \\        zg[o] = red[0][tid] + red[1][tid];
     \\        zu[o] = red[2][tid] + red[3][tid];
     \\    }
@@ -1044,7 +1099,7 @@ pub const text_fin3 =
     \\    const uint rk = threadgroup_position_in_grid.y;
     \\    const uint L = thread_index_in_simdgroup;
     \\    const uint tid = thread_index_in_threadgroup;
-    \\    const uint e = slots[rk];
+    \\    const uint e = uint(slots[rk]);
     \\    threadgroup float xch[128];
     \\    const uint o = blk * 128u + tid;
     \\    float g = 0.0f, u = 0.0f;
@@ -1081,18 +1136,24 @@ pub const text_down3 =
     \\    const uint sg = simdgroup_index_in_threadgroup;
     \\    const uint L = thread_index_in_simdgroup;
     \\    const uint tid = thread_index_in_threadgroup;
-    \\    const uint e = slots[rk];
-    \\    threadgroup float red[4][16u * BTC];
-    \\    float a[BTC][2];
-    \\    for (uint t = 0; t < BTC; ++t) { a[t][0] = 0.0f; a[t][1] = 0.0f; }
+    \\    constexpr uint GRP = uint(GROUP);   // row-slots per lead threadgroup (1 or 2)
+    \\    const uint e = uint(slots[rk]);
+    \\    uint members[2]; uint m;
+    \\    if (!exl3lib_members<GRP, uint(RKC)>(slots, rk, e, L, members, m)) return;
+    \\    threadgroup float red[4][2u * 16u * BTC];
     \\    const device uint* wbase = (const device uint*)(down_t) + ulong(e) * ulong(IN_TILES) * ulong(OUT_TILES) * ulong(N / 2u);
-    \\    const device half* xrow = hdp + ulong(rk) * ulong(INTC) + 4u * (L & 3u);
+    \\    const device half* xbase = hdp + 4u * (L & 3u);
+    \\    const device half* xrow0 = xbase + ulong(members[0]) * ulong(INTC);
+    \\    const device half* xrow1 = xbase + ulong(members[1]) * ulong(INTC);
     \\    const uint per = IN_TILES / (KSC * 4u);
     \\    const uint tk0 = (ks * 4u + sg) * per;
-    \\    exl3lib_gemv_core<N, WMASK, CB, OUT_TILES, BTC>(wbase, xrow, tk0, tk0 + per, blk, L, a);
-    \\    exl3lib_fold<BTC>(a, red[sg], L);
+    \\    if (m == 1u) exl3lib_gemv_members<N, WMASK, CB, OUT_TILES, BTC, 1u>(wbase, xrow0, xrow0, tk0, tk0 + per, blk, L, red[sg]);
+    \\    else exl3lib_gemv_members<N, WMASK, CB, OUT_TILES, BTC, 2u>(wbase, xrow0, xrow1, tk0, tk0 + per, blk, L, red[sg]);
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    if (tid < 16u * BTC) zd[(ulong(ks) * ulong(RKC) + rk) * ulong(HIDC) + blk * (16u * BTC) + tid] = ((red[0][tid] + red[1][tid]) + red[2][tid]) + red[3][tid];
+    \\    if (tid < 16u * BTC * m) {
+    \\        const uint j = tid / (16u * BTC);
+    \\        zd[(ulong(ks) * ulong(RKC) + members[j]) * ulong(HIDC) + blk * (16u * BTC) + (tid - j * 16u * BTC)] = ((red[0][tid] + red[1][tid]) + red[2][tid]) + red[3][tid];
+    \\    }
     \\
 ;
 
@@ -1112,13 +1173,13 @@ pub const text_dfin3 =
     \\    float acc = 0.0f;
     \\    for (uint k = 0; k < TOPKC; ++k) {
     \\        const uint rk = row * TOPKC + k;
-    \\        const uint e = slots[rk];
+    \\        const uint e = uint(slots[rk]);
     \\        float v = 0.0f;
     \\        for (uint ks = 0; ks < KSC; ++ks) v += zd[(ulong(ks) * ulong(RKC) + rk) * ulong(HIDC) + o];
     \\        v = exl3lib_h128(float(half(v)), xch, tid, L);
-    \\        acc = fma(scores[rk], float(half(v * HAD_SCALE * float(down_svh[e * HIDC + o]))), acc);
+    \\        acc = fma(float(scores[rk]), float(half(v * HAD_SCALE * float(down_svh[e * HIDC + o]))), acc);
     \\    }
-    \\    y[ulong(row) * ulong(HIDC) + o] = acc;
+    \\    y[ulong(row) * ulong(HIDC) + o] = OUT_T(acc);   // the caller's dtype (bf16 served, f32 in the tests)
     \\
 ;
 
@@ -1130,10 +1191,10 @@ pub const text_prep2 =
     \\    const uint b = threadgroup_position_in_grid.x;
     \\    const uint rk = threadgroup_position_in_grid.y;
     \\    const uint L = thread_index_in_simdgroup;
-    \\    const uint e = slots[rk];
+    \\    const uint e = uint(slots[rk]);
     \\    const uint row = rk / TOPKC;
     \\    float vg[4]; float vu[4];
-    \\    for (uint j = 0; j < 4u; ++j) { const uint i = b * 128u + L + 32u * j; const float xr = float(half(x[row * DIMC + i])); vg[j] = xr * float(gate_suh[e * DIMC + i]); vu[j] = xr * float(up_suh[e * DIMC + i]); }
+    \\    for (uint j = 0; j < 4u; ++j) { const uint i = b * 128u + L + 32u * j; const float xr = float(half(float(x[row * DIMC + i]))); vg[j] = xr * float(gate_suh[e * DIMC + i]); vu[j] = xr * float(up_suh[e * DIMC + i]); }
     \\    for (uint s = 0; s < 5u; ++s) { const uint bit = 1u << s; for (uint j = 0; j < 4u; ++j) { const float pg = simd_shuffle_xor(vg[j], ushort(bit)); const float pu = simd_shuffle_xor(vu[j], ushort(bit)); vg[j] = (L & bit) ? (pg - vg[j]) : (vg[j] + pg); vu[j] = (L & bit) ? (pu - vu[j]) : (vu[j] + pu); } }
     \\    { float t0 = vg[0] + vg[1], t1 = vg[0] - vg[1], t2 = vg[2] + vg[3], t3 = vg[2] - vg[3]; vg[0] = t0 + t2; vg[1] = t1 + t3; vg[2] = t0 - t2; vg[3] = t1 - t3; }
     \\    { float t0 = vu[0] + vu[1], t1 = vu[0] - vu[1], t2 = vu[2] + vu[3], t3 = vu[2] - vu[3]; vu[0] = t0 + t2; vu[1] = t1 + t3; vu[2] = t0 - t2; vu[3] = t1 - t3; }
@@ -1165,6 +1226,10 @@ pub const Kernels3 = struct {
     ks_dn: u32,
     /// output tiles per GEMV threadgroup (8, 4, 2 or 1): 2 bt f32 accumulators per lane, 128 / (16 bt) x more threadgroups
     bt: u32,
+    /// row-slots per GEMV lead threadgroup from two rows up (2: slots that chose the same expert share one decode)
+    group: u32,
+    /// y's dtype (the x the host passes: bf16 served; f32 in the tests and the bench); set before the first call
+    out_dtype: mlx.mlx_dtype = .float32,
     prep: mlx.mlx_fast_metal_kernel,
     gu: mlx.mlx_fast_metal_kernel,
     fin: mlx.mlx_fast_metal_kernel,
@@ -1179,7 +1244,14 @@ pub const Kernels3 = struct {
     /// K slices: gate/up over hidden/16 tiles in KS x 2 parts, down over inter/16 tiles in KS2 x 4 parts; each part
     /// at least 4 tiles.
     pub fn init(geo: Geometry, bt: u32, ks_max: u32) !Kernels3 {
-        if (!geo.admitted() or (bt != 8 and bt != 4 and bt != 2 and bt != 1) or (ks_max != 1 and ks_max != 2 and ks_max != 4 and ks_max != 8)) return error.BadExl3Shape;
+        return initWith(geo, bt, ks_max, 2);
+    }
+
+    /// `group` 2 pairs the row-slots that chose the same expert under one threadgroup from two rows up (the weights
+    /// read and decoded once, fed to both members' accumulators; Sushi's grouped kernels do the same); 1 keeps every
+    /// row-slot its own threadgroup.
+    pub fn initWith(geo: Geometry, bt: u32, ks_max: u32, group: u32) !Kernels3 {
+        if (!geo.admitted() or (bt != 8 and bt != 4 and bt != 2 and bt != 1) or (ks_max != 1 and ks_max != 2 and ks_max != 4 and ks_max != 8) or (group != 1 and group != 2)) return error.BadExl3Shape;
         var ks_gu: u32 = ks_max;
         while (ks_gu > 1 and (geo.hidden / 16) % (ks_gu * 2) != 0) ks_gu /= 2;
         var ks_dn: u32 = ks_max;
@@ -1189,6 +1261,7 @@ pub const Kernels3 = struct {
             .ks_gu = ks_gu,
             .ks_dn = ks_dn,
             .bt = bt,
+            .group = group,
             .prep = ks.newKernel("exl3lib_prep2", &prep2_inputs, &prep2_outputs, text_prep2, header, true) orelse return error.KernelCreateFailed,
             .gu = ks.newKernel("exl3lib_gu3", &gu3_inputs, &gu3_outputs, text_gu3, header, true) orelse return error.KernelCreateFailed,
             .fin = ks.newKernel("exl3lib_fin3", &fin3_inputs, &fin3_outputs, text_fin3, header, true) orelse return error.KernelCreateFailed,
@@ -1232,13 +1305,15 @@ pub const Kernels3 = struct {
         const ks_gu_t = ks.TemplateArg{ .name = "KS", .value = .{ .int = @intCast(ks_gu_r) } };
         const ks_dn_t = ks.TemplateArg{ .name = "KS", .value = .{ .int = @intCast(ks_dn_r) } };
         const bt_t = ks.TemplateArg{ .name = "BT", .value = .{ .int = @intCast(self.bt) } };
+        const grp_t = ks.TemplateArg{ .name = "GROUP", .value = .{ .int = @intCast(if (rows >= 2) self.group else 1) } };
+        const out_t = ks.TemplateArg{ .name = "OUT_T", .value = .{ .dtype = self.out_dtype } };
         const bw: u32 = 16 * self.bt;
         const c: Cfg = .{
             .prep_h = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 32, rk, 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{ &[_]c_int{ rkc, H }, &[_]c_int{ rkc, H } }, .out_dtypes = &.{ .float16, .float16 }, .template = &.{ .{ .name = "DIM", .value = .{ .int = H } }, topk } }),
-            .gu = try ks.buildConfig(.{ .grid = .{ (g.inter / bw) * 128, rk, ks_gu_r }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{ &[_]c_int{ @intCast(ks_gu_r), rkc, I }, &[_]c_int{ @intCast(ks_gu_r), rkc, I } }, .out_dtypes = &.{ .float32, .float32 }, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_gu_t, bt_t } }),
+            .gu = try ks.buildConfig(.{ .grid = .{ (g.inter / bw) * 128, rk, ks_gu_r }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{ &[_]c_int{ @intCast(ks_gu_r), rkc, I }, &[_]c_int{ @intCast(ks_gu_r), rkc, I } }, .out_dtypes = &.{ .float32, .float32 }, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_gu_t, bt_t, grp_t } }),
             .fin = try ks.buildConfig(.{ .grid = .{ (g.inter / 128) * 128, rk, 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, I }}, .out_dtypes = &.{.float16}, .template = &.{ inter_t, rkt, ks_gu_t } }),
-            .down = try ks.buildConfig(.{ .grid = .{ (g.hidden / bw) * 128, rk, ks_dn_r }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(ks_dn_r), rkc, H }}, .out_dtypes = &.{.float32}, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_dn_t, bt_t } }),
-            .dfin = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 128, @intCast(rows), 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(rows), H }}, .out_dtypes = &.{.float32}, .template = &.{ hid, topk, rkt, ks_dn_t } }),
+            .down = try ks.buildConfig(.{ .grid = .{ (g.hidden / bw) * 128, rk, ks_dn_r }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(ks_dn_r), rkc, H }}, .out_dtypes = &.{.float32}, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_dn_t, bt_t, grp_t } }),
+            .dfin = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 128, @intCast(rows), 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(rows), H }}, .out_dtypes = &.{self.out_dtype}, .template = &.{ hid, topk, rkt, ks_dn_t, out_t } }),
         };
         self.cfg[rows] = c;
         return c;

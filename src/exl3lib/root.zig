@@ -92,7 +92,7 @@ fn validateCall(x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.m
 var cache_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 var cache: [16]?decode.Kernels3 = @splat(null);
 
-fn kernelsFor(geo: decode.Geometry) !*decode.Kernels3 {
+fn kernelsFor(geo: decode.Geometry, out_dtype: mlx.mlx_dtype) !*decode.Kernels3 {
     while (cache_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
     defer cache_lock.store(0, .release);
     var free_slot: ?usize = null;
@@ -100,14 +100,27 @@ fn kernelsFor(geo: decode.Geometry) !*decode.Kernels3 {
         if (slot.*) |*k| {
             const g = k.geo;
             if (g.hidden == geo.hidden and g.inter == geo.inter and g.topk == geo.topk and g.rate.n == geo.rate.n and
-                g.dec.codebook == geo.dec.codebook and g.dec.window == geo.dec.window) return k;
+                g.dec.codebook == geo.dec.codebook and g.dec.window == geo.dec.window and k.out_dtype == out_dtype) return k;
         } else if (free_slot == null) free_slot = i;
     }
     const i = free_slot orelse return error.Exl3EngineCacheFull;
-    // form 3 at 2 output tiles per threadgroup and up to 4 K slices: the M5 Max bench's pick (ties or beats Sushi at every
-    // integer rate)
-    cache[i] = try decode.Kernels3.init(geo, 2, 4);
+    // form 3 at 1 output tile per threadgroup (2 f32 accumulators per lane, 4 grouped) and up to 4 K slices, expert-grouped
+    // row-slots (2 per lead): the M5 Max bench's pick at 4 and 8 rows (window 68), a tie at 1 row. A/B knobs:
+    // MLX_SERVE_EXL3LIB_BT=2 (two tiles), MLX_SERVE_EXL3LIB_GROUP=1 (no grouping).
+    var k3 = try decode.Kernels3.initWith(geo, btFromEnv(), 4, groupFromEnv());
+    k3.out_dtype = out_dtype;
+    cache[i] = k3;
     return &cache[i].?;
+}
+
+fn btFromEnv() u32 {
+    const v = std.c.getenv("MLX_SERVE_EXL3LIB_BT") orelse return 1;
+    return if (v[0] == '2') 2 else 1;
+}
+
+fn groupFromEnv() u32 {
+    const v = std.c.getenv("MLX_SERVE_EXL3LIB_GROUP") orelse return 2;
+    return if (v[0] == '1') 1 else 2;
 }
 
 fn freeArr(a: mlx.mlx_array) void {
@@ -126,27 +139,19 @@ pub fn moe(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array,
     const rows: usize = @intCast(rows_c);
     if (rows > kernels.DECODE_ROWS_MAX) return error.Exl3EngineNotImplemented;
     const K: c_int = mlx.getShape(inds)[2];
-    const k = try kernelsFor(.{ .hidden = @intCast(geo.hidden), .inter = @intCast(geo.width), .topk = @intCast(K), .rate = geo.gate_up, .dec = dec });
-    // the operands the kernels take: x f32 [rows, D], slots u32 [rows * K], scores f32 [rows * K]
+    const k = try kernelsFor(.{ .hidden = @intCast(geo.hidden), .inter = @intCast(geo.width), .topk = @intCast(K), .rate = geo.gate_up, .dec = dec }, mlx.mlx_array_dtype(x));
+    // the operands the kernels take as the host holds them: x [rows, D] (bf16/f16/f32), slots [rows * K] (i32/u32), scores
+    // [rows * K] (bf16/f16/f32); the kernels convert in place and write y in x's dtype, so no cast launches per layer
     var x2 = mlx.mlx_array_new();
     defer freeArr(x2);
     try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ rows_c, xsh[2] }, 2, s));
-    var xf = mlx.mlx_array_new();
-    defer freeArr(xf);
-    try mlx.check(mlx.mlx_astype(&xf, x2, .float32, s));
     var inds1 = mlx.mlx_array_new();
     defer freeArr(inds1);
     try mlx.check(mlx.mlx_reshape(&inds1, inds, &[_]c_int{rows_c * K}, 1, s));
-    var slots = mlx.mlx_array_new();
-    defer freeArr(slots);
-    try mlx.check(mlx.mlx_astype(&slots, inds1, .uint32, s));
     var s1 = mlx.mlx_array_new();
     defer freeArr(s1);
     try mlx.check(mlx.mlx_reshape(&s1, scores, &[_]c_int{rows_c * K}, 1, s));
-    var sc = mlx.mlx_array_new();
-    defer freeArr(sc);
-    try mlx.check(mlx.mlx_astype(&sc, s1, .float32, s));
-    const y0 = try k.moe(s, xf, slots, sc, .{
+    const y0 = try k.moe(s, x2, inds1, s1, .{
         .gate_t = bank.gate.trellis,
         .gate_suh = bank.gate.suh,
         .gate_svh = bank.gate.svh,
@@ -158,12 +163,9 @@ pub fn moe(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array,
         .down_svh = bank.down.svh,
     }, rows);
     defer freeArr(y0);
-    var y3 = mlx.mlx_array_new();
-    defer freeArr(y3);
-    try mlx.check(mlx.mlx_reshape(&y3, y0, xsh.ptr, 3, s));
     var y = mlx.mlx_array_new();
     errdefer freeArr(y);
-    try mlx.check(mlx.mlx_astype(&y, y3, mlx.mlx_array_dtype(x), s));
+    try mlx.check(mlx.mlx_reshape(&y, y0, xsh.ptr, 3, s));
     return y;
 }
 

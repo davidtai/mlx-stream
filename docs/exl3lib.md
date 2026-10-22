@@ -100,6 +100,10 @@ numbers: Qwen3.8-Flash-Next EXL3 5.05 (n80 MUL1 w16), DeepSeek-V4.1-Flash 2.9bpw
 | `lib_prefill_dig` | the generic DIG-X 128-row NAX GEMM waves (gate|up GEMM -> SwiGLU -> down GEMM) | the prefill arm vs Sushi's 32-row windows |
 | `stream_baked` | the plugin's existing K2/K3 5120x2304 forms | DeepSeek only: the generic text must not lose to the baked one |
 
+The decode bench as it runs today (`bench.zig`) has four arms: `b2k4g` (form 3, 2 output tiles per threadgroup, up to 4 K
+slices, expert-grouped row-slots), `b2k4` (the same ungrouped: every row-slot its own threadgroup), `b1k4g` (1 tile per
+threadgroup, grouped: the served default) and `sushi`.
+
 **Protocol.** Per (grid point, arm): parity first (the arm's output against `format.project` composed over the top-k:
 f32 outputs max |err| / rms <= 1e-4, bf16 outputs within 2^-8 |ref| + 1e-4 rms, the DeepSeek tolerances; an arm failing
 parity is not timed), then timing: 48 chained layers (layer l+1's x is layer l's output, each layer its own fresh slots),
@@ -140,5 +144,15 @@ arm within 5e-3 of the host reference:
   compile-time offsets past its first window and the funnel is one select, one shift and one mask per weight at n36 as at
   n80 (`lane.zig` GenPlan). The earlier word-select reader cost 2x at fractional rates.
 
-The engine (`root.moe`) serves form 3 at 2 tiles per threadgroup and up to 4 K slices; the bench's remaining arms
-(1 tile per threadgroup, 8 slices) and the standard cell decide the final setting.
+- **Sushi's 4-row edge was expert grouping, not a cheaper decoder.** Per weight both readers spend about the same ALU (the
+  MUL1 hash is 9 of ~13 ops), but Sushi's grouped kernels decode an expert once for two row-slots that chose it. The bench's
+  slots repeat 7 of 40 experts at 4 rows and 35 of 80 at 8; MTP verify rows overlap more. Form 3 now groups too
+  (`exl3lib_members`: a ballot over all row-slots, any count; `exl3lib_gemv_members<...,M>`), bytes unchanged. M5 Max,
+  window 68 (box under an e2e test load, so absolute numbers are inflated): at 8 rows grouped is 10-20 % faster than
+  ungrouped and faster than Sushi at every rate (n64 888 vs 1411 us, n112 604 vs 798); at 4 rows the 1-tile grouped arm
+  wins or ties everywhere but n40/n96 (-2 %); 1 row is the same kernel grouped or not.
+- **The host glue counted.** `root.moe` used to cast x to f32, the indices to u32 and the scores to f32 and the output back to
+  bf16: four launches per layer on top of the five kernels. The kernels now take the host's dtypes and write bf16 directly.
+
+The engine (`root.moe`) serves form 3 at 1 tile per threadgroup, groups of 2 and up to 4 K slices (knobs
+MLX_SERVE_EXL3LIB_BT, MLX_SERVE_EXL3LIB_GROUP for A/B); the greedy, gated standard cell against the production binary decides.

@@ -33,9 +33,10 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-const Arm = enum { b2k4, b1k4, b2k8, b1k8, sushi };
-const arms = [_]Arm{ .b2k4, .b1k4, .b2k8, .b1k8, .sushi };
-/// form-3 variants: bN = N output tiles per GEMV threadgroup (2N accumulators per lane), kM = up to M K slices
+const Arm = enum { b2k4g, b2k4, b1k4g, sushi };
+const arms = [_]Arm{ .b2k4g, .b2k4, .b1k4g, .sushi };
+/// form-3 variants: bN = N output tiles per GEMV threadgroup (2N accumulators per lane), kM = up to M K slices, g =
+/// expert-grouped row-slots (two slots that chose the same expert share one lead threadgroup and one decode)
 const rates = [_]u32{ 32, 40, 48, 64, 80, 96, 112, 128 };
 const row_counts = [_]u32{ 1, 4, 8 };
 const hidden: u32 = 2560;
@@ -60,7 +61,7 @@ const Ctx = struct {
 
     fn run(c: *const Ctx, arm: Arm) !mlx.mlx_array {
         switch (arm) {
-            .b2k4, .b1k4, .b2k8, .b1k8 => return c.forms[@backingInt(arm)].moe(c.s, c.x2, c.slots1, c.sc1, c.bank, c.rows),
+            .b2k4g, .b2k4, .b1k4g => return c.forms[@backingInt(arm)].moe(c.s, c.x2, c.slots1, c.sc1, c.bank, c.rows),
             .sushi => {
                 if (!has_sushi) return error.SkipZigTest;
                 const b: sushi.Bank = .{
@@ -118,11 +119,11 @@ fn benchCase(a: std.mem.Allocator, g: *G, s: mlx.mlx_stream, n: u32, rows: u32) 
         .down_svh = try g.hostArray(std.mem.sliceAsBytes(bank.down_svh), &.{ ci(experts), ci(hidden) }, .float16),
     };
     const geo: decode.Geometry = .{ .hidden = hidden, .inter = inter, .topk = topk, .rate = rate, .dec = dec };
-    const variants = [_][2]u32{ .{ 2, 4 }, .{ 1, 4 }, .{ 2, 8 }, .{ 1, 8 } };
+    const variants = [_][3]u32{ .{ 2, 4, 2 }, .{ 2, 4, 1 }, .{ 1, 4, 2 } };
     var forms_store: [variants.len]decode.Kernels3 = undefined;
     var forms: [variants.len]*decode.Kernels3 = undefined;
     for (variants, 0..) |v, i| {
-        forms_store[i] = try decode.Kernels3.init(geo, v[0], v[1]);
+        forms_store[i] = try decode.Kernels3.initWith(geo, v[0], v[1], v[2]);
         forms[i] = &forms_store[i];
     }
     defer for (&forms_store) |*f| f.deinit();
