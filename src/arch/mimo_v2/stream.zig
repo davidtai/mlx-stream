@@ -583,7 +583,7 @@ fn p7Ids(rng: std.Random, rows: usize, span: u16, out: []u16) []u16 {
 /// The reader a P7 script runs on: its workers, and (X21) what keeps it behind the call's plans: a sleep injected on each
 /// call's first read-ahead read (`hold_ns`) or a random delay before every range read (`delay_ns`, at most); `relocate`:
 /// the stream built with the overlap schedule's relocation (`Options.prompt_relocate`, glm5_next's route; MiMo's off).
-const P7Pool = struct { workers: u32 = io_workers, hold_ns: i64 = 0, delay_ns: i64 = 0, relocate: bool = false };
+const P7Pool = struct { workers: u32 = io_workers, hold_ns: i64 = 0, delay_ns: i64 = 0, relocate: bool = false, stage: bool = false };
 
 fn p7Fixture(f: *HitFixture, a: std.mem.Allocator, rows: []const u32, schedule: ReadSchedule) !StreamSource {
     return p7FixtureOn(f, a, rows, schedule, .{});
@@ -596,6 +596,7 @@ fn p7FixtureOn(f: *HitFixture, a: std.mem.Allocator, rows: []const u32, schedule
     opts.pool.workers = pool.workers;
     try applyReadSchedule(&opts, schedule);
     opts.prompt_relocate = pool.relocate;
+    opts.stage_transient = pool.stage;
     try f.initOpts(a, opts);
     errdefer f.deinit(a);
     var ss = StreamSource.init(f.stream);
@@ -1019,6 +1020,53 @@ test "mimo p7 read schedule CPU relocate: the read-ahead records the plans evict
     try testing.expectEqual(whole.stats.loads_skipped, trim.stats.loads_skipped);
     try testing.expectEqual(moved.stats.expert_bytes_read, trim.stats.expert_bytes_read);
     std.debug.print("MIMO_P7_RELOCATE crafted bytes current={d} early_whole={d} relocate={d} trim_relocate={d} skipped whole={d} relocate={d}\n", .{ cur.stats.expert_bytes_read, whole.stats.expert_bytes_read, moved.stats.expert_bytes_read, trim.stats.expert_bytes_read, whole.stats.loads_skipped, moved.stats.loads_skipped });
+}
+
+test "mimo p7 read schedule CPU stage: the predicted records no persistent row takes are staged into the windows during the attention and the plans adopt them: current's hits, misses and residents, fewer bytes, every row its record" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    // Eight rows a layer: the persistent read-ahead fills them and the prediction's rest has only the windows to go to.
+    const rows = [_]u32{ 8, 8 };
+    var ids_buf: [64 * 8]u16 = undefined;
+    var pred_buf: [64]u16 = undefined;
+    const call = p7CraftedCall(&ids_buf, &pred_buf);
+    var ids = [_][]const u16{call.ids};
+    var pred = [_][]const u16{call.pred};
+    const script: P7Script = .{ .ids = &ids, .pred = &pred, .per_prompt = 1 };
+    var calls_c: [1]P7Call = undefined;
+    var calls_s: [1]P7Call = undefined;
+    var cur: P7Run = .{ .calls = &calls_c, .stats = .{}, .residents = undefined };
+    var staged: P7Run = .{ .calls = &calls_s, .stats = .{}, .residents = undefined };
+    try p7RunScript(a, .current, &rows, script, &cur);
+    // The stage: every predicted record no persistent row took, into the first `wide_depth` windows; `p7RunCall` checks
+    // every routed expert's row holds its record when its group is consumed.
+    try p7RunScriptOn(a, .early_whole_trim, &rows, script, &staged, .{ .stage = true });
+    try testing.expectEqual(calls_c[0].n_groups, calls_s[0].n_groups);
+    for (0..calls_c[0].n_groups) |g| {
+        try testing.expectEqualSlices(u16, calls_c[0].plans[g].hitsOf(), calls_s[0].plans[g].hitsOf());
+        try testing.expectEqualSlices(u16, calls_c[0].plans[g].missesOf(), calls_s[0].plans[g].missesOf());
+        try testing.expectEqual(calls_c[0].windows[g], calls_s[0].windows[g]);
+    }
+    for (cur.residents, staged.residents) |rc, rs| try testing.expectEqualSlices(u16, &rc, &rs);
+    try testing.expectEqual(cur.stats.expert_cache_hits, staged.stats.expert_cache_hits);
+    try testing.expectEqual(cur.stats.expert_cache_misses, staged.stats.expert_cache_misses);
+    try testing.expect(staged.stats.staged > 0);
+    // A staged record the plans adopt is read once; the rest are read again: never fewer than the control's bytes minus
+    // the adopted records, never more than the control's plus the staged ones.
+    try testing.expect(staged.stats.expert_bytes_read <= cur.stats.expert_bytes_read + staged.stats.staged * (try p7RecordBytes()));
+    std.debug.print("MIMO_P7_STAGE crafted bytes current={d} staged={d} records staged={d} adopted={d} skipped current={d} staged={d}\n", .{ cur.stats.expert_bytes_read, staged.stats.expert_bytes_read, staged.stats.staged, staged.stats.staged_adopted, cur.stats.loads_skipped, staged.stats.loads_skipped });
+    // The reader held on the read-ahead's first read (one worker): the plans arrive before the stage's jobs start, the trim
+    // withdraws them and the plans re-post what they keep; the staged rows the plans adopt still land before their waves.
+    var calls_h: [1]P7Call = undefined;
+    var held: P7Run = .{ .calls = &calls_h, .stats = .{}, .residents = undefined };
+    try p7RunScriptOn(a, .early_whole_trim, &rows, script, &held, .{ .workers = 1, .hold_ns = 300 * std.time.ns_per_ms, .stage = true });
+    for (0..calls_c[0].n_groups) |g| {
+        try testing.expectEqualSlices(u16, calls_c[0].plans[g].hitsOf(), calls_h[0].plans[g].hitsOf());
+        try testing.expectEqualSlices(u16, calls_c[0].plans[g].missesOf(), calls_h[0].plans[g].missesOf());
+    }
+    for (cur.residents, held.residents) |rc, rh| try testing.expectEqualSlices(u16, &rc, &rh);
+    try testing.expect(held.stats.expert_bytes_read <= cur.stats.expert_bytes_read + held.stats.staged * (try p7RecordBytes()));
+    std.debug.print("MIMO_P7_STAGE held-reader bytes current={d} staged={d} records staged={d} adopted={d} dropped={d}\n", .{ cur.stats.expert_bytes_read, held.stats.expert_bytes_read, held.stats.staged, held.stats.staged_adopted, held.stats.ahead_dropped });
 }
 
 test "mimo p7 read schedule CPU relocate: a record whose later transient row an earlier group of the call loads is not relocated (read again, as the control)" {
