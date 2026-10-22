@@ -18,7 +18,7 @@ bits on either engine.
 | | Scope | Status |
 |---|---|---|
 | M1 | `format.zig` (rates, windows, codebooks, `unpackTile`, the packer for tests, H128, suh/svh, `project`), `spec.zig` (the contract), `root.zig` (the API, loader refusals) | done, 24 hermetic tests |
-| M2 | the generic decode chain: one configurable Metal text per kernel kind, specialized at compile on (n, window, codebook, in, out) | next |
+| M2 | the generic decode chain: one configurable Metal text per kernel kind, specialized at compile on (n, window, codebook, in, out) | form 3 serving (see below) |
 | M3 | the generic DIG-style prefill GEMM (128-row NAX waves) at any n and geometry | after M2 |
 | M4 | registry entries, the host provider switch (`expert_quant.engine`) as a ddalcu/mlx-serve PR, the bench harness in the host's test tree | with M2/M3 |
 | M5 | DeepSeek-V4.1 / GLM adoption of the generic kernels (replacing the shape-baked texts) | later |
@@ -120,3 +120,25 @@ experts per wave to fill the GPU).
 The Qwen3.8-Flash-Next EXL3 5.05 pack (`~/models/Qwen3.8-Flash-Next-EXL3-5.05-mlx-serve` on ai-server: turboderp's K5
 MUL1 experts restacked onto the Sushi contract, the mixed pack's 8-bit affine trunk) serves today through `sushi_exl3`;
 its 16K prefill and MTP decode numbers on the production binary are the baseline this library has to beat on that model.
+
+## What the decode benchmark found (2026-10-22)
+
+Measured on the box (M5 Max, 40 GPU cores) with `reports/exl3lib_bench_step.sh`, synthetic banks, Qwen geometry, every
+arm within 5e-3 of the host reference:
+
+- **Fusion by itself is not the lever.** The first fused form (two launches, the rotations recomputed in every threadgroup,
+  the down kernel walking a row's slots serially) was 24 % slower than Sushi on the standard cell. Hoisting the rotations
+  changed nothing. The eleven separately launched steps on the same readers beat both fused forms: MLX batches launches
+  into one command buffer, so their fixed cost is small next to a kernel organized with too little parallelism.
+- **Occupancy and per-lane state are the levers.** Form 2 (one threadgroup per 128-wide block and row-slot, simdgroups as
+  projection x K-half, lane-ordered inputs loaded as one half4 per tile, the finish on all 128 threads) closed most of the
+  gap. Form 3 (split-K partial planes in both GEMVs with finish launches that also fuse SwiGLU, the down's rotation and the
+  slot reduce) at 2 output tiles per threadgroup (4 f32 accumulators per lane) ties or beats Sushi at every integer rate
+  on the M5 Max: n64 rows 4 388 vs 528 us, n112 451 vs 504, n128 374 vs 404, n80 245 / 418 vs 264 / 412 (rows 1 / 4).
+  16 accumulators per lane cost 10-20 % at one row; accumulation stays f32 throughout.
+- **The reader is one path for every even rate.** 8 L n is a multiple of 16 for even n, so each lane's windows sit at
+  compile-time offsets past its first window and the funnel is one select, one shift and one mask per weight at n36 as at
+  n80 (`lane.zig` GenPlan). The earlier word-select reader cost 2x at fractional rates.
+
+The engine (`root.moe`) serves form 3 at 2 tiles per threadgroup and up to 4 K slices; the bench's remaining arms
+(1 tile per threadgroup, 8 slices) and the standard cell decide the final setting.

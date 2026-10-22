@@ -1122,6 +1122,33 @@ pub const text_dfin3 =
     \\
 ;
 
+/// Form 3's prepare for gate and up in one launch: xg, xu half [RK, DIM] in lane order from x [rows, DIM] and the two suh.
+pub const text_prep2 =
+    \\    constexpr uint DIMC = uint(DIM);
+    \\    constexpr uint TOPKC = uint(TOPK);
+    \\    constexpr float HAD_SCALE = 0.08838834764831845f;
+    \\    const uint b = threadgroup_position_in_grid.x;
+    \\    const uint rk = threadgroup_position_in_grid.y;
+    \\    const uint L = thread_index_in_simdgroup;
+    \\    const uint e = slots[rk];
+    \\    const uint row = rk / TOPKC;
+    \\    float vg[4]; float vu[4];
+    \\    for (uint j = 0; j < 4u; ++j) { const uint i = b * 128u + L + 32u * j; const float xr = float(half(x[row * DIMC + i])); vg[j] = xr * float(gate_suh[e * DIMC + i]); vu[j] = xr * float(up_suh[e * DIMC + i]); }
+    \\    for (uint s = 0; s < 5u; ++s) { const uint bit = 1u << s; for (uint j = 0; j < 4u; ++j) { const float pg = simd_shuffle_xor(vg[j], ushort(bit)); const float pu = simd_shuffle_xor(vu[j], ushort(bit)); vg[j] = (L & bit) ? (pg - vg[j]) : (vg[j] + pg); vu[j] = (L & bit) ? (pu - vu[j]) : (vu[j] + pu); } }
+    \\    { float t0 = vg[0] + vg[1], t1 = vg[0] - vg[1], t2 = vg[2] + vg[3], t3 = vg[2] - vg[3]; vg[0] = t0 + t2; vg[1] = t1 + t3; vg[2] = t0 - t2; vg[3] = t1 - t3; }
+    \\    { float t0 = vu[0] + vu[1], t1 = vu[0] - vu[1], t2 = vu[2] + vu[3], t3 = vu[2] - vu[3]; vu[0] = t0 + t2; vu[1] = t1 + t3; vu[2] = t0 - t2; vu[3] = t1 - t3; }
+    \\    for (uint j = 0; j < 4u; ++j) {
+    \\        const uint i = b * 128u + L + 32u * j;
+    \\        const uint r = i & 15u; const uint q = (r & 7u) >> 1u; const uint m = (r & 1u) | ((r >> 3u) << 1u);
+    \\        const ulong o = ulong(rk) * ulong(DIMC) + (i & ~15u) + 4u * q + m;
+    \\        xg[o] = half(vg[j] * HAD_SCALE);
+    \\        xu[o] = half(vu[j] * HAD_SCALE);
+    \\    }
+    \\
+;
+const prep2_inputs = [_][*:0]const u8{ "x", "slots", "gate_suh", "up_suh" };
+const prep2_outputs = [_][*:0]const u8{ "xg", "xu" };
+
 const gu3_inputs = [_][*:0]const u8{ "xgp", "xup", "slots", "gate_t", "up_t" };
 const gu3_outputs = [_][*:0]const u8{ "zg", "zu" };
 const fin3_inputs = [_][*:0]const u8{ "zg", "zu", "slots", "gate_svh", "up_svh", "down_suh" };
@@ -1130,8 +1157,8 @@ const down3_inputs = [_][*:0]const u8{ "hdp", "slots", "down_t" };
 const down3_outputs = [_][*:0]const u8{"zd"};
 const dfin3_inputs = [_][*:0]const u8{ "zd", "slots", "scores", "down_svh" };
 
-/// Form 3: five launches (prepare gate, prepare up, split-K gate/up planes, finish + SwiGLU + down prepare, split-K
-/// down planes, finish + reduce) -> six with the two prepares; KS slices fill the GPU at one row.
+/// Form 3: five launches (prepare gate and up, split-K gate/up planes, finish + SwiGLU + down prepare, split-K down
+/// planes, finish + reduce); KS slices fill the GPU at one row.
 pub const Kernels3 = struct {
     geo: Geometry,
     ks_gu: u32,
@@ -1157,13 +1184,12 @@ pub const Kernels3 = struct {
         while (ks_gu > 1 and (geo.hidden / 16) % (ks_gu * 2) != 0) ks_gu /= 2;
         var ks_dn: u32 = ks_max;
         while (ks_dn > 1 and ((geo.inter / 16) % (ks_dn * 4) != 0 or (geo.inter / 16) / (ks_dn * 4) < 2)) ks_dn /= 2;
-        const unf = @import("unfused.zig");
         return .{
             .geo = geo,
             .ks_gu = ks_gu,
             .ks_dn = ks_dn,
             .bt = bt,
-            .prep = ks.newKernel("exl3lib_prep", &prep_in, &prep_out, unf.text_prep, header, true) orelse return error.KernelCreateFailed,
+            .prep = ks.newKernel("exl3lib_prep2", &prep2_inputs, &prep2_outputs, text_prep2, header, true) orelse return error.KernelCreateFailed,
             .gu = ks.newKernel("exl3lib_gu3", &gu3_inputs, &gu3_outputs, text_gu3, header, true) orelse return error.KernelCreateFailed,
             .fin = ks.newKernel("exl3lib_fin3", &fin3_inputs, &fin3_outputs, text_fin3, header, true) orelse return error.KernelCreateFailed,
             .down = ks.newKernel("exl3lib_down3", &down3_inputs, &down3_outputs, text_down3, header, true) orelse return error.KernelCreateFailed,
@@ -1199,7 +1225,7 @@ pub const Kernels3 = struct {
         const bt_t = ks.TemplateArg{ .name = "BT", .value = .{ .int = @intCast(self.bt) } };
         const bw: u32 = 16 * self.bt;
         const c: Cfg = .{
-            .prep_h = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 32, rk, 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, H }}, .out_dtypes = &.{.float16}, .template = &.{ .{ .name = "DIM", .value = .{ .int = H } }, topk } }),
+            .prep_h = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 32, rk, 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{ &[_]c_int{ rkc, H }, &[_]c_int{ rkc, H } }, .out_dtypes = &.{ .float16, .float16 }, .template = &.{ .{ .name = "DIM", .value = .{ .int = H } }, topk } }),
             .gu = try ks.buildConfig(.{ .grid = .{ (g.inter / bw) * 128, rk, self.ks_gu }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{ &[_]c_int{ @intCast(self.ks_gu), rkc, I }, &[_]c_int{ @intCast(self.ks_gu), rkc, I } }, .out_dtypes = &.{ .float32, .float32 }, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_gu_t, bt_t } }),
             .fin = try ks.buildConfig(.{ .grid = .{ (g.inter / 128) * 128, rk, 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, I }}, .out_dtypes = &.{.float16}, .template = &.{ inter_t, rkt, ks_gu_t } }),
             .down = try ks.buildConfig(.{ .grid = .{ (g.hidden / bw) * 128, rk, self.ks_dn }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(self.ks_dn), rkc, H }}, .out_dtypes = &.{.float32}, .template = &.{ nhw, cb, wb, hid, inter_t, rkt, ks_dn_t, bt_t } }),
@@ -1215,15 +1241,15 @@ pub const Kernels3 = struct {
         return outs[0];
     }
 
-    /// The six launches; the caller frees y.
+    /// The five launches (one prepare for both projections); the caller frees y.
     pub fn moe(self: *Kernels3, s: mlx.mlx_stream, x: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, bank: Kernels.Bank, rows: usize) !mlx.mlx_array {
         const c = try self.cfgs(rows);
-        const xg = try one(self.prep, c.prep_h, &.{ x, slots, bank.gate_suh }, s);
-        defer _ = mlx.mlx_array_free(xg);
-        const xu = try one(self.prep, c.prep_h, &.{ x, slots, bank.up_suh }, s);
-        defer _ = mlx.mlx_array_free(xu);
+        var xp: [2]mlx.mlx_array = undefined;
+        try ks.applyConfig(self.prep, c.prep_h, &.{ x, slots, bank.gate_suh, bank.up_suh }, &xp, s);
+        defer _ = mlx.mlx_array_free(xp[0]);
+        defer _ = mlx.mlx_array_free(xp[1]);
         var planes: [2]mlx.mlx_array = undefined;
-        try ks.applyConfig(self.gu, c.gu, &.{ xg, xu, slots, bank.gate_t, bank.up_t }, &planes, s);
+        try ks.applyConfig(self.gu, c.gu, &.{ xp[0], xp[1], slots, bank.gate_t, bank.up_t }, &planes, s);
         defer _ = mlx.mlx_array_free(planes[0]);
         defer _ = mlx.mlx_array_free(planes[1]);
         const hd = try one(self.fin, c.fin, &.{ planes[0], planes[1], slots, bank.gate_svh, bank.up_svh, bank.down_suh }, s);

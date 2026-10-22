@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- exl3lib M2 (`src/exl3lib/decode.zig`, `unfused.zig`, `bench.zig`): the generic decode chain serving EXL3 experts at every even
+  rate (K1..K8, fractional included), both codebooks and every window. Form 3: one prepare launch (gate and up, lane order), split-K
+  gate/up partial planes, a finish launch (f16 round, H128, svh, f16 round, SwiGLU, the down's rotation), split-K down planes, a
+  finish-and-reduce launch (slot order: deterministic bytes); 2 output tiles per threadgroup (4 f32 accumulators per lane). The
+  funnel is one path for every even n (a lane's windows sit at compile-time offsets past its first). `root.moe` serves decode rows
+  through it (the sushi_exl3 API; prefill rows refuse until M3). Bench (EXL3LIB_GPU=1 EXL3LIB_BENCH=1): fused forms vs the eleven
+  separately launched steps vs Sushi's chain at n 32..128 on the Qwen geometry; on the M5 Max form 3 ties or beats Sushi at every
+  integer rate. Host switch `MLX_SERVE_EXL3_ENGINE=exl3lib` on the fork branch exl3lib-engine.
 - exl3lib (M1 of the EXL3 fused GEMM library, `src/exl3lib/`): the EXL3 trellis format reference and the pack contract,
   API-compatible with Sushi's `sushi_exl3` module so a host switches engines by import. `format.zig` (ported from Sushi's
   reference decoder, MIT) decodes every admitted rate (even n in [16, 128]: K1..K8, fractional included), both codebooks
