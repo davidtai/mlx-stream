@@ -318,3 +318,105 @@ test "exl3lib gpu: dense.linear equals format.project per row at the trunk's rat
         }
     }
 }
+
+// Real tensors: EXL3LIB_REAL_SHARD=<trunk-exl3-NN.safetensors of the full Qwen3.8 pack> runs root.linear on two of its trellis
+// triples (a GDN in-projection and a shared-expert down-projection) against format.project on the same halfwords, bf16 x,
+// rows 3 (GEMV path) and 40 (matmul path). Pins the pack-side interpretation (orientation, dtypes, suh/svh) on turboderp's data.
+test "exl3lib gpu: root.linear on real trunk trellises from the full pack equals format.project (EXL3LIB_REAL_SHARD)" {
+    _ = std.c.getenv("EXL3LIB_GPU") orelse return error.SkipZigTest;
+    const shard_c = std.c.getenv("EXL3LIB_REAL_SHARD") orelse return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const a = testing.allocator;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    const path = std.mem.span(shard_c);
+    // the safetensors header
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY });
+    try testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+    var hl_buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(isize, 8), std.c.pread(fd, &hl_buf, 8, 0));
+    const hlen: usize = @intCast(std.mem.readInt(u64, &hl_buf, .little));
+    const hdr = try a.alloc(u8, hlen);
+    defer a.free(hdr);
+    try testing.expectEqual(@as(isize, @intCast(hlen)), std.c.pread(fd, hdr.ptr, hlen, 8));
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, hdr, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const data_off: usize = 8 + hlen;
+    const Tensor = struct { bytes: []u8, shape: [3]c_int, ndim: usize };
+    const readT = struct {
+        fn run(alloc: std.mem.Allocator, o: std.json.ObjectMap, f: c_int, base: usize, name: []const u8) !Tensor {
+            const t = (o.get(name) orelse return error.MissingWeight).object;
+            const offs = t.get("data_offsets").?.array.items;
+            const o0: usize = @intCast(offs[0].integer);
+            const o1: usize = @intCast(offs[1].integer);
+            const bytes = try alloc.alloc(u8, o1 - o0);
+            if (std.c.pread(f, bytes.ptr, bytes.len, @intCast(base + o0)) != @as(isize, @intCast(bytes.len))) return error.ShortRead;
+            const dims = t.get("shape").?.array.items;
+            var sh: [3]c_int = .{ 1, 1, 1 };
+            for (dims, 0..) |d, i| sh[i] = @intCast(d.integer);
+            return .{ .bytes = bytes, .shape = sh, .ndim = dims.len };
+        }
+    }.run;
+    const bases = [_][]const u8{ "language_model.model.layers.4.linear_attn.in_proj_qkv", "language_model.model.layers.4.mlp.shared_expert.down_proj" };
+    for (bases) |base| {
+        var nb: [200]u8 = undefined;
+        const w = try readT(a, obj, fd, data_off, try std.fmt.bufPrint(&nb, "{s}.weight", .{base}));
+        defer a.free(w.bytes);
+        var nb2: [200]u8 = undefined;
+        const suh = try readT(a, obj, fd, data_off, try std.fmt.bufPrint(&nb2, "{s}.scales", .{base}));
+        defer a.free(suh.bytes);
+        var nb3: [200]u8 = undefined;
+        const svh = try readT(a, obj, fd, data_off, try std.fmt.bufPrint(&nb3, "{s}.biases", .{base}));
+        defer a.free(svh.bytes);
+        try testing.expectEqual(@as(usize, 3), w.ndim);
+        const in_dim: u32 = @intCast(w.shape[0] * 16);
+        const out_dim: u32 = @intCast(w.shape[1] * 16);
+        const n: u32 = @intCast(w.shape[2]);
+        const rate = format.Rate.fromN(n).?;
+        try testing.expectEqual(in_dim, @as(u32, @intCast(suh.shape[0])));
+        try testing.expectEqual(out_dim, @as(u32, @intCast(svh.shape[0])));
+        const trellis = std.mem.bytesAsSlice(u16, w.bytes);
+        const suh16 = std.mem.bytesAsSlice(u16, suh.bytes);
+        const svh16 = std.mem.bytesAsSlice(u16, svh.bytes);
+        // suh/svh sanity: finite, O(1) scales
+        var smin: f32 = 1e9;
+        var smax: f32 = -1e9;
+        for (suh16) |v| {
+            const f: f32 = @floatCast(@as(f16, @bitCast(v)));
+            smin = @min(smin, f);
+            smax = @max(smax, f);
+        }
+        std.debug.print("EXL3LIB_REAL {s}: in={d} out={d} n={d} suh[min,max]=[{d:.4}, {d:.4}]\n", .{ base, in_dim, out_dim, n, smin, smax });
+        const mark = g.mark();
+        defer g.resetTo(mark);
+        const ta = try g.hostArray(w.bytes, &.{ w.shape[0], w.shape[1], w.shape[2] }, .uint16);
+        const sa = try g.hostArray(suh.bytes, &.{ci(in_dim)}, .float16);
+        const va = try g.hostArray(svh.bytes, &.{ci(out_dim)}, .float16);
+        var prng = std.Random.DefaultPrng.init(0xBEEF ^ n);
+        const rnd = prng.random();
+        for ([_]u32{ 3, 40 }) |rows| {
+            const x = try a.alloc(f32, rows * in_dim);
+            defer a.free(x);
+            const bf = @import("../arch/deepseek_v41/ops.zig").bf16Bits;
+            for (x) |*v| v.* = @bitCast(@as(u32, bf(rnd.floatNorm(f32))) << 16);
+            const y_ref = try a.alloc(f32, rows * out_dim);
+            defer a.free(y_ref);
+            const transformed = try a.alloc(f32, in_dim);
+            defer a.free(transformed);
+            const inner = try a.alloc(f32, out_dim);
+            defer a.free(inner);
+            for (0..rows) |r| format.project(x[r * in_dim ..][0..in_dim], @alignCast(trellis), @alignCast(suh16), @alignCast(svh16), in_dim, out_dim, rate, .mul1, transformed, inner, y_ref[r * out_dim ..][0..out_dim]);
+            const x3 = try g.astype(try g.hostArray(std.mem.sliceAsBytes(x), &.{ 1, ci(rows), ci(in_dim) }, .float32), .bfloat16);
+            const y = try g.adopt(try root.linear(s, x3, ta, sa, va, .mul1));
+            const got = try a.alloc(f32, rows * out_dim);
+            defer a.free(got);
+            _ = try g.hostF32(try g.astype(y, .float32), got);
+            const e = ref.compare(got, y_ref);
+            std.debug.print("EXL3LIB_REAL_PARITY {s} rows={d} path={s} max_abs={e:.3} rms={e:.3} ratio={e:.3} {s}\n", .{ base, rows, if (rows <= 16) "gemv" else "matmul", e.max_abs, e.rms_ref, e.max_ratio, if (e.max_ratio <= 2.5e-2) "PASS" else "FAIL" });
+            try testing.expect(e.max_ratio <= 2.5e-2);
+        }
+    }
+}
