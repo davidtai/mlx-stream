@@ -1913,18 +1913,28 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.stage_transient and self.n_free == route_capacity and self.held_base.items.len == 0 and !self.p7.live) {
                     const pol = &self.layers[layer].policy;
                     const cap = pol.capacity;
-                    const room: u32 = @min(@as(u32, self.wide_depth) * self.max_route_ids, self.transient.rows);
-                    var t: u32 = 0;
+                    const width = self.max_route_ids;
+                    const windows: u32 = @min(@as(u32, self.wide_depth), self.transient.rows / width);
+                    // The executor groups the call's experts hottest first, `width` to a group, residents and misses alike,
+                    // and the plan puts group g's misses in window g (g < depth). The stage mirrors that: the prediction's
+                    // rank order counts every expert into its group, and only the group's non-residents take rows of its
+                    // window, in rank order, so the plan finds the group's expert in the window it reads.
                     var staged: u32 = 0;
+                    var idx: u32 = 0;
+                    var k: u32 = 0;
                     for (experts) |e| {
-                        if (n >= fit or t >= room) break;
-                        if (e >= pol.n_experts or pol.expert_to_slot[e] != expert_policy.no_slot) continue;
-                        // A row a reader still fills or a wave still pins is left alone (the stage takes the next one).
-                        while (t < room and (self.locate(layer, cap + t).meta.pins != 0 or self.locate(layer, cap + t).meta.state == .loading)) t += 1;
-                        if (t >= room) break;
-                        ah.loads[n] = .{ .expert = e, .slot = cap + t };
+                        if (e >= pol.n_experts) continue;
+                        const w = idx / width;
+                        if (w >= windows or n >= fit) break;
+                        if (idx % width == 0) k = 0;
+                        idx += 1;
+                        if (pol.expert_to_slot[e] != expert_policy.no_slot) continue;
+                        // A row a reader still fills or a wave still pins is left alone (the stage takes the window's next).
+                        while (k < width and (self.locate(layer, cap + w * width + k).meta.pins != 0 or self.locate(layer, cap + w * width + k).meta.state == .loading)) k += 1;
+                        if (k >= width) continue;
+                        ah.loads[n] = .{ .expert = e, .slot = cap + w * width + k };
                         n += 1;
-                        t += 1;
+                        k += 1;
                         staged += 1;
                     }
                     self.counters.staged += staged;
