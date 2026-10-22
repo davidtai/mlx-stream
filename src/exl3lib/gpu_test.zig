@@ -265,7 +265,8 @@ test "exl3lib gpu: dense.linear equals format.project per row at the trunk's rat
         .{ .in = 2560, .out = 640, .n = 80, .dec = .mul1 },
         .{ .in = 512, .out = 256, .n = 48, .dec = .{ .codebook = .mcg, .window = .w12 } },
     };
-    const row_counts = [_]u32{ 1, 4, 16, 40 };
+    // 1..5, 8: one chunk of the multi-row GEMV at every RB it serves; 9 and 16: two chunks (a partial one at 9); 40: prefill
+    const row_counts = [_]u32{ 1, 2, 3, 4, 5, 8, 9, 16, 40 };
     for (shapes) |sh| {
         var prng = std.Random.DefaultPrng.init(0xD3A5E ^ sh.n ^ sh.out);
         const rnd = prng.random();
@@ -569,6 +570,165 @@ test "exl3lib tool: trunk column order, EXL3 vs the affine pack (EXL3LIB_PERM_FI
             }
             const id_v = dot(ce[c * in_dim ..][0..in_dim], ra[c * in_dim ..][0..in_dim]);
             std.debug.print("  col {d:>6} -> row {d:>6} corr {d:.3} (identity corr {d:.3}) norm_ratio {d:.3}\n", .{ c, best, best_v, id_v, ne[c] / na[best] });
+        }
+    }
+}
+
+// The multi-row GEMV's promise: a row's output bytes do not depend on how many rows share the launch (the summation order is
+// fixed by the shape's K split), so a verify row equals the same row decoded alone.
+test "exl3lib gpu: dense multi-row GEMV, a row's bytes are the same alone and among 2..16 rows (EXL3LIB_GPU=1)" {
+    _ = std.c.getenv("EXL3LIB_GPU") orelse return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const a = testing.allocator;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    const dense = @import("dense.zig");
+    const Shape = struct { in: u32, out: u32, n: u32 };
+    for ([_]Shape{ .{ .in = 2560, .out = 640, .n = 112 }, .{ .in = 640, .out = 2560, .n = 96 } }) |sh| {
+        var prng = std.Random.DefaultPrng.init(0xB17E ^ sh.out);
+        const rnd = prng.random();
+        const rate = format.Rate.fromN(sh.n).?;
+        var bank = try ref.synthBank(a, rnd, 1, sh.in, sh.out, rate);
+        defer bank.deinit(a);
+        const mark = g.mark();
+        defer g.resetTo(mark);
+        const trellis = try g.hostArray(std.mem.sliceAsBytes(bank.gate_t), &.{ ci(sh.in / 16), ci(sh.out / 16), ci(sh.n) }, .uint16);
+        const suh = try g.hostArray(std.mem.sliceAsBytes(bank.gate_suh), &.{ci(sh.in)}, .float16);
+        const svh = try g.hostArray(std.mem.sliceAsBytes(bank.gate_svh), &.{ci(sh.out)}, .float16);
+        var d = try dense.Dense.init(.{ .in = sh.in, .out = sh.out, .rate = rate, .dec = .mul1, .out_dtype = .float32 });
+        defer d.deinit();
+        d.rowslot = false;
+        const max_rows = 16;
+        const x = try a.alloc(f32, max_rows * sh.in);
+        defer a.free(x);
+        for (x) |*v| v.* = rnd.floatNorm(f32);
+        const alone = try a.alloc(f32, max_rows * sh.out);
+        defer a.free(alone);
+        // each row alone
+        for (0..max_rows) |r| {
+            const xr = try g.hostArray(std.mem.sliceAsBytes(x[r * sh.in ..][0..sh.in]), &.{ 1, ci(sh.in) }, .float32);
+            const y = try g.adopt(try d.linear(s, xr, trellis, suh, svh, 1));
+            _ = try g.hostF32(y, alone[r * sh.out ..][0..sh.out]);
+        }
+        for ([_]u32{ 2, 3, 4, 5, 8, 9, 16 }) |rows| {
+            const xr = try g.hostArray(std.mem.sliceAsBytes(x[0 .. rows * sh.in]), &.{ ci(rows), ci(sh.in) }, .float32);
+            const y = try g.adopt(try d.linear(s, xr, trellis, suh, svh, rows));
+            const got = try a.alloc(f32, rows * sh.out);
+            defer a.free(got);
+            _ = try g.hostF32(y, got);
+            var diff: usize = 0;
+            for (got, alone[0 .. rows * sh.out]) |p, q| {
+                if (@as(u32, @bitCast(p)) != @as(u32, @bitCast(q))) diff += 1;
+            }
+            std.debug.print("EXL3LIB_ROWBYTES dense in={d} out={d} n={d} ks={d} rows={d} differing={d}/{d} {s}\n", .{ sh.in, sh.out, sh.n, d.ks_split, rows, diff, got.len, if (diff == 0) "PASS" else "FAIL" });
+            try testing.expectEqual(@as(usize, 0), diff);
+        }
+    }
+}
+
+// Timing of the dense linear on the trunk's shapes (EXL3LIB_GPU=1 EXL3LIB_DENSE_TIME=1): the multi-row GEMV, the per-row-slot
+// GEMV it replaces, and MLX's 8-bit affine quantized_matmul at the same shape (what the mixed pack's trunk runs). Median us
+// per call (the minimum over 7 timed rounds of 16 calls evaluated together, after 2 warm rounds).
+test "exl3lib gpu: dense timing, multi-row vs row-slot vs affine q8 (EXL3LIB_DENSE_TIME=1)" {
+    _ = std.c.getenv("EXL3LIB_GPU") orelse return error.SkipZigTest;
+    _ = std.c.getenv("EXL3LIB_DENSE_TIME") orelse return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const a = std.heap.page_allocator;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    const dense = @import("dense.zig");
+    const Shape = struct { name: []const u8, in: u32, out: u32, n: u32 };
+    const shapes = [_]Shape{
+        .{ .name = "gdn.in_proj_qkv", .in = 2560, .out = 10240, .n = 112 },
+        .{ .name = "attn.q_proj", .in = 2560, .out = 12288, .n = 112 },
+        .{ .name = "gdn.out_proj", .in = 6144, .out = 2560, .n = 112 },
+        .{ .name = "attn.k_proj", .in = 2560, .out = 512, .n = 112 },
+        .{ .name = "shared.gate", .in = 2560, .out = 640, .n = 112 },
+        .{ .name = "shared.down", .in = 640, .out = 2560, .n = 112 },
+        .{ .name = "lm_head/10", .in = 2560, .out = 24832, .n = 96 },
+    };
+    const row_counts = [_]u32{ 1, 2, 3, 4, 5, 8 };
+    const calls = 16;
+    for (shapes) |sh| {
+        var prng = std.Random.DefaultPrng.init(0x7173 ^ sh.out);
+        const rnd = prng.random();
+        const rate = format.Rate.fromN(sh.n).?;
+        const mark = g.mark();
+        defer g.resetTo(mark);
+        const tw = try a.alloc(u16, (sh.in / 16) * (sh.out / 16) * sh.n);
+        defer a.free(tw);
+        for (tw) |*v| v.* = rnd.int(u16);
+        const su = try a.alloc(u16, sh.in);
+        defer a.free(su);
+        for (su) |*v| v.* = format.f32ToF16Bits(0.5 + rnd.float(f32));
+        const sv = try a.alloc(u16, sh.out);
+        defer a.free(sv);
+        for (sv) |*v| v.* = format.f32ToF16Bits(0.5 + rnd.float(f32));
+        const trellis = try g.hostArray(std.mem.sliceAsBytes(tw), &.{ ci(sh.in / 16), ci(sh.out / 16), ci(sh.n) }, .uint16);
+        const suh = try g.hostArray(std.mem.sliceAsBytes(su), &.{ci(sh.in)}, .float16);
+        const svh = try g.hostArray(std.mem.sliceAsBytes(sv), &.{ci(sh.out)}, .float16);
+        // the affine 8-bit operand at the same shape: a random bf16 [out, in] quantized by MLX (group 64)
+        const wf = try a.alloc(f32, sh.out * sh.in);
+        defer a.free(wf);
+        for (wf) |*v| v.* = 0.02 * rnd.floatNorm(f32);
+        const wb = try g.astype(try g.hostArray(std.mem.sliceAsBytes(wf), &.{ ci(sh.out), ci(sh.in) }, .float32), .bfloat16);
+        var qv = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(qv);
+        try mlx.check(mlx.mlx_quantize(&qv, wb, .some(64), .some(8), "affine", .{}, s));
+        var wq = mlx.mlx_array_new();
+        var sc = mlx.mlx_array_new();
+        var bi = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&wq, qv, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&sc, qv, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&bi, qv, 2));
+        wq = try g.adopt(wq);
+        sc = try g.adopt(sc);
+        bi = try g.adopt(bi);
+        try g.evalAll(&.{ trellis, suh, svh, wq, sc, bi });
+        var multi = try dense.Dense.init(.{ .in = sh.in, .out = sh.out, .rate = rate, .dec = .mul1, .out_dtype = .bfloat16 });
+        defer multi.deinit();
+        multi.rowslot = false;
+        var slot = try dense.Dense.init(.{ .in = sh.in, .out = sh.out, .rate = rate, .dec = .mul1, .out_dtype = .bfloat16 });
+        defer slot.deinit();
+        slot.rowslot = true;
+        for (row_counts) |rows| {
+            const xf = try a.alloc(f32, rows * sh.in);
+            defer a.free(xf);
+            for (xf) |*v| v.* = rnd.floatNorm(f32);
+            const x = try g.astype(try g.hostArray(std.mem.sliceAsBytes(xf), &.{ ci(rows), ci(sh.in) }, .float32), .bfloat16);
+            try g.evalAll(&.{x});
+            var med: [3]f64 = .{ 0, 0, 0 };
+            const arms: usize = if (std.c.getenv("EXL3LIB_DENSE_TIME_MULTI_ONLY") != null) 1 else 3;
+            for (0..arms) |arm| {
+                var samples: [7]f64 = undefined;
+                for (0..9) |round| {
+                    var ys: [calls]mlx.mlx_array = undefined;
+                    for (&ys) |*y| {
+                        y.* = switch (arm) {
+                            0 => try multi.linear(s, x, trellis, suh, svh, rows),
+                            1 => try slot.linear(s, x, trellis, suh, svh, rows),
+                            else => blk: {
+                                var o = mlx.mlx_array_new();
+                                try mlx.check(mlx.mlx_quantized_matmul(&o, x, wq, sc, bi, true, .some(64), .some(8), "affine", s));
+                                break :blk o;
+                            },
+                        };
+                    }
+                    const t0 = nowNs();
+                    try g.evalAll(&ys);
+                    const dt = nowNs() - t0;
+                    for (ys) |y| _ = mlx.mlx_array_free(y);
+                    if (round >= 2) samples[round - 2] = @as(f64, @floatFromInt(dt)) / 1000.0 / calls;
+                }
+                // the minimum over rounds: the kernel's time with the least interference from whatever else shares the GPU
+                std.mem.sort(f64, &samples, {}, std.sort.asc(f64));
+                med[arm] = samples[0];
+            }
+            std.debug.print("EXL3LIB_DENSE_TIME {s} in={d} out={d} n={d} ks={d} rows={d} multi_us={d:.1} rowslot_us={d:.1} q8_us={d:.1} multi_vs_rowslot={d:.2}x multi_vs_q8={d:.2}x\n", .{
+                sh.name, sh.in, sh.out, sh.n, multi.ks_split, rows, med[0], med[1], med[2], med[1] / med[0], med[2] / med[0],
+            });
         }
     }
 }
