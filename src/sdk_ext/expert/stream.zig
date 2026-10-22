@@ -2283,13 +2283,16 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const n_e = self.bank.n_experts;
                 const ah = &self.ahead;
                 const ra_live = ah.live and ah.layer == layer;
-                if (self.transient.rows > self.p7_rows.len - n_e) return self.fail(error.RoutesExhausted);
+                // The layer's transient scratch: the widest geometry's, or the second geometry's (`altOf`) for a layer of that
+                // geometry (the 2.9 bpw banks' K = 2 layers), whose rows `locate` and the plans' transient slots name.
+                const t_meta = if (self.altOf(layer)) |x| x.meta else self.transient_meta;
+                if (t_meta.len > self.p7_rows.len - n_e) return self.fail(error.RoutesExhausted);
                 for (self.p7_rows[0..cap], ls.meta[0..cap], 0..) |*v, m, s| {
                     const ra = ra_live and self.ahead_job[s] != no_job;
                     if (m.state == .loading and !ra) return self.fail(error.SlotStillPinned);
                     v.* = .{ .layer = m.layer, .expert = m.expert, .ready = m.state == .ready or (m.state == .loading and ra), .reader = -1 };
                 }
-                for (self.p7_rows[n_e..][0..self.transient.rows], self.transient_meta[0..self.transient.rows], 0..) |*v, m, t| {
+                for (self.p7_rows[n_e..][0..t_meta.len], t_meta, 0..) |*v, m, t| {
                     const ra = ra_live and self.ahead_job[n_e + t] != no_job;
                     if (m.state == .loading and !ra) return self.fail(error.SlotStillPinned);
                     v.* = .{ .layer = m.layer, .expert = m.expert, .ready = m.state == .ready or (m.state == .loading and ra), .reader = -1 };
