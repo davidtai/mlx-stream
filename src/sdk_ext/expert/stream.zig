@@ -2448,7 +2448,17 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const l = plan.loads[li];
                     const loc = self.locate(r.layer, l.slot);
                     const m = loc.meta;
-                    if (m.pins != 0 or m.state == .loading) return self.fail(error.SlotStillPinned);
+                    if (m.pins != 0 or m.state == .loading) {
+                        // The refusal's row, for the log: which schedule left it pinned or loading (a diagnostic, never hot).
+                        const cap = ls.policy.capacity;
+                        const pi7 = self.p7Index(r.layer, l.slot);
+                        const job: u32 = if (self.ahead_job.len > pi7) self.ahead_job[pi7] else no_job;
+                        const v = if (self.p7_rows.len > pi7) self.p7_rows[pi7] else P7Row{};
+                        log.warn("expert stream: p7 submit refused: layer={d} group={d} part={d} slot={d} transient={} state={t} pins={d} read={} expert={d} row.expert={d} row.layer={d} row.ready={} row.reader={d} ahead_job={d} landed={} ahead.live={} ahead.layer={d} staged_on={}\n", .{
+                            r.layer, self.p7.post_g, pi, l.slot, l.slot >= cap, m.state, m.pins, r.reads[li], l.expert, v.expert, v.layer, v.ready, v.reader, job, if (job != no_job and job < self.ahead.landed.len) self.ahead.landed[job] else false, self.ahead.live, self.ahead.layer, self.stage_transient,
+                        });
+                        return self.fail(error.SlotStillPinned);
+                    }
                     if (r.reads[li]) {
                         m.* = .{ .state = .loading, .layer = @intCast(r.layer), .expert = l.expert };
                         rows[nr] = loc.rows.rowDest(loc.row);
