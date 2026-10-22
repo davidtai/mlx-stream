@@ -89,6 +89,7 @@ pub const kernels = [_]Kernel{
     .q3_ph_pvrope_win__kvf32,
     .q3_ph_pvrope_cmp,
     .q3_ph_pvrope_cmp__kvbf16,
+    .q3_ph_flash_cmp,
     .q3pf_hc_mix_rsqrt,
     .q3pf_hc_pre_norm,
     .q3pf_hc_mix_rsqrt__f32,
@@ -1014,11 +1015,16 @@ pub fn PrefillAttn(comptime G: type) type {
         pub const max_kc = 512;
         kind: CoreKind,
         cmp: bool,
+        q_dt: Dtype,
+        ring_dt: Dtype,
         qk: *const Entry,
         pv: *const Entry,
         s32: *const Entry,
         s128: *const Entry,
         statics: Statics(G),
+        /// The fused core (`fuse`): one launch per call in place of QK, softmax and PV, with its own static scale.
+        flash: ?*const Entry = null,
+        flash_statics: Statics(G) = .{},
 
         /// `q` the query dtype (bf16 on the tier), `ring` the window store's dtype, `cmp` a
         /// compressed layer (its store f32). A dtype set the lane does not warm is refused
@@ -1035,11 +1041,23 @@ pub fn PrefillAttn(comptime G: type) type {
             const qk = instantiation(reg, qb, q, ring) orelse return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: {t} has no instantiation at q {t}, window store {t}", .{ qb, q, ring });
             const pv = instantiation(reg, pb, q, ring) orelse return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: {t} has no instantiation at window store {t}", .{ pb, ring });
             const s32 = reg.get(.q3_attnfuse_softmax);
-            return .{ .kind = kind, .cmp = cmp, .qk = qk, .pv = pv, .s32 = s32, .s128 = reg.get(.q3_attnfuse_softmax__ls128), .statics = try Statics(G).init(g, s32) };
+            return .{ .kind = kind, .cmp = cmp, .q_dt = q, .ring_dt = ring, .qk = qk, .pv = pv, .s32 = s32, .s128 = reg.get(.q3_attnfuse_softmax__ls128), .statics = try Statics(G).init(g, s32) };
+        }
+
+        /// The fused attention core (`q3_ph_flash_cmp`): the row's keys read once, the scores kept in the
+        /// threadgroup. Registered for the ropefuse compressed core on the bf16 stream only; another kind,
+        /// a window-only layer or another dtype set is refused (TemplateNotRegistered) and the route keeps
+        /// its three launches.
+        pub fn fuse(self: *Self, g: *G, reg: *const xk.Registry, diag: ?*xk.Diag) !void {
+            if (self.kind != .rope or !self.cmp) return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: q3_ph_flash_cmp fuses the ropefuse compressed core only", .{});
+            const e = instantiation(reg, .q3_ph_flash_cmp, self.q_dt, self.ring_dt) orelse return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: q3_ph_flash_cmp has no instantiation at q {t}, window store {t}", .{ self.q_dt, self.ring_dt });
+            self.flash_statics = try Statics(G).init(g, e);
+            self.flash = e;
         }
 
         pub fn deinit(self: *Self, g: *G) void {
             self.statics.deinit(g);
+            self.flash_statics.deinit(g);
         }
 
         /// q [1, S, 64, 512] (UN-roped for rope), win [1, T, 512] (the window store), widx int32 /
@@ -1079,9 +1097,16 @@ pub fn PrefillAttn(comptime G: type) type {
                 kv[n_kv] = x;
                 n_kv += 1;
             };
-            var ins: [9]G.T = undefined; // q | ex, denom; then the kv operands
+            var ins: [10]G.T = undefined; // q | ex, denom; then the kv operands (fused: q, kv, sink, scale)
             ins[0] = q;
             @memcpy(ins[1 .. 1 + n_kv], kv[0..n_kv]);
+            if (self.flash) |fe| {
+                ins[1 + n_kv] = sink;
+                ins[2 + n_kv] = self.flash_statics.arrays[2 + n_kv];
+                var fo: [1]G.T = undefined;
+                try launchRule(G, g, fe, &vars, ins[0 .. 3 + n_kv], &fo);
+                return fo[0];
+            }
             var sv: [2]G.T = undefined;
             try launchRule(G, g, self.qk, &vars, ins[0 .. 1 + n_kv], &sv);
             var soft_vars: Vars = .initFill(0);
@@ -1629,6 +1654,40 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
         defer pr.deinit(&t);
         try testing.expectEqual(Kernel.q3_ph_qkrope_cmp__kvbf16, pr.qk.kernel);
         try testing.expectEqual(Kernel.q3_ph_pvrope_cmp__kvbf16, pr.pv.kernel);
+        // the fused core: the corevec and the window-only routes refuse it; the ropefuse compressed bf16 route
+        // takes it and attends in ONE launch (q, the kv operands, the rope, the sink, its registered scale)
+        try testing.expectError(error.TemplateNotRegistered, pa.fuse(&t, &reg, null));
+        {
+            var pw = try PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, .bfloat16, .bfloat16, false, null);
+            defer pw.deinit(&t);
+            try testing.expectError(error.TemplateNotRegistered, pw.fuse(&t, &reg, null));
+        }
+        try pr.fuse(&t, &reg, null);
+        const fe = pr.flash.?;
+        try testing.expectEqual(Kernel.q3_ph_flash_cmp, fe.kernel);
+        try testing.expect(fe.samples.len > 0);
+        for (fe.samples) |*s| {
+            const n_s: c_int = @intCast(s.vars.get(.rows));
+            const kc: c_int = @intCast(s.vars.get(.kc));
+            const q = try t.node(&.{ 1, n_s, 64, 512 }, .bfloat16, &.{});
+            const win = try t.node(&.{ 1, @intCast(s.vars.get(.ring)), 512 }, .bfloat16, &.{});
+            const widx = try t.node(&.{ n_s, 128 }, .int32, &.{});
+            const wval = try t.node(&.{ n_s, 128 }, .bool_, &.{});
+            const ckv = try t.node(&.{ 1, @intCast(s.vars.get(.store)), 512 }, .bfloat16, &.{});
+            const cidx = try t.node(&.{ 1, n_s, kc }, .int32, &.{});
+            const qc = try t.node(&.{ n_s, 32 }, .float32, &.{});
+            const qs = try t.node(&.{ n_s, 32 }, .float32, &.{});
+            const n_launch = t.launches.items.len;
+            const o = try pr.attend(&t, q, win, widx, wval, .{ ckv, cidx }, sink, .{ qc, qs });
+            try testing.expectEqual(n_launch + 1, t.launches.items.len);
+            const l = t.back(1);
+            try testing.expect(!l.prepared);
+            try testing.expectEqual(o, l.outs[0]);
+            try testing.expectEqualSlices(c_int, &.{ 8, n_s, 4096 }, t.shapeOf(o).slice());
+            try expectLaunch(l, fe, s, &.{ q, win, l.inputs[2], l.inputs[3], ckv, cidx, qc, qs, sink, pr.flash_statics.arrays[9] });
+            try testing.expectEqual(widx, t.root(l.inputs[2]));
+            try testing.expectEqual([3]u32{ 256, 1, @intCast(n_s) }, l.cfg.grid);
+        }
     }
     try testing.expectError(error.TemplateNotRegistered, PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, .float16, .float32, false, null));
     {
