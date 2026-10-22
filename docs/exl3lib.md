@@ -119,6 +119,16 @@ single-launch forms beat two launches at 1 row and whether they lose at 8; wheth
 TFLOPS at n80 and at Qwen's narrow 640 intermediate (fewer output tiles per wave: the wave table may need two layers'
 experts per wave to fill the GPU).
 
+## The dense linear (a fully EXL3 trunk)
+
+turboderp's packs quantize the trunk too (Qwen3.8-Flash-Next 5.05bpw_h6: attention q/k/v/o, indexer, GDN in/out projections and
+the shared expert at K7, lm_head and the MTP projections at K6, the indexer at K5; the n-gram PLE table as K6 rings), and serving
+the model he measured means serving those. `dense.zig` is one trellis as a projection: prepare (f16 round, suh, H128 per
+128-block), the inner product, finish (f16 round, H128, svh, f16 round). Decode rows reuse the row-slot GEMV with a single expert;
+wider calls dequantize the trellis to an f16 matrix once and run MLX's GEMM on the prepared rows (f32 accumulation, f16 output =
+the finish's first rounding). `root.linear` is the host entry (`mlx_stream.exl3Linear`), dispatched from mlx-serve's `qmatmul`
+for every weight the loader registered from a `trunk_quant` pack. The prefill side is the stopgap until the M3 GEMM.
+
 ## Status of the served Qwen pack
 
 The Qwen3.8-Flash-Next EXL3 5.05 pack (`~/models/Qwen3.8-Flash-Next-EXL3-5.05-mlx-serve` on ai-server: turboderp's K5

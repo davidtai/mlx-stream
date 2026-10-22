@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- exl3lib dense linear (`src/exl3lib/dense.zig`, `root.linear`): one trellis [in/16, out/16, n] with suh/svh as a dense
+  projection at exllamav3's rounding points, for a fully EXL3 trunk (attention, indexer, GDN, shared expert, lm_head, MTP).
+  Decode rows (<= 16) run prepare (lane order), the single-expert trellis GEMV and finish (output in x's dtype); wider calls
+  dequantize the trellis to f16 W [in, out] once (one simdgroup per tile, the GEMV's row/column rule), matmul the naturally
+  ordered prepared rows and finish. Parity against `format.project` per row at K5/K6/K7 MUL1 and K3 MCG w12, rows 1/4/16
+  (GEMV) and 40 (matmul), ratio <= 2e-3 on f32 x; bf16 in and out checked. The host routes `trunk_quant` packs' trellis
+  weights here from `qmatmul` (mlx-serve exl3lib-engine 997b6204).
 - exl3lib decode: expert-grouped row-slots. From two rows up, row-slots that chose the same expert share one GEMV threadgroup
   that reads and decodes each weight once and feeds every member's accumulators in the one-member order (bytes unchanged;
   `exl3lib_members` is a ballot over all row-slots, so 8-row verifies group too where Sushi's 64-slot cap stops). The engine
