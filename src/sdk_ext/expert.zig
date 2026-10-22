@@ -144,6 +144,8 @@ pub const Stats = struct {
     ahead_dropped: u64 = 0,
     /// P7 transient staging: the predicted records read into the transient windows during the attention.
     staged: u64 = 0,
+    /// P7 transient staging: the staged records a call's plans adopted (read once, during the attention).
+    staged_adopted: u64 = 0,
     /// Prompt records copied from a transient row into a resident's row (`Stream.promote`) and their bytes.
     promoted: u64 = 0,
     promoted_bytes: u64 = 0,

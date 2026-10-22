@@ -773,6 +773,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             prompt_relocate: bool = false,
             /// P7 overlap transient staging (`Options.stage_transient`), fixed at construction.
             stage_transient: bool = false,
+            /// The staged layer's prediction: each expert's rank in it (`no_rank`: not predicted), so the arch's hot order
+            /// can group the call as the stage grouped the windows (`predictedRank`).
+            pred_rank: []u16 = &.{},
+            pred_layer: ?u32 = null,
             /// P7 overlap: the prompt call being scheduled; per row (a layer's persistent slots [0, n_experts), then the
             /// transient rows) the record its plans leave and its last reader; per persistent slot the read-ahead job
             /// writing it (`no_job`: none). Empty under `stock`.
@@ -977,6 +981,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 errdefer if (p7_rows.len > 0) a.free(p7_rows);
                 // Indexed by `p7Index`: the persistent slots, then the transient rows (a staged record's job).
                 const ahead_job: []u8 = if (opt.prompt_reads == .overlap) try a.alloc(u8, bank.n_experts + opt.transient_rows) else &.{};
+                const pred_rank: []u16 = if (opt.stage_transient) try a.alloc(u16, bank.n_experts) else &.{};
+                errdefer if (pred_rank.len > 0) a.free(pred_rank);
                 errdefer if (ahead_job.len > 0) a.free(ahead_job);
                 @memset(ahead_job, no_job);
                 const pool = try expert_io.Pool.start(a, pool_opt);
@@ -1020,6 +1026,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .ahead_cap = opt.ahead_cap,
                     .prompt_relocate = opt.prompt_relocate,
                     .stage_transient = opt.stage_transient,
+                    .pred_rank = pred_rank,
                     .p7_rows = p7_rows,
                     .ahead_job = ahead_job,
                 };
@@ -1060,6 +1067,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 a.free(self.ahead.landed);
                 if (self.p7_rows.len > 0) a.free(self.p7_rows);
                 if (self.ahead_job.len > 0) a.free(self.ahead_job);
+                if (self.pred_rank.len > 0) a.free(self.pred_rank);
                 a.destroy(self);
             }
 
@@ -1922,6 +1930,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     var staged: u32 = 0;
                     var idx: u32 = 0;
                     var k: u32 = 0;
+                    @memset(self.pred_rank, no_rank);
+                    self.pred_layer = layer;
+                    for (experts, 0..) |e, ri| if (e < pol.n_experts and ri < no_rank) {
+                        self.pred_rank[e] = @intCast(ri);
+                    };
                     for (experts) |e| {
                         if (e >= pol.n_experts) continue;
                         const w = idx / width;
@@ -2130,6 +2143,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         if ((m.state == .ready or in_flight) and m.layer == layer) staged[t] = m.expert;
                     };
                     ls.policy.planWith(self.p7Group(g), .prefill, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held.items, .staged = if (self.stage_transient) &staged else null });
+                    self.counters.staged_adopted += r.plan.n_adopted;
                     for (r.plan.hitsOf(), r.hit_slots[0..r.plan.n_hits]) |e, *slot| slot.* = ls.policy.slotOf(e).?;
                 }
                 if (self.prompt_ahead == .whole_trim) try self.p7Withdraw(layer);
@@ -2138,6 +2152,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 try self.p7Rows(layer);
                 for (0..n_groups) |g| try self.p7Parts(@intCast(g));
                 try self.p7Post(0);
+            }
+
+            /// P7 transient staging: an expert's rank in the staged layer's prediction (`no_rank`: none, or another layer's).
+            pub const no_rank: u16 = std.math.maxInt(u16);
+            pub fn predictedRank(self: *const Stream, layer: u32, e: u16) u16 {
+                if (!self.stage_transient or self.pred_layer != layer or e >= self.pred_rank.len) return no_rank;
+                return self.pred_rank[e];
             }
 
             /// Group `g` of the scheduled call: its ids, as the executor routes them.

@@ -40,6 +40,8 @@ pub const Plan = struct {
     /// Non-resident experts, in admission order.
     misses: [max_route_ids]u16 = undefined,
     n_loads: u32 = 0,
+    /// P7 transient staging: misses that took the staged row already holding their record (`PlanOpts.staged`).
+    n_adopted: u32 = 0,
     /// Persistent loads in admission order, then transient loads.
     loads: [max_route_ids]Load = undefined,
     /// The persistent loads: `loads[0..n_persistent]`.
@@ -588,6 +590,7 @@ pub const LayerPolicy = struct {
                 for (st, 0..) |se, t| if (se == e and !taken[t]) {
                     taken[t] = true;
                     row_of[k] = @intCast(t);
+                    out.n_adopted += 1;
                     break;
                 };
             }

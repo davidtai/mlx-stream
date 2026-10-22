@@ -167,6 +167,31 @@ pub const StreamSource = struct {
         try self.stream.planCall(layer, distinct, max_route_ids, split);
     }
 
+    /// The wide feed's hottest-first order (`hot_first`). With transient staging the call is grouped as the stage grouped the
+    /// windows: the layer's predicted rank first (the stage's order), experts the prediction left out after them by their
+    /// rows, so each group's experts sit in the window the stage read them into. Exact: a wave's rows are independent of
+    /// its composition; without staging, the stock order (rows descending, ties by id).
+    pub fn hotOrder(self: *StreamSource, layer: u32, distinct: []u16, counts: []const u32) void {
+        const st = self.stream;
+        if (st.stage_transient and st.pred_layer == layer) {
+            const Ctx = struct { st: *Stream, layer: u32, counts: []const u32 };
+            std.sort.pdq(u16, distinct, Ctx{ .st = st, .layer = layer, .counts = counts }, struct {
+                fn lt(c: Ctx, x: u16, y: u16) bool {
+                    const rx = c.st.predictedRank(c.layer, x);
+                    const ry = c.st.predictedRank(c.layer, y);
+                    if (rx != ry) return rx < ry;
+                    return if (c.counts[x] != c.counts[y]) c.counts[x] > c.counts[y] else x < y;
+                }
+            }.lt);
+            return;
+        }
+        std.sort.pdq(u16, distinct, counts, struct {
+            fn lt(c: []const u32, x: u16, y: u16) bool {
+                return if (c[x] != c[y]) c[x] > c[y] else x < y;
+            }
+        }.lt);
+    }
+
     pub fn route(self: *StreamSource, layer: u32, ids: []const u16, scores: []const f32) Error!*Call {
         const st = self.stream;
         const r = if (st.p7.live and st.p7.layer == layer) try st.activateP7(ids) else try st.route(layer, ids, scores);
