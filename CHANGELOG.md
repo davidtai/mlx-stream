@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- DeepSeek-V4.1: the prompt pass's attention chain on bf16 operand fragments, a model setting (`prefill_attn_bf16mma`, off by
+  default). Twins of the compressed layers' QK and PV texts (`q3_ph_qkrope_cmp_bf16mma`, `q3_ph_pvrope_cmp_bf16mma`) keep the
+  chain's tile schedule and launches but hand the tensor ops bf16 fragments (f32 accumulation; the softmax's ex rounded to
+  bf16 in the PV load): the path the GPU runs at its bf16 rate (62 TFLOPS measured on an M5 Max) instead of the f32-fragment
+  path (42). Not bit-identical to the chain (max |diff| 1.8e-4 on outputs of 9e-2 in the GPU parity test, which times it as
+  BF16MMA_TIMING); the cell harness takes `DSV41_CELL_PREFILL_ATTN_BF16MMA`; the call-sites line names it ("attention bf16 mma").
 - DeepSeek-V4.1: the fused attention core for the prompt pass's compressed layers, a model setting (`prefill_attn_fused`,
   off by default: the three-kernel chain is the control). One Metal kernel (`q3_ph_flash_cmp`) per query row and 16-head
   block replaces QK, the ATTN_FUSE softmax and PV: each simdgroup keeps its query quarter in bf16 fragments, gathers its
