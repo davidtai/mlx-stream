@@ -16,7 +16,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "a33959696392f36266c0f4a58ddeb7e2a76a983c7804e6fb09d6c652bc2cf816";
+pub const manifest_sha256 = "0c3f9f31ae24d55e3d40f075b8440aab236a2c2c69763cba498b553d7d884581";
 
 /// G7: the decode-timers build's launch probe (`sdk_ext/kernel_set.zig`: its build flag, keys and observer).
 pub const launch_observed = kset.launch_observed;

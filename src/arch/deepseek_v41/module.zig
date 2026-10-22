@@ -118,6 +118,8 @@ pub const RouteOverrides = struct {
     engram_posted: ?bool = null,
     /// The DIG-X prefill waves' fused down GEMM (the down GEMM and rot_widen1 in one launch; null / false: stock).
     prefill_fused_down: ?bool = null,
+    /// The compressed layers' attention core as one fused launch (q3_ph_flash_cmp; null / false: the three-kernel chain).
+    prefill_attn_fused: ?bool = null,
     /// The verify-row routes (C23 softmax, C27 select, C28 smallm, C29 mxfp8 rows).
     decode_attn_softmax: ?bool = null,
     decode_index_topk: ?bool = null,
@@ -767,6 +769,9 @@ pub const Module = struct {
             if (v and !tier.routes.prefill_attn) return error.PrefillOprojNeedsPrefillAttn;
             tier.routes.prefill_oproj = v;
         }
+        if (config.prefill_attn_fused) |v| tier.routes.prefill_attn_fused = v;
+        if (ov.prefill_attn_fused) |v| tier.routes.prefill_attn_fused = v;
+        if (tier.routes.prefill_attn_fused and !tier.routes.prefill_attn) return error.PrefillAttnFusedNeedsPrefillAttn;
         // kv16-opt route switches (model settings, construction only; default: the tier's route, on).
         if (config.kv16_oproj_bf16) |v| tier.routes.prefill_oproj_bf16 = v;
         if (config.kv16_hcpost) |v| tier.routes.prefill_hcpost = v;
@@ -797,7 +802,7 @@ pub const Module = struct {
             self.model.engram.?.posted = true;
         }
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prompt_overlap = t.arm.stream.prompt_reads == .overlap, .prompt_stage = t.arm.stream.stage_transient, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .grow_fill = t.arm.stream.grow_fill, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .hoist_first = t.arm.hook.hoistFirst(), .devroute = t.arm.hook.devRoute() },
+            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prompt_overlap = t.arm.stream.prompt_reads == .overlap, .prompt_stage = t.arm.stream.stage_transient, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .prefill_attn_fused = self.model.tier.routes.prefill_attn_fused, .transient_release = t.arm.stream.release_installed, .grow_fill = t.arm.stream.grow_fill, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .hoist_first = t.arm.hook.hoistFirst(), .devroute = t.arm.hook.devRoute() },
         };
         // DEVROUTE: exact by construction (the same banked texts per routed pair, the slots the host's plan names; the join
         // takes the miss parts' rows for their pairs).
@@ -1933,6 +1938,8 @@ pub const Installed = struct {
     prefill_unjoined: bool = false,
     /// The DIG-X waves launch the fused down GEMM (installed, past its self-checks).
     prefill_fused_down: bool = false,
+    /// The compressed layers' attention core is the fused launch (q3_ph_flash_cmp).
+    prefill_attn_fused: bool = false,
     /// The phase change's transient release (installed in the stream at construction).
     transient_release: bool = false,
     /// The decode read-ahead's speculative records per layer call (the stream's selector; 0 = none).
@@ -1999,7 +2006,7 @@ pub const Installed = struct {
     }
 
     pub fn callSites(self: Installed, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}, unjoined waves {}, engram posted {}, deferred base calls {}, hc post {}, fused down {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows, self.prefill_unjoined, self.engram_posted, self.wide.defer_base, self.prefill_hc_post, self.prefill_fused_down }) catch buf[0..0];
+        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}, unjoined waves {}, engram posted {}, deferred base calls {}, hc post {}, fused down {}, attention fused {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows, self.prefill_unjoined, self.engram_posted, self.wide.defer_base, self.prefill_hc_post, self.prefill_fused_down, self.prefill_attn_fused }) catch buf[0..0];
     }
 
     /// The construction log line the gates assert.

@@ -64,8 +64,8 @@ def entry(by_name):
     inputs += [sink, scl]
     e['inputs'] = inputs
     e['template'] = [{'dtype': 'bfloat16', 'name': 'TQ'}, {'dtype': 'bfloat16', 'name': 'TKV'}, {'int': 8, 'name': 'GH'}]
-    e['grid'] = [{'m': 256}, {'m': 1}, {'m': 1, 'v': 'rows'}]
-    e['threadgroup'] = [256, 1, 1]
+    e['grid'] = [{'m': 512}, {'m': 1}, {'m': 1, 'v': 'rows'}]   # 4 head blocks x 128 threads per row
+    e['threadgroup'] = [128, 1, 1]
     e['lane_pins'] = [{'hash_of': 'source', 'sha256': sha(src),
                        'symbol': 'q3_ph_flash_cmp (fused attention core, 2026-10-22): no Python lane; parity against the q3_ph_qkrope_cmp__kvbf16 -> q3_attnfuse_softmax -> q3_ph_pvrope_cmp__kvbf16 chain is the route test'},
                       {'hash_of': 'header', 'sha256': sha(hdr), 'symbol': 'header_attnfuse_s2 (the NAX tile header the chain uses)'}]
@@ -73,8 +73,8 @@ def entry(by_name):
     samples = []
     for s in base['launch_samples']:
         s2 = copy.deepcopy(s)
-        s2['grid'] = [256, 1, s['grid'][2]]
-        s2['threadgroup'] = [256, 1, 1]
+        s2['grid'] = [512, 1, s['grid'][2]]
+        s2['threadgroup'] = [128, 1, 1]
         s2['template'] = copy.deepcopy(e['template'])
         samples.append(s2)
     e['launch_samples'] = samples
@@ -101,15 +101,32 @@ def main():
         current = f.read()
     m = json.loads(current)
     if any(e['name'] == NAME for e in m['kernels']):
-        print(f'manifest already carries {NAME}; sha256 {sha(current)}')
-        return 0
-    out = dumps(build(m, current)).encode()
+        # the entry exists: refresh its text's bytes, sha256 and source pin in place (a text edit while iterating)
+        src = read_text(NAME + '.metal')
+        for e in m['kernels']:
+            if e['name'] == NAME:
+                e['source'] = {'bytes': len(src), 'file': NAME + '.metal', 'sha256': sha(src)}
+                for pin in e['lane_pins']:
+                    if pin['hash_of'] == 'source':
+                        pin['sha256'] = sha(src)
+                e['grid'] = [{'m': 512}, {'m': 1}, {'m': 1, 'v': 'rows'}]
+                e['threadgroup'] = [128, 1, 1]
+                for s2 in e['launch_samples']:
+                    s2['grid'] = [512, 1, s2['grid'][2]]
+                    s2['threadgroup'] = [128, 1, 1]
+        out = dumps(m).encode()
+        if out == current:
+            print(f'manifest already carries {NAME} at this text; sha256 {sha(current)}')
+            return 0
+        print(f'refreshed {NAME} in the manifest')
+    else:
+        out = dumps(build(m, current)).encode()
     pin = sha(out)
     if a.check:
         sys.exit(0 if out == current else 1)
     with open(MANIFEST, 'wb') as f:
         f.write(out)
-    print(f'wrote {MANIFEST}: {len(out)} bytes, {len(m["kernels"]) + 1} kernels, sha256 {pin}')
+    print(f'wrote {MANIFEST}: {len(out)} bytes, {len(json.loads(out)["kernels"])} kernels, sha256 {pin}')
     if a.pin:
         src = open(KERNELS_ZIG).read()
         new_src, n = re.subn(r'(pub const manifest_sha256 = ")[0-9a-f]{64}(";)', r'\g<1>' + pin + r'\2', src)
