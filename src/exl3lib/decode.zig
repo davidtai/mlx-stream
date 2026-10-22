@@ -704,3 +704,249 @@ pub const Kernels4 = struct {
         return one(self.down, c.down, &.{ hd, slots, scores, bank.down_t, bank.down_svh }, s);
     }
 };
+
+/// Form 2, launch 1: one 128-thread threadgroup per (128-wide intermediate block, row-slot); simdgroup sg handles
+/// projection sg >> 1 (gate, up) over input half sg & 1. Each lane holds one projection's 8 tiles x 2 columns and loads
+/// its quad's four x rows per tile as one half4 (lane-ordered xg / xu from the prepare). The two halves meet in
+/// threadgroup memory; all 128 threads then round, rotate the block's outputs (5 shuffle stages + 2 threadgroup
+/// exchanges), scale by svh, round and write h = silu(gate) * up.
+pub const text_gu2 =
+    \\    constexpr uint N = uint(NHW);
+    \\    constexpr uint NW = N / 2u;
+    \\    constexpr uint WMASK = (WBITS >= 16) ? 0xffffu : ((1u << uint(WBITS)) - 1u);
+    \\    constexpr int CB = int(CODEBOOK);
+    \\    constexpr uint HIDC = uint(HID);
+    \\    constexpr uint INTC = uint(INTER);
+    \\    constexpr uint IN_TILES = HIDC / 16u;
+    \\    constexpr uint OUT_TILES = INTC / 16u;
+    \\    constexpr bool INTK = (N % 16u) == 0u;
+    \\    constexpr float HAD_SCALE = 0.08838834764831845f;
+    \\    const uint blk = threadgroup_position_in_grid.x;
+    \\    const uint rk = threadgroup_position_in_grid.y;
+    \\    const uint sg = simdgroup_index_in_threadgroup;
+    \\    const uint L = thread_index_in_simdgroup;
+    \\    const uint tid = thread_index_in_threadgroup;
+    \\    const uint e = slots[rk];
+    \\    const uint proj = sg >> 1u;          // 0 gate, 1 up
+    \\    const uint khalf = sg & 1u;
+    \\    threadgroup float red[4][128];       // [sg][output]
+    \\    threadgroup float xch[128];          // the rotation's cross-simdgroup exchange
+    \\    const uint base = INTK ? exl3_int_qb<N>(L) : exl3_lane_base<N>(L);
+    \\    const uint ia = INTK ? exl3_int_a<N>(L) : 0u;
+    \\    const uint ib = INTK ? exl3_int_b<N>(L) : 0u;
+    \\    uint off[8];
+    \\    for (uint m = 0; m < 8u; ++m) off[m] = INTK ? 0u : exl3_lane_off<N>(L, m, base);
+    \\    float a[8][2];
+    \\    for (uint t = 0; t < 8u; ++t) { a[t][0] = 0.0f; a[t][1] = 0.0f; }
+    \\    const device uint* wbase = (const device uint*)(proj == 0u ? gate_t : up_t) + ulong(e) * ulong(IN_TILES) * ulong(OUT_TILES) * ulong(NW);
+    \\    const device half* xrow = (proj == 0u ? xgp : xup) + ulong(rk) * ulong(HIDC) + 4u * (L & 3u);
+    \\    const uint tk_per = IN_TILES / 2u;
+    \\    for (uint tk = khalf * tk_per; tk < (khalf + 1u) * tk_per; ++tk) {
+    \\        const half4 x4 = *reinterpret_cast<const device half4*>(xrow + tk * 16u);
+    \\        const float xr[4] = { float(x4.x), float(x4.y), float(x4.z), float(x4.w) };
+    \\        for (uint t = 0; t < 8u; ++t) {
+    \\            const device uint* tile = wbase + (ulong(tk) * OUT_TILES + blk * 8u + t) * ulong(NW);
+    \\            if (INTK) {
+    \\                const IntWords ww = exl3_int_words<N>(tile, base, ia);
+    \\                uint cw[8];
+    \\                cw[0] = exl3_int_cw<N, WMASK, 0>(ww, ib); cw[1] = exl3_int_cw<N, WMASK, 1>(ww, ib); cw[2] = exl3_int_cw<N, WMASK, 2>(ww, ib); cw[3] = exl3_int_cw<N, WMASK, 3>(ww, ib);
+    \\                cw[4] = exl3_int_cw<N, WMASK, 4>(ww, ib); cw[5] = exl3_int_cw<N, WMASK, 5>(ww, ib); cw[6] = exl3_int_cw<N, WMASK, 6>(ww, ib); cw[7] = exl3_int_cw<N, WMASK, 7>(ww, ib);
+    \\                for (uint m = 0; m < 8u; ++m) a[t][m >> 2] = fma(xr[m & 3u], float(exl3_decode<CB>(cw[m])), a[t][m >> 2]);
+    \\            } else {
+    \\                const LaneWords ww = exl3_lane_words<N>(tile, base);
+    \\                for (uint m = 0; m < 8u; ++m) a[t][m >> 2] = fma(xr[m & 3u], float(exl3_decode<CB>(exl3_lane_cw<WMASK>(ww, off[m]))), a[t][m >> 2]);
+    \\            }
+    \\        }
+    \\    }
+    \\    for (uint t = 0; t < 8u; ++t) for (uint c = 0; c < 2u; ++c) { a[t][c] += simd_shuffle_xor(a[t][c], ushort(1)); a[t][c] += simd_shuffle_xor(a[t][c], ushort(2)); }
+    \\    if ((L & 3u) == 0u) for (uint t = 0; t < 8u; ++t) { red[sg][t * 16u + (L >> 2)] = a[t][0]; red[sg][t * 16u + (L >> 2) + 8u] = a[t][1]; }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    // every thread owns output o = tid for the finish: gate (red 0 + 1) and up (red 2 + 3), f16 round, H128
+    \\    float g = float(half(red[0][tid] + red[1][tid]));
+    \\    float u = float(half(red[2][tid] + red[3][tid]));
+    \\    for (uint st = 0; st < 5u; ++st) {
+    \\        const uint bit = 1u << st;
+    \\        const float pg = simd_shuffle_xor(g, ushort(bit)); const float pu = simd_shuffle_xor(u, ushort(bit));
+    \\        g = (L & bit) ? (pg - g) : (g + pg); u = (L & bit) ? (pu - u) : (u + pu);
+    \\    }
+    \\    // stages 5 and 6 cross simdgroups (bit 5 = sg & 1, bit 6 = sg >> 1) through threadgroup memory
+    \\    for (uint st = 5; st < 7u; ++st) {
+    \\        const uint bit = 1u << st;
+    \\        xch[tid] = g; threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\        const float pg = xch[tid ^ bit]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\        g = (tid & bit) ? (pg - g) : (g + pg);
+    \\        xch[tid] = u; threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\        const float pu = xch[tid ^ bit]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\        u = (tid & bit) ? (pu - u) : (u + pu);
+    \\    }
+    \\    const uint o = blk * 128u + tid;
+    \\    const float gv = float(half(g * HAD_SCALE * float(gate_svh[e * INTC + o])));
+    \\    const float uv = float(half(u * HAD_SCALE * float(up_svh[e * INTC + o])));
+    \\    h[ulong(rk) * ulong(INTC) + o] = (gv / (1.0f + metal::exp(-gv))) * uv;
+    \\
+;
+
+/// Form 2, launch 2: one threadgroup per (128-wide hidden block, row-slot); the four simdgroups split the input tiles;
+/// all 128 threads finish (round, rotate, svh, round) and write yk f32 [RK, hidden] scaled by the slot's score, for the
+/// reduce launch (slot-order sums: deterministic bytes).
+pub const text_down2 =
+    \\    constexpr uint N = uint(NHW);
+    \\    constexpr uint NW = N / 2u;
+    \\    constexpr uint WMASK = (WBITS >= 16) ? 0xffffu : ((1u << uint(WBITS)) - 1u);
+    \\    constexpr int CB = int(CODEBOOK);
+    \\    constexpr uint HIDC = uint(HID);
+    \\    constexpr uint INTC = uint(INTER);
+    \\    constexpr uint IN_TILES = INTC / 16u;
+    \\    constexpr uint OUT_TILES = HIDC / 16u;
+    \\    constexpr bool INTK = (N % 16u) == 0u;
+    \\    constexpr float HAD_SCALE = 0.08838834764831845f;
+    \\    const uint blk = threadgroup_position_in_grid.x;
+    \\    const uint rk = threadgroup_position_in_grid.y;
+    \\    const uint sg = simdgroup_index_in_threadgroup;
+    \\    const uint L = thread_index_in_simdgroup;
+    \\    const uint tid = thread_index_in_threadgroup;
+    \\    const uint e = slots[rk];
+    \\    threadgroup float red[4][128];
+    \\    threadgroup float xch[128];
+    \\    const uint base = INTK ? exl3_int_qb<N>(L) : exl3_lane_base<N>(L);
+    \\    const uint ia = INTK ? exl3_int_a<N>(L) : 0u;
+    \\    const uint ib = INTK ? exl3_int_b<N>(L) : 0u;
+    \\    uint off[8];
+    \\    for (uint m = 0; m < 8u; ++m) off[m] = INTK ? 0u : exl3_lane_off<N>(L, m, base);
+    \\    float a[8][2];
+    \\    for (uint t = 0; t < 8u; ++t) { a[t][0] = 0.0f; a[t][1] = 0.0f; }
+    \\    const device uint* wbase = (const device uint*)(down_t) + ulong(e) * ulong(IN_TILES) * ulong(OUT_TILES) * ulong(NW);
+    \\    const device half* xrow = hdp + ulong(rk) * ulong(INTC) + 4u * (L & 3u);
+    \\    const uint tk_per = IN_TILES / 4u;
+    \\    for (uint tk = sg * tk_per; tk < (sg + 1u) * tk_per; ++tk) {
+    \\        const half4 x4 = *reinterpret_cast<const device half4*>(xrow + tk * 16u);
+    \\        const float xr[4] = { float(x4.x), float(x4.y), float(x4.z), float(x4.w) };
+    \\        for (uint t = 0; t < 8u; ++t) {
+    \\            const device uint* tile = wbase + (ulong(tk) * OUT_TILES + blk * 8u + t) * ulong(NW);
+    \\            if (INTK) {
+    \\                const IntWords ww = exl3_int_words<N>(tile, base, ia);
+    \\                uint cw[8];
+    \\                cw[0] = exl3_int_cw<N, WMASK, 0>(ww, ib); cw[1] = exl3_int_cw<N, WMASK, 1>(ww, ib); cw[2] = exl3_int_cw<N, WMASK, 2>(ww, ib); cw[3] = exl3_int_cw<N, WMASK, 3>(ww, ib);
+    \\                cw[4] = exl3_int_cw<N, WMASK, 4>(ww, ib); cw[5] = exl3_int_cw<N, WMASK, 5>(ww, ib); cw[6] = exl3_int_cw<N, WMASK, 6>(ww, ib); cw[7] = exl3_int_cw<N, WMASK, 7>(ww, ib);
+    \\                for (uint m = 0; m < 8u; ++m) a[t][m >> 2] = fma(xr[m & 3u], float(exl3_decode<CB>(cw[m])), a[t][m >> 2]);
+    \\            } else {
+    \\                const LaneWords ww = exl3_lane_words<N>(tile, base);
+    \\                for (uint m = 0; m < 8u; ++m) a[t][m >> 2] = fma(xr[m & 3u], float(exl3_decode<CB>(exl3_lane_cw<WMASK>(ww, off[m]))), a[t][m >> 2]);
+    \\            }
+    \\        }
+    \\    }
+    \\    for (uint t = 0; t < 8u; ++t) for (uint c = 0; c < 2u; ++c) { a[t][c] += simd_shuffle_xor(a[t][c], ushort(1)); a[t][c] += simd_shuffle_xor(a[t][c], ushort(2)); }
+    \\    if ((L & 3u) == 0u) for (uint t = 0; t < 8u; ++t) { red[sg][t * 16u + (L >> 2)] = a[t][0]; red[sg][t * 16u + (L >> 2) + 8u] = a[t][1]; }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    float v = float(half(((red[0][tid] + red[1][tid]) + red[2][tid]) + red[3][tid]));
+    \\    for (uint st = 0; st < 5u; ++st) { const uint bit = 1u << st; const float p = simd_shuffle_xor(v, ushort(bit)); v = (L & bit) ? (p - v) : (v + p); }
+    \\    for (uint st = 5; st < 7u; ++st) {
+    \\        const uint bit = 1u << st;
+    \\        xch[tid] = v; threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\        const float p = xch[tid ^ bit]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\        v = (tid & bit) ? (p - v) : (v + p);
+    \\    }
+    \\    const uint o = blk * 128u + tid;
+    \\    yk[ulong(rk) * ulong(HIDC) + o] = scores[rk] * float(half(v * HAD_SCALE * float(down_svh[e * HIDC + o])));
+    \\
+;
+
+/// reduce over the slots of a row (the scores already applied): y f32 [rows, hidden] = sum_k yk[r k], slot order
+pub const text_reduce2 =
+    \\    constexpr uint DIMC = uint(DIM);
+    \\    constexpr uint TOPKC = uint(TOPK);
+    \\    const uint d = thread_position_in_grid.x;
+    \\    const uint r = thread_position_in_grid.y;
+    \\    float acc = 0.0f;
+    \\    for (uint k = 0; k < TOPKC; ++k) acc += yk[(r * TOPKC + k) * DIMC + d];
+    \\    y[r * DIMC + d] = acc;
+    \\
+;
+
+const gu2_inputs = [_][*:0]const u8{ "xgp", "xup", "slots", "gate_t", "gate_svh", "up_t", "up_svh" };
+const down2_inputs = [_][*:0]const u8{ "hdp", "slots", "scores", "down_t", "down_svh" };
+const down2_outputs = [_][*:0]const u8{"yk"};
+const reduce2_inputs = [_][*:0]const u8{"yk"};
+
+/// Form 2: five launches per layer (prepare gate, prepare up, gate/up GEMV+finish+SwiGLU, prepare h, down GEMV+finish,
+/// reduce), every threadgroup one (block, row-slot), lane-ordered prepared inputs.
+pub const Kernels2 = struct {
+    geo: Geometry,
+    prep: mlx.mlx_fast_metal_kernel,
+    gu: mlx.mlx_fast_metal_kernel,
+    down: mlx.mlx_fast_metal_kernel,
+    reduce: mlx.mlx_fast_metal_kernel,
+    cfg: [Kernels.max_rows + 1]?Cfg = @splat(null),
+
+    const Cfg = struct { prep_h: mlx.mlx_fast_metal_kernel_config, prep_i: mlx.mlx_fast_metal_kernel_config, gu: mlx.mlx_fast_metal_kernel_config, down: mlx.mlx_fast_metal_kernel_config, reduce: mlx.mlx_fast_metal_kernel_config };
+    const prep_in = [_][*:0]const u8{ "x", "slots", "suh" };
+    const prep_out = [_][*:0]const u8{"xp"};
+
+    pub fn init(geo: Geometry) !Kernels2 {
+        if (!geo.admitted()) return error.BadExl3Shape;
+        const unf = @import("unfused.zig");
+        return .{
+            .geo = geo,
+            .prep = ks.newKernel("exl3lib_prep", &prep_in, &prep_out, unf.text_prep, header, true) orelse return error.KernelCreateFailed,
+            .gu = ks.newKernel("exl3lib_gu2", &gu2_inputs, &gu_outputs, text_gu2, header, true) orelse return error.KernelCreateFailed,
+            .down = ks.newKernel("exl3lib_down2", &down2_inputs, &down2_outputs, text_down2, header, true) orelse return error.KernelCreateFailed,
+            .reduce = ks.newKernel("exl3lib_reduce2", &reduce2_inputs, &down_outputs, text_reduce2, header, true) orelse return error.KernelCreateFailed,
+        };
+    }
+
+    pub fn deinit(self: *Kernels2) void {
+        for (&self.cfg) |*c| if (c.*) |cc| {
+            inline for (.{ cc.prep_h, cc.prep_i, cc.gu, cc.down, cc.reduce }) |k| _ = mlx.mlx_fast_metal_kernel_config_free(k);
+            c.* = null;
+        };
+        inline for (.{ self.prep, self.gu, self.down, self.reduce }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+    }
+
+    fn cfgs(self: *Kernels2, rows: usize) !Cfg {
+        if (rows == 0 or rows > Kernels.max_rows) return error.BadExl3Shape;
+        if (self.cfg[rows]) |c| return c;
+        const g = self.geo;
+        const rk: u32 = @as(u32, @intCast(rows)) * g.topk;
+        const rkc: c_int = @intCast(rk);
+        const H: c_int = @intCast(g.hidden);
+        const I: c_int = @intCast(g.inter);
+        const t = [_]ks.TemplateArg{
+            .{ .name = "NHW", .value = .{ .int = @intCast(g.rate.n) } },
+            .{ .name = "CODEBOOK", .value = .{ .int = @backingInt(g.dec.codebook) } },
+            .{ .name = "WBITS", .value = .{ .int = @intCast(g.dec.window.bits()) } },
+            .{ .name = "HID", .value = .{ .int = H } },
+            .{ .name = "INTER", .value = .{ .int = I } },
+        };
+        const c: Cfg = .{
+            .prep_h = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 32, rk, 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, H }}, .out_dtypes = &.{.float16}, .template = &.{ .{ .name = "DIM", .value = .{ .int = H } }, .{ .name = "TOPK", .value = .{ .int = @intCast(g.topk) } } } }),
+            .prep_i = try ks.buildConfig(.{ .grid = .{ (g.inter / 128) * 32, rk, 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, I }}, .out_dtypes = &.{.float16}, .template = &.{ .{ .name = "DIM", .value = .{ .int = I } }, .{ .name = "TOPK", .value = .{ .int = 1 } } } }),
+            .gu = try ks.buildConfig(.{ .grid = .{ (g.inter / 128) * 128, rk, 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, I }}, .out_dtypes = &.{.float32}, .template = &t }),
+            .down = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 128, rk, 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, H }}, .out_dtypes = &.{.float32}, .template = &t }),
+            .reduce = try ks.buildConfig(.{ .grid = .{ g.hidden, @intCast(rows), 1 }, .threadgroup = .{ 256, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(rows), H }}, .out_dtypes = &.{.float32}, .template = &.{ .{ .name = "DIM", .value = .{ .int = H } }, .{ .name = "TOPK", .value = .{ .int = @intCast(g.topk) } } } }),
+        };
+        self.cfg[rows] = c;
+        return c;
+    }
+
+    fn one(k: mlx.mlx_fast_metal_kernel, c: mlx.mlx_fast_metal_kernel_config, ins: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        var outs: [1]mlx.mlx_array = undefined;
+        try ks.applyConfig(k, c, ins, &outs, s);
+        return outs[0];
+    }
+
+    /// The five launches; the caller frees y.
+    pub fn moe(self: *Kernels2, s: mlx.mlx_stream, x: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, bank: Kernels.Bank, rows: usize) !mlx.mlx_array {
+        const c = try self.cfgs(rows);
+        const xg = try one(self.prep, c.prep_h, &.{ x, slots, bank.gate_suh }, s);
+        defer _ = mlx.mlx_array_free(xg);
+        const xu = try one(self.prep, c.prep_h, &.{ x, slots, bank.up_suh }, s);
+        defer _ = mlx.mlx_array_free(xu);
+        const h = try one(self.gu, c.gu, &.{ xg, xu, slots, bank.gate_t, bank.gate_svh, bank.up_t, bank.up_svh }, s);
+        defer _ = mlx.mlx_array_free(h);
+        const hd = try one(self.prep, c.prep_i, &.{ h, slots, bank.down_suh }, s);
+        defer _ = mlx.mlx_array_free(hd);
+        const yk = try one(self.down, c.down, &.{ hd, slots, scores, bank.down_t, bank.down_svh }, s);
+        defer _ = mlx.mlx_array_free(yk);
+        return one(self.reduce, c.reduce, &.{yk}, s);
+    }
+};

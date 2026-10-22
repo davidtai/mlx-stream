@@ -24,12 +24,20 @@ pub const text_prep =
     \\    for (uint j = 0; j < 4u; ++j) { const uint i = b * 128u + L + 32u * j; v[j] = float(half(x[row * DIMC + i])) * float(suh[e * DIMC + i]); }
     \\    for (uint s = 0; s < 5u; ++s) { const uint bit = 1u << s; for (uint j = 0; j < 4u; ++j) { const float p = simd_shuffle_xor(v[j], ushort(bit)); v[j] = (L & bit) ? (p - v[j]) : (v[j] + p); } }
     \\    { float t0 = v[0] + v[1], t1 = v[0] - v[1], t2 = v[2] + v[3], t3 = v[2] - v[3]; v[0] = t0 + t2; v[1] = t1 + t3; v[2] = t0 - t2; v[3] = t1 - t3; }
-    \\    for (uint j = 0; j < 4u; ++j) xp[rk * DIMC + b * 128u + L + 32u * j] = half(v[j] * HAD_SCALE);
+    \\    // lane order: within each 16-wide tile, position r = 2 q + {0, 1, 8, 9}[m] is stored at 4 q + m, so a GEMV lane
+    \\    // (its quad q = L & 3) loads its four rows of a tile as one half4
+    \\    for (uint j = 0; j < 4u; ++j) {
+    \\        const uint i = b * 128u + L + 32u * j;
+    \\        const uint r = i & 15u;
+    \\        const uint q = (r & 7u) >> 1u;
+    \\        const uint m = (r & 1u) | ((r >> 3u) << 1u);
+    \\        xp[rk * DIMC + (i & ~15u) + 4u * q + m] = half(v[j] * HAD_SCALE);
+    \\    }
     \\
 ;
 
 /// raw GEMV: z f32 [RK, OUT] = xp[rk] . W[slot] (inner sums, unrounded); one 128-thread threadgroup per (128-wide out
-/// block, row-slot), the four simdgroups split the input tiles, lanes read their x rows from device memory
+/// block, row-slot), the four simdgroups split the input tiles, each lane loads its quad's four rows of a tile as one half4
 pub const text_gemv =
     \\    constexpr uint N = uint(NHW);
     \\    constexpr uint NW = N / 2u;
@@ -52,16 +60,14 @@ pub const text_gemv =
     \\    const uint ib = INTK ? exl3_int_b<N>(L) : 0u;
     \\    uint off[8];
     \\    for (uint m = 0; m < 8u; ++m) off[m] = INTK ? 0u : exl3_lane_off<N>(L, m, base);
-    \\    uint rows_of[4];
-    \\    for (uint m = 0; m < 4u; ++m) rows_of[m] = exl3lib_row_of(L, m);
     \\    float a[8][2];
     \\    for (uint t = 0; t < 8u; ++t) { a[t][0] = 0.0f; a[t][1] = 0.0f; }
     \\    const uint tk_per = IN_TILES / 4u;
     \\    const device uint* wbase = (const device uint*)(w) + ulong(e) * ulong(IN_TILES) * ulong(OUT_TILES) * ulong(NW);
-    \\    const device half* xrow = xp + ulong(rk) * ulong(INC);
+    \\    const device half* xrow = xp + ulong(rk) * ulong(INC) + 4u * (L & 3u);   // lane order: the quad's four rows
     \\    for (uint tk = sg * tk_per; tk < (sg + 1u) * tk_per; ++tk) {
-    \\        float xr[4];
-    \\        for (uint m = 0; m < 4u; ++m) xr[m] = float(xrow[tk * 16u + rows_of[m]]);
+    \\        const half4 x4 = *reinterpret_cast<const device half4*>(xrow + tk * 16u);
+    \\        const float xr[4] = { float(x4.x), float(x4.y), float(x4.z), float(x4.w) };
     \\        for (uint t = 0; t < 8u; ++t) {
     \\            const uint tn = blk * 8u + t;
     \\            const device uint* tile = wbase + (ulong(tk) * OUT_TILES + tn) * ulong(NW);
