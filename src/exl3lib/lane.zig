@@ -200,8 +200,8 @@ pub const metal_helpers =
     \\template <uint N, uint WMASK, uint M> inline uint exl3_int_cw(IntWords w, uint b) {
     \\  constexpr uint K = N / 16u; constexpr uint CM = (K % 8u) + K * M; constexpr uint JC = CM >> 4u; constexpr bool CARRY_IF_B = (CM & 15u) >= 8u;
     \\  const uint hsel = (CARRY_IF_B && b != 0u) ? w.h[JC + 1u] : w.h[JC];
-    \\  const uint r = (8u * b + CM) & 15u;
-    \\  return ((hsel >> (16u - r)) & 0xffffu) & WMASK;
+    \\  const uint cw = metal::extract_bits(hsel, 16u - ((8u * b + CM) & 15u), 16u);
+    \\  return (WMASK == 0xffffu) ? cw : (cw & WMASK);
     \\}
     \\// the general fast path (every even N; lane.zig GenPlan): the lane's start bit s, its word qb, halfword a, offset lp
     \\template <uint N> inline uint exl3_gen_s(uint L) { return (((8u * L + 1u) * N) >> 4u) + 16u * N - 16u; }
@@ -213,8 +213,9 @@ pub const metal_helpers =
     \\  constexpr uint CM = (((M + 1u) * N) >> 4u) - (N >> 4u); constexpr uint J = CM >> 4u;
     \\  const uint pos = lp + CM;
     \\  const uint hsel = ((pos >> 4u) == J) ? w.h[J] : w.h[J + 1u];
-    \\  const uint r = pos & 15u;
-    \\  return ((hsel >> (16u - r)) & 0xffffu) & WMASK;
+    \\  // the 16 bits at offset (pos & 15) from the top: one bit-field extract (bits 16 - r .. 31 - r)
+    \\  const uint cw = metal::extract_bits(hsel, 16u - (pos & 15u), 16u);
+    \\  return (WMASK == 0xffffu) ? cw : (cw & WMASK);
     \\}
     \\template <int CB> inline half exl3_decode(uint cw) {
     \\  if (CB == 1) {
