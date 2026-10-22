@@ -890,3 +890,40 @@ pub fn boundedParts(offsets: []const u64, lengths: []const u64, per_part: u32, e
     }
     return ends[0..n_parts];
 }
+
+test "expert policy: adoption takes a staged row in any window, frees a row a depth later, falls back to any free row" {
+    const a = std.testing.allocator;
+    var p = try LayerPolicy.init(a, 16, 0); // no persistent rows: every miss is transient
+    defer p.deinit(a);
+    const width: u32 = 2;
+    const depth: u8 = 2;
+    var slot_of: [16]u32 = @splat(no_slot);
+    var owner: [4]u8 = @splat(LayerPolicy.no_owner);
+    var staged_of_row: [4]u16 = @splat(no_expert);
+    slot_of[5] = 2; // expert 5 staged in window 1's first row
+    staged_of_row[2] = 5;
+    const ad: LayerPolicy.Adopt = .{ .slot_of = &slot_of, .owner = &owner, .staged_of_row = &staged_of_row, .width = width, .depth = depth };
+    var plan: Plan = undefined;
+    // Group 0 (window 0): 5 adopts its row in the other window; 6 takes window 0's first free row.
+    p.planWith(&.{ 5, 6 }, .prefill, &plan, .{ .transient_base = 0, .adopt = &ad, .group = 0 });
+    try std.testing.expectEqual(@as(u32, 1), plan.n_adopted);
+    try std.testing.expectEqual(@as(u32, 2), plan.loads[0].slot);
+    try std.testing.expectEqual(@as(u32, 0), plan.loads[1].slot);
+    // Group 1 (window 1): row 2 is live (group 0), so 7 takes row 3; the window is out, 8 takes the scratch's free row 1.
+    p.planWith(&.{ 7, 8 }, .prefill, &plan, .{ .transient_base = 2, .adopt = &ad, .group = 1 });
+    try std.testing.expectEqual(@as(u32, 0), plan.n_adopted);
+    try std.testing.expectEqual(@as(u32, 3), plan.loads[0].slot);
+    try std.testing.expectEqual(@as(u32, 1), plan.loads[1].slot);
+    // Group 2 (window 0 again): group 0's rows are free, group 1's are not: 9 takes row 0, 10 falls back to row 2 and
+    // overwrites the staged record of 5, which forgets its row.
+    p.planWith(&.{ 9, 10 }, .prefill, &plan, .{ .transient_base = 0, .adopt = &ad, .group = 2 });
+    try std.testing.expectEqual(@as(u32, 0), plan.loads[0].slot);
+    try std.testing.expectEqual(@as(u32, 2), plan.loads[1].slot);
+    try std.testing.expectEqual(no_slot, slot_of[5]);
+    try std.testing.expectEqual(no_expert, staged_of_row[2]);
+    try std.testing.expectEqual(@as(u8, 2), owner[0]);
+    try std.testing.expectEqual(@as(u8, 1), owner[1]);
+    try std.testing.expectEqual(@as(u8, 2), owner[2]);
+    try std.testing.expectEqual(@as(u8, 1), owner[3]);
+    for (plan.loads[0..plan.n_loads]) |l| try std.testing.expect(!l.persistent);
+}
