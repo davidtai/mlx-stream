@@ -270,14 +270,14 @@ test "dsv41 settings: expert_event_gates and embedding_host_rows are bools, anyt
     try testing.expectEqual(@as(?bool, false), (try settingsOf("{\"embedding_host_rows\": false}")).embedding_host_rows);
 }
 
-test "dsv41 settings: the prefill routes are a bool, a bool and a depth of 1 to the stream's 5; cold rows 1 to 8; anything else is unset" {
+test "dsv41 settings: the prefill routes are a bool, a bool and a depth of 1 to the stream's 8; cold rows 1 to 8; anything else is unset" {
     const a = try settingsOf("{\"layer_major_prefill\": true, \"expert_wide_feed\": false, \"expert_wide_depth\": 2, \"expert_wide_cold_rows\": 8}");
     try testing.expectEqual(@as(?bool, true), a.layer_major_prefill);
     try testing.expectEqual(@as(?bool, false), a.expert_wide_feed);
     try testing.expectEqual(@as(?u8, 2), a.expert_wide_depth);
     try testing.expectEqual(@as(?u8, 8), a.expert_wide_cold_rows);
-    // Every depth the stream takes is honored, 3 to 5 too (a depth of 5 is the served tier's default); 0 and 6 are not.
-    try testing.expectEqual(@as(u8, 5), expert_stream.max_wide_depth);
+    // Every depth the stream takes is honored, 3 to 8 too (a depth of 5 is the served tier's default); 0 and 9 are not.
+    try testing.expectEqual(@as(u8, 8), expert_stream.max_wide_depth);
     for (1..expert_stream.max_wide_depth + 1) |d| {
         var buf: [64]u8 = undefined;
         const s = try settingsOf(try std.fmt.bufPrint(&buf, "{{\"expert_wide_depth\": {d}}}", .{d}));
@@ -285,7 +285,7 @@ test "dsv41 settings: the prefill routes are a bool, a bool and a depth of 1 to 
         try testing.expectEqual(@as(u8, @intCast(d)), s.dsv41WideDepth());
     }
     try testing.expectEqual(@as(?u8, null), (try settingsOf("{\"expert_wide_depth\": 0}")).expert_wide_depth);
-    const c = try settingsOf("{\"layer_major_prefill\": 1, \"expert_wide_depth\": 6, \"expert_wide_cold_rows\": 9, \"expert_wide_seed\": \"on\"}");
+    const c = try settingsOf("{\"layer_major_prefill\": 1, \"expert_wide_depth\": 9, \"expert_wide_cold_rows\": 9, \"expert_wide_seed\": \"on\"}");
     try testing.expectEqual(@as(?bool, null), c.layer_major_prefill);
     try testing.expectEqual(@as(?u8, null), c.expert_wide_depth);
     try testing.expectEqual(@as(?u8, null), c.expert_wide_cold_rows);

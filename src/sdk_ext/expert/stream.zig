@@ -657,8 +657,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         /// groups: DeepSeek-V4.1's 384 experts are 8 groups of 48, 10 with a seed-aligned split (MiMo's 256 and GLM's 288
         /// fit in 6). Bounded by the pool's gates (the assert below).
         pub const route_capacity = 10;
-        /// Prefill routes one layer may hold live at once (`Options.wide_depth`; P1c: 5, the served default).
-        pub const max_wide_depth = 5;
+        /// Prefill routes one layer may hold live at once (`Options.wide_depth`; P1c: 5, the served default). Eight lets the
+        /// transient stage (`Options.stage_transient`) cover every group of a 384-expert layer's call (8 groups of 48), one
+        /// window each; the route ring holds `route_capacity` (10) and the window masks are a byte.
+        pub const max_wide_depth = 8;
         comptime {
             // Every route the stream holds is gated at most once, the gate/up gate and a down gate per part (a part at
             // least one id): their gates fit the pool's ring.

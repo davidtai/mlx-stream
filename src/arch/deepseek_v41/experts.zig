@@ -4438,8 +4438,9 @@ test "dsv41 experts: wide depth 5 (the served default): five groups live, the re
     const k = 6;
     var ids: [n * k]u16 = undefined;
     for (&ids, 0..) |*e, i| e.* = @intCast(((i % k) * 40 + i / k) % 240);
-    const depth = expert_stream.max_wide_depth;
-    try testing.expectEqual(@as(u8, 5), depth);
+    // The served default (the stream takes up to `max_wide_depth`, 8 since the transient stage).
+    const depth: u8 = 5;
+    try testing.expect(depth <= expert_stream.max_wide_depth);
     const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 1024 }, .wide_depth = depth, .transient_rows = depth * max_route_ids });
     defer s.deinit();
     StreamRec.stream = s;
