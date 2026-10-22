@@ -420,3 +420,155 @@ test "exl3lib gpu: root.linear on real trunk trellises from the full pack equals
         }
     }
 }
+
+// CPU-only tool. EXL3LIB_PERM_FILE names a small safetensors file holding, per trunk module <base>, the EXL3 triple as
+// "exl3:<base>.{weight,scales,biases}" and the mixed pack's affine 8-bit triple as "aff:<base>.{weight,scales,biases}"
+// (weight U32 [out, in/4], scales/biases BF16 [out, in/group]). It reconstructs the EXL3 public weight [in, out]
+// (format.reconstructPublic) and the affine weight [out, in], then reports how the EXL3 output columns map onto the
+// affine output rows: per 128-block identity agreement and, for a sample of columns, the best-matching affine row.
+// A permutation here means turboderp's export orders a projection's outputs differently from mlx-serve's converter.
+test "exl3lib tool: trunk column order, EXL3 vs the affine pack (EXL3LIB_PERM_FILE)" {
+    const path_c = std.c.getenv("EXL3LIB_PERM_FILE") orelse return error.SkipZigTest;
+    const a = std.heap.page_allocator;
+    const path = std.mem.span(path_c);
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY });
+    try testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+    var hl_buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(isize, 8), std.c.pread(fd, &hl_buf, 8, 0));
+    const hlen: usize = @intCast(std.mem.readInt(u64, &hl_buf, .little));
+    const hdr = try a.alloc(u8, hlen);
+    defer a.free(hdr);
+    try testing.expectEqual(@as(isize, @intCast(hlen)), std.c.pread(fd, hdr.ptr, hlen, 8));
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, hdr, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const data_off: usize = 8 + hlen;
+    const Tensor = struct { bytes: []u8, shape: [3]usize, ndim: usize };
+    const readT = struct {
+        fn run(alloc: std.mem.Allocator, o: std.json.ObjectMap, f: c_int, base: usize, name: []const u8) !Tensor {
+            const t = (o.get(name) orelse return error.MissingWeight).object;
+            const offs = t.get("data_offsets").?.array.items;
+            const o0: usize = @intCast(offs[0].integer);
+            const o1: usize = @intCast(offs[1].integer);
+            const bytes = try alloc.alloc(u8, o1 - o0);
+            if (std.c.pread(f, bytes.ptr, bytes.len, @intCast(base + o0)) != @as(isize, @intCast(bytes.len))) return error.ShortRead;
+            const dims = t.get("shape").?.array.items;
+            var sh: [3]usize = .{ 1, 1, 1 };
+            for (dims, 0..) |d, i| sh[i] = @intCast(d.integer);
+            return .{ .bytes = bytes, .shape = sh, .ndim = dims.len };
+        }
+    }.run;
+    var it = obj.iterator();
+    while (it.next()) |e| {
+        const k = e.key_ptr.*;
+        if (!std.mem.startsWith(u8, k, "exl3:") or !std.mem.endsWith(u8, k, ".weight")) continue;
+        const base = k[5 .. k.len - 7];
+        var nb: [6][256]u8 = undefined;
+        const w = try readT(a, obj, fd, data_off, try std.fmt.bufPrint(&nb[0], "exl3:{s}.weight", .{base}));
+        defer a.free(w.bytes);
+        const suh = try readT(a, obj, fd, data_off, try std.fmt.bufPrint(&nb[1], "exl3:{s}.scales", .{base}));
+        defer a.free(suh.bytes);
+        const svh = try readT(a, obj, fd, data_off, try std.fmt.bufPrint(&nb[2], "exl3:{s}.biases", .{base}));
+        defer a.free(svh.bytes);
+        const aw = readT(a, obj, fd, data_off, try std.fmt.bufPrint(&nb[3], "aff:{s}.weight", .{base})) catch {
+            std.debug.print("EXL3LIB_PERM {s}: no affine counterpart\n", .{base});
+            continue;
+        };
+        defer a.free(aw.bytes);
+        const asc = try readT(a, obj, fd, data_off, try std.fmt.bufPrint(&nb[4], "aff:{s}.scales", .{base}));
+        defer a.free(asc.bytes);
+        const abi = try readT(a, obj, fd, data_off, try std.fmt.bufPrint(&nb[5], "aff:{s}.biases", .{base}));
+        defer a.free(abi.bytes);
+        const in_dim = w.shape[0] * 16;
+        const out_dim = w.shape[1] * 16;
+        const n: u32 = @intCast(w.shape[2]);
+        const rate = format.Rate.fromN(n) orelse return error.BadExl3Shape;
+        try testing.expectEqual(out_dim, aw.shape[0]);
+        try testing.expectEqual(in_dim / 4, aw.shape[1]);
+        const gs = in_dim / asc.shape[1];
+        // EXL3 public weight [in, out]
+        const we16 = try a.alloc(u16, in_dim * out_dim);
+        defer a.free(we16);
+        const trellis: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, w.bytes));
+        const suh16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, suh.bytes));
+        const svh16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, svh.bytes));
+        try format.reconstructPublic(a, trellis, suh16, svh16, in_dim, out_dim, rate, .mul1, we16);
+        // normalized EXL3 columns ce[c][i], with their norms
+        const ce = try a.alloc(f32, in_dim * out_dim);
+        defer a.free(ce);
+        const ne = try a.alloc(f32, out_dim);
+        defer a.free(ne);
+        for (0..out_dim) |c| {
+            var ss: f64 = 0;
+            for (0..in_dim) |i| {
+                const v = format.f16BitsToF32(we16[i * out_dim + c]);
+                ce[c * in_dim + i] = v;
+                ss += @as(f64, v) * v;
+            }
+            const nrm: f32 = @floatCast(@sqrt(ss) + 1e-20);
+            ne[c] = nrm;
+            for (0..in_dim) |i| ce[c * in_dim + i] /= nrm;
+        }
+        // normalized affine rows ra[o][i] = (scale * q + bias) / norm
+        const ra = try a.alloc(f32, in_dim * out_dim);
+        defer a.free(ra);
+        const na = try a.alloc(f32, out_dim);
+        defer a.free(na);
+        const aw32: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, aw.bytes));
+        const asc16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, asc.bytes));
+        const abi16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, abi.bytes));
+        const groups = in_dim / gs;
+        for (0..out_dim) |o| {
+            var ss: f64 = 0;
+            for (0..in_dim) |i| {
+                const q: f32 = @floatFromInt((aw32[o * (in_dim / 4) + i / 4] >> @intCast(8 * (i % 4))) & 0xff);
+                const s: f32 = @bitCast(@as(u32, asc16[o * groups + i / gs]) << 16);
+                const b: f32 = @bitCast(@as(u32, abi16[o * groups + i / gs]) << 16);
+                const v = s * q + b;
+                ra[o * in_dim + i] = v;
+                ss += @as(f64, v) * v;
+            }
+            const nrm: f32 = @floatCast(@sqrt(ss) + 1e-20);
+            na[o] = nrm;
+            for (0..in_dim) |i| ra[o * in_dim + i] /= nrm;
+        }
+        const dot = struct {
+            fn run(x: []const f32, y: []const f32) f32 {
+                var s: f32 = 0;
+                for (x, y) |p, q| s += p * q;
+                return s;
+            }
+        }.run;
+        // identity agreement per 128-block
+        const nblk = out_dim / 128;
+        var blocks: [512]u8 = undefined;
+        var ident: usize = 0;
+        for (0..@min(nblk, blocks.len)) |bk| {
+            var m: usize = 0;
+            for (0..128) |j| {
+                const c = bk * 128 + j;
+                if (dot(ce[c * in_dim ..][0..in_dim], ra[c * in_dim ..][0..in_dim]) > 0.9) m += 1;
+            }
+            ident += m;
+            blocks[bk] = if (m == 128) 'X' else if (m > 0) 'x' else '.';
+        }
+        std.debug.print("EXL3LIB_PERM {s} in={d} out={d} n={d} gs={d} identity_cols={d}/{d} blocks(128)={s}\n", .{ base, in_dim, out_dim, n, gs, ident, out_dim, blocks[0..@min(nblk, blocks.len)] });
+        // a sample of columns: where does each one's best match sit?
+        const samples: usize = 24;
+        for (0..samples) |j| {
+            const c = (j * out_dim) / samples + 5;
+            var best: usize = 0;
+            var best_v: f32 = -2;
+            for (0..out_dim) |o| {
+                const v = dot(ce[c * in_dim ..][0..in_dim], ra[o * in_dim ..][0..in_dim]);
+                if (v > best_v) {
+                    best_v = v;
+                    best = o;
+                }
+            }
+            const id_v = dot(ce[c * in_dim ..][0..in_dim], ra[c * in_dim ..][0..in_dim]);
+            std.debug.print("  col {d:>6} -> row {d:>6} corr {d:.3} (identity corr {d:.3}) norm_ratio {d:.3}\n", .{ c, best, best_v, id_v, ne[c] / na[best] });
+        }
+    }
+}

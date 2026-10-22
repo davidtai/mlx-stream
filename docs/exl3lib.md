@@ -146,6 +146,11 @@ A pack whose trunk is EXL3 too (turboderp's as published) carries, beside `exper
 - Layout differences from the HF-style source the restack resolves: conv1d weights are stored MLX-style [C, K, 1] (PyTorch's
   [C, 1, K] has the same bytes, so only the shape changes); plain f16 tensors become bf16 (lossless for bf16-origin values);
   the MTP hyper-connection mixer, which turboderp's pack lacks, is carried from the hybrid pack (affine 8-bit).
+- `qwen4_norm_convention: delta` in config.json: turboderp's shards keep Qwen3-Next's zero-centered RMSNorm weights as HF stores
+  them (hc_norm, q_norm, k_norm, indexer layernorms, PLE norms, MTP pre_fc norms), while mlx-serve's converter folds +1 into them
+  and an unmarked external-table pack is read as folded. Without the marker every such norm multiplies by about zero and the
+  model emits garbage with every linear bit-exact. A norm carried from a converter pack (the MTP mixer's hc_norm) is unfolded
+  (-1) by the restack so the whole pack is one convention.
 - Expert shards and the table are hard links of the source files; `restack_exl3_full.py` on the box builds the pack from the
   hybrid pack (experts, tokenizer, vision) and a fetched trunk directory (`fetch_exl3_trunk.py`: the non-expert tensors by
   HTTP byte range).
