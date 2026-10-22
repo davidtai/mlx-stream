@@ -14,6 +14,7 @@ pub const lane = @import("lane.zig");
 pub const decode = @import("decode.zig");
 pub const ref = @import("ref.zig");
 pub const unfused = @import("unfused.zig");
+pub const dense = @import("dense.zig");
 
 pub const Spec = spec.Spec;
 pub const parseExpertQuant = spec.parseExpertQuant;
@@ -113,9 +114,128 @@ fn kernelsFor(geo: decode.Geometry, out_dtype: mlx.mlx_dtype) !*decode.Kernels3 
     return &cache[i].?;
 }
 
+/// MLX_SERVE_EXL3LIB_SLOT_STATS=1: a diagnostic that reads every decode call's routing back to the host (a sync per layer,
+/// so never on in a timed run) and prints, every 480 calls, how the row-slots of a call repeat experts: the multiplicity
+/// histogram that sizes the grouping (GROUP 2 covers pairs; 3 and 4 would want wider groups) and the decode work a perfect
+/// grouping would save.
+const SlotStats = struct {
+    var state: ?bool = null;
+    var calls: u64 = 0;
+    var calls_rows: [17]u64 = @splat(0);
+    var slots_total: [17]u64 = @splat(0);
+    var distinct_total: [17]u64 = @splat(0);
+    var mult: [17][6]u64 = @splat(@splat(0)); // [rows][multiplicity 1..4, 5+]
+
+    fn enabled() bool {
+        if (state) |on| return on;
+        const v = std.c.getenv("MLX_SERVE_EXL3LIB_SLOT_STATS");
+        const on = v != null and v.?[0] == '1';
+        state = on;
+        return on;
+    }
+
+    fn record(inds: mlx.mlx_array, rows: usize, K: usize) !void {
+        const n = rows * K;
+        var buf: [16 * 64]u32 = undefined;
+        if (rows > 16 or n > buf.len) return;
+        try mlx.check(mlx.mlx_array_eval(inds));
+        if (mlx.mlx_array_dtype(inds) == .int32) {
+            const p = mlx.mlx_array_data_int32(inds) orelse return error.NullData;
+            for (0..n) |i| buf[i] = @intCast(p[i]);
+        } else {
+            const p = mlx.mlx_array_data_uint32(inds) orelse return error.NullData;
+            for (0..n) |i| buf[i] = p[i];
+        }
+        var distinct: usize = 0;
+        for (0..n) |i| {
+            const e = buf[i];
+            var seen = false;
+            for (0..i) |j| if (buf[j] == e) {
+                seen = true;
+                break;
+            };
+            if (seen) continue;
+            distinct += 1;
+            var m: usize = 0;
+            for (0..n) |j| if (buf[j] == e) {
+                m += 1;
+            };
+            mult[rows][@min(m, 5)] += 1;
+        }
+        slots_total[rows] += n;
+        distinct_total[rows] += distinct;
+        calls_rows[rows] += 1;
+        calls += 1;
+        if (calls % 480 == 0) print();
+    }
+
+    fn print() void {
+        for (1..17) |r| if (calls_rows[r] > 0) {
+            const saved = 100.0 * (1.0 - @as(f64, @floatFromInt(distinct_total[r])) / @as(f64, @floatFromInt(slots_total[r])));
+            std.debug.print("[exl3lib slot-stats] rows={d} calls={d} slots={d} distinct={d} perfect_grouping_saves={d:.1}% experts_by_multiplicity 1={d} 2={d} 3={d} 4={d} 5+={d}\n", .{
+                r, calls_rows[r], slots_total[r], distinct_total[r], saved, mult[r][1], mult[r][2], mult[r][3], mult[r][4], mult[r][5],
+            });
+        };
+    }
+};
+
 fn btFromEnv() u32 {
     const v = std.c.getenv("MLX_SERVE_EXL3LIB_BT") orelse return 1;
     return if (v[0] == '2') 2 else 1;
+}
+
+/// The dense-linear kernels of every (in, out, rate, decode, dtype) this process has served: the trunk of a fully EXL3 model
+/// has a dozen shapes (attention q/k/v/o, indexer, GDN qkv/z/out, shared gate/up/down, lm_head, MTP fc).
+var dense_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+var dense_cache: [32]?dense.Dense = @splat(null);
+
+fn denseFor(shape: dense.Shape) !*dense.Dense {
+    while (dense_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    defer dense_lock.store(0, .release);
+    var free_slot: ?usize = null;
+    for (&dense_cache, 0..) |*slot, i| {
+        if (slot.*) |*d| {
+            const g = d.shape;
+            if (g.in == shape.in and g.out == shape.out and g.rate.n == shape.rate.n and g.dec.codebook == shape.dec.codebook and
+                g.dec.window == shape.dec.window and g.out_dtype == shape.out_dtype) return d;
+        } else if (free_slot == null) free_slot = i;
+    }
+    const i = free_slot orelse return error.Exl3EngineCacheFull;
+    dense_cache[i] = try dense.Dense.init(shape);
+    return &dense_cache[i].?;
+}
+
+/// A dense EXL3 linear: y [..., out] in x's dtype for x [..., in], trellis U16/I16 [in/16, out/16, n], suh F16 [in], svh F16
+/// [out]. Rows up to `kernels.DECODE_ROWS_MAX` take the GEMV kernels, wider calls the dequantize-and-matmul path.
+pub fn linear(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, dec: format.Decode) !mlx.mlx_array {
+    const xsh = mlx.getShape(x);
+    if (xsh.len < 1) return error.BadExl3Shape;
+    const tsh = mlx.getShape(trellis);
+    if (tsh.len != 3) return error.BadExl3Shape;
+    const in_dim: u32 = @intCast(tsh[0] * 16);
+    const out_dim: u32 = @intCast(tsh[1] * 16);
+    const rate = format.Rate.fromN(@intCast(tsh[2])) orelse return error.BadExl3Shape;
+    if (xsh[xsh.len - 1] != @as(c_int, @intCast(in_dim))) return error.BadExl3Shape;
+    if (mlx.getShape(suh)[0] != @as(c_int, @intCast(in_dim)) or mlx.getShape(svh)[0] != @as(c_int, @intCast(out_dim))) return error.BadExl3Shape;
+    const xd = mlx.mlx_array_dtype(x);
+    if (xd != .bfloat16 and xd != .float32 and xd != .float16) return error.BadExl3Dtype;
+    var rows: c_int = 1;
+    for (xsh[0 .. xsh.len - 1]) |d| rows *= d;
+    if (rows < 1) return error.BadExl3Shape;
+    const d = try denseFor(.{ .in = in_dim, .out = out_dim, .rate = rate, .dec = dec, .out_dtype = xd });
+    var x2 = mlx.mlx_array_new();
+    defer freeArr(x2);
+    try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ rows, @intCast(in_dim) }, 2, s));
+    const y2 = try d.linear(s, x2, trellis, suh, svh, @intCast(rows));
+    defer freeArr(y2);
+    var osh: [8]c_int = undefined;
+    if (xsh.len > osh.len) return error.BadExl3Shape;
+    for (xsh, 0..) |v, i| osh[i] = v;
+    osh[xsh.len - 1] = @intCast(out_dim);
+    var y = mlx.mlx_array_new();
+    errdefer freeArr(y);
+    try mlx.check(mlx.mlx_reshape(&y, y2, osh[0..xsh.len].ptr, @intCast(xsh.len), s));
+    return y;
 }
 
 fn groupFromEnv() u32 {
@@ -139,6 +259,7 @@ pub fn moe(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array,
     const rows: usize = @intCast(rows_c);
     if (rows > kernels.DECODE_ROWS_MAX) return error.Exl3EngineNotImplemented;
     const K: c_int = mlx.getShape(inds)[2];
+    if (SlotStats.enabled()) SlotStats.record(inds, rows, @intCast(K)) catch {};
     const k = try kernelsFor(.{ .hidden = @intCast(geo.hidden), .inter = @intCast(geo.width), .topk = @intCast(K), .rate = geo.gate_up, .dec = dec }, mlx.mlx_array_dtype(x));
     // the operands the kernels take as the host holds them: x [rows, D] (bf16/f16/f32), slots [rows * K] (i32/u32), scores
     // [rows * K] (bf16/f16/f32); the kernels convert in place and write y in x's dtype, so no cast launches per layer

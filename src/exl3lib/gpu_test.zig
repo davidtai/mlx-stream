@@ -247,3 +247,74 @@ test "exl3lib gpu: root.moe (the sushi_exl3-shaped entry) equals the reference t
     const sw = try g.zeros(&.{ 1, 32, ci(c.topk) }, .bfloat16);
     try testing.expectError(error.Exl3EngineNotImplemented, root.moe(s, xw, bank_arrays, iw, sw, c.dec, false));
 }
+
+// The dense linear (the full-EXL3 trunk's path): rows 1, 4 and 16 through the GEMV kernels, 40 through dequantize-and-matmul,
+// at K7 (the attention and GDN projections' rate), K6 (lm_head, MTP fc) and K5, both directions of a 2560 x 640 shape.
+test "exl3lib gpu: dense.linear equals format.project per row at the trunk's rates, GEMV and prefill paths (EXL3LIB_GPU=1)" {
+    _ = std.c.getenv("EXL3LIB_GPU") orelse return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const a = testing.allocator;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    const Shape = struct { in: u32, out: u32, n: u32, dec: format.Decode };
+    const shapes = [_]Shape{
+        .{ .in = 2560, .out = 640, .n = 112, .dec = .mul1 },
+        .{ .in = 640, .out = 2560, .n = 112, .dec = .mul1 },
+        .{ .in = 2560, .out = 512, .n = 96, .dec = .mul1 },
+        .{ .in = 2560, .out = 640, .n = 80, .dec = .mul1 },
+        .{ .in = 512, .out = 256, .n = 48, .dec = .{ .codebook = .mcg, .window = .w12 } },
+    };
+    const row_counts = [_]u32{ 1, 4, 16, 40 };
+    for (shapes) |sh| {
+        var prng = std.Random.DefaultPrng.init(0xD3A5E ^ sh.n ^ sh.out);
+        const rnd = prng.random();
+        const rate = format.Rate.fromN(sh.n).?;
+        // one expert of a synthetic bank: its gate projection is a dense in -> out linear
+        var bank = try ref.synthBank(a, rnd, 1, sh.in, sh.out, rate);
+        defer bank.deinit(a);
+        const ht = ci(sh.in / 16);
+        const ot = ci(sh.out / 16);
+        const mark = g.mark();
+        defer g.resetTo(mark);
+        const trellis = try g.hostArray(std.mem.sliceAsBytes(bank.gate_t), &.{ ht, ot, ci(sh.n) }, .uint16);
+        const suh = try g.hostArray(std.mem.sliceAsBytes(bank.gate_suh), &.{ci(sh.in)}, .float16);
+        const svh = try g.hostArray(std.mem.sliceAsBytes(bank.gate_svh), &.{ci(sh.out)}, .float16);
+        for (row_counts) |rows| {
+            const x = try a.alloc(f32, rows * sh.in);
+            defer a.free(x);
+            const bf = @import("../arch/deepseek_v41/ops.zig").bf16Bits;
+            for (x) |*v| v.* = @bitCast(@as(u32, bf(rnd.floatNorm(f32))) << 16);
+            const y_ref = try a.alloc(f32, rows * sh.out);
+            defer a.free(y_ref);
+            const transformed = try a.alloc(f32, sh.in);
+            defer a.free(transformed);
+            const inner = try a.alloc(f32, sh.out);
+            defer a.free(inner);
+            for (0..rows) |r| format.project(x[r * sh.in ..][0..sh.in], bank.gate_t, bank.gate_suh, bank.gate_svh, sh.in, sh.out, rate, sh.dec, transformed, inner, y_ref[r * sh.out ..][0..sh.out]);
+            // f32 x: the numeric bar is the decode chain's (5e-3 of the reference rms); the output is f32 too
+            const x3 = try g.hostArray(std.mem.sliceAsBytes(x), &.{ 1, ci(rows), ci(sh.in) }, .float32);
+            const y = try g.adopt(try root.linear(s, x3, trellis, suh, svh, sh.dec));
+            try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(y));
+            const ysh = mlx.getShape(y);
+            try testing.expect(ysh.len == 3 and ysh[1] == ci(rows) and ysh[2] == ci(sh.out));
+            const got = try a.alloc(f32, rows * sh.out);
+            defer a.free(got);
+            _ = try g.hostF32(y, got);
+            const e = ref.compare(got, y_ref);
+            std.debug.print("EXL3LIB_PARITY dense in={d} out={d} n={d} cb={s} rows={d} path={s} max_abs={e:.3} rms={e:.3} ratio={e:.3} {s}\n", .{
+                sh.in, sh.out, sh.n, @tagName(sh.dec.codebook), rows, if (rows <= 16) "gemv" else "matmul", e.max_abs, e.rms_ref, e.max_ratio, if (e.max_ratio <= 5e-3) "PASS" else "FAIL",
+            });
+            try testing.expect(e.max_ratio <= 5e-3);
+            // bf16 x: the served dtype in and out (one bf16 ulp of rounding on top)
+            if (rows == 4 or rows == 40) {
+                const xb = try g.astype(x3, .bfloat16);
+                const yb = try g.adopt(try root.linear(s, xb, trellis, suh, svh, sh.dec));
+                try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(yb));
+                _ = try g.hostF32(try g.astype(yb, .float32), got);
+                const eb = ref.compare(got, y_ref);
+                try testing.expect(eb.max_ratio <= 2.5e-2);
+            }
+        }
+    }
+}
