@@ -2454,7 +2454,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         const pi7 = self.p7Index(r.layer, l.slot);
                         const job: u32 = if (self.ahead_job.len > pi7) self.ahead_job[pi7] else no_job;
                         const v = if (self.p7_rows.len > pi7) self.p7_rows[pi7] else P7Row{};
-                        log.warn("expert stream: p7 submit refused: layer={d} group={d} part={d} slot={d} transient={} state={t} pins={d} read={} expert={d} row.expert={d} row.layer={d} row.ready={} row.reader={d} ahead_job={d} landed={} ahead.live={} ahead.layer={d} staged_on={}\n", .{
+                        std.debug.print("expert stream: p7 submit refused: layer={d} group={d} part={d} slot={d} transient={} state={t} pins={d} read={} expert={d} row.expert={d} row.layer={d} row.ready={} row.reader={d} ahead_job={d} landed={} ahead.live={} ahead.layer={d} staged_on={}\n", .{
                             r.layer, self.p7.post_g, pi, l.slot, l.slot >= cap, m.state, m.pins, r.reads[li], l.expert, v.expert, v.layer, v.ready, v.reader, job, if (job != no_job and job < self.ahead.landed.len) self.ahead.landed[job] else false, self.ahead.live, self.ahead.layer, self.stage_transient,
                         });
                         return self.fail(error.SlotStillPinned);
