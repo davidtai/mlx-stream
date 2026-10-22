@@ -1,7 +1,8 @@
 //! The decode-chain benchmark (EXL3LIB_GPU=1 EXL3LIB_BENCH=1, else skipped): three arms on the same synthetic banks at
 //! every integer rate K2..K8 (n 32..128) plus the fractional n40, Qwen3.8-Flash-Next's geometry (2560 x 640, top-10),
 //! rows 1 / 4 / 8 (decode and MTP verify widths):
-//!   fused   - exl3lib's two-launch chain (`decode.zig`)
+//!   fused   - exl3lib's two-launch chain (`decode.zig`, the rotations inside every threadgroup)
+//!   fused4  - exl3lib's four-launch chain (the rotations hoisted: prepare, gate/up, prepare, down)
 //!   steps   - the same math as eleven separately launched steps on the same readers (`unfused.zig`)
 //!   sushi   - the host's Sushi module chain (`sushi_exl3.moe`, reached through `mlx_host`), the shipped control
 //! Parity of every arm against the host reference first (an arm failing parity is reported, not timed); then rounds
@@ -32,8 +33,8 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-const Arm = enum { fused, steps, sushi };
-const arms = [_]Arm{ .fused, .steps, .sushi };
+const Arm = enum { fused, fused4, steps, sushi };
+const arms = [_]Arm{ .fused, .fused4, .steps, .sushi };
 const rates = [_]u32{ 32, 40, 48, 64, 80, 96, 112, 128 };
 const row_counts = [_]u32{ 1, 4, 8 };
 const hidden: u32 = 2560;
@@ -55,6 +56,7 @@ const Ctx = struct {
     bank: decode.Kernels.Bank,
     k: *decode.Kernels,
     st: *unfused.Steps,
+    k4: *decode.Kernels4,
     dec: format.Decode,
 
     fn run(c: *const Ctx, arm: Arm) !mlx.mlx_array {
@@ -64,6 +66,7 @@ const Ctx = struct {
                 _ = mlx.mlx_array_free(o.h);
                 return o.y;
             },
+            .fused4 => return c.k4.moe(c.s, c.x2, c.slots1, c.sc1, c.bank, c.rows),
             .steps => return c.st.moe(c.s, c.x2, c.slots1, c.sc1, c.bank, c.rows),
             .sushi => {
                 if (!has_sushi) return error.SkipZigTest;
@@ -125,6 +128,8 @@ fn benchCase(a: std.mem.Allocator, g: *G, s: mlx.mlx_stream, n: u32, rows: u32) 
     defer k.deinit();
     var st = try unfused.Steps.init(.{ .hidden = hidden, .inter = inter, .topk = topk, .rate = rate, .dec = dec });
     defer st.deinit();
+    var k4 = try decode.Kernels4.init(.{ .hidden = hidden, .inter = inter, .topk = topk, .rate = rate, .dec = dec });
+    defer k4.deinit();
     const c: Ctx = .{
         .s = s,
         .rows = rows,
@@ -137,10 +142,11 @@ fn benchCase(a: std.mem.Allocator, g: *G, s: mlx.mlx_stream, n: u32, rows: u32) 
         .bank = bank_arrays,
         .k = &k,
         .st = &st,
+        .k4 = &k4,
         .dec = dec,
     };
     // parity
-    var timed = [_]bool{ false, false, false };
+    var timed = [_]bool{ false, false, false, false };
     const got = try a.alloc(f32, rows * hidden);
     defer a.free(got);
     for (arms, 0..) |arm, ai| {
@@ -160,7 +166,7 @@ fn benchCase(a: std.mem.Allocator, g: *G, s: mlx.mlx_stream, n: u32, rows: u32) 
         std.debug.print("EXL3LIB_BENCH_PARITY n={d} rows={d} arm={s} max_abs={e:.3} ratio={e:.3} {s}\n", .{ n, rows, @tagName(arm), e.max_abs, e.max_ratio, if (timed[ai]) "PASS" else "FAIL" });
     }
     // timing: interleaved rounds, rotated start
-    var samples: [3][rounds]u64 = undefined;
+    var samples: [4][rounds]u64 = undefined;
     var r: usize = 0;
     while (r < rounds + 3) : (r += 1) {
         var ai: usize = 0;

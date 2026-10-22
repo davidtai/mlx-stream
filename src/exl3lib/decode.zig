@@ -191,6 +191,122 @@ pub const text_gu =
     \\
 ;
 
+/// Launch 1 of form 1b: `text_gu` with the input rotation done once per (row, slot) by `unfused.text_prep`.
+pub const text_gu4 =
+    \\    constexpr uint N = uint(NHW);
+    \\    constexpr uint NW = N / 2u;
+    \\    constexpr uint WMASK = (WBITS >= 16) ? 0xffffu : ((1u << uint(WBITS)) - 1u);
+    \\    constexpr int CB = int(CODEBOOK);
+    \\    constexpr int PRB = int(PROBE);
+    \\    constexpr uint HIDC = uint(HID);
+    \\    constexpr uint INTC = uint(INTER);
+    \\    constexpr uint TOPKC = uint(TOPK);
+    \\    constexpr uint IN_TILES = HIDC / 16u;
+    \\    constexpr uint OUT_TILES = INTC / 16u;
+    \\    constexpr float HAD_SCALE = 0.08838834764831845f;
+    \\    const uint blk = threadgroup_position_in_grid.x;      // 128-wide block of the intermediate
+    \\    const uint k = threadgroup_position_in_grid.y;        // slot
+    \\    const uint row = threadgroup_position_in_grid.z;
+    \\    const uint sg = simdgroup_index_in_threadgroup;
+    \\    const uint L = thread_index_in_simdgroup;
+    \\    const uint e = slots[row * TOPKC + k];
+    \\    threadgroup float red_g[4][128];
+    \\    threadgroup float red_u[4][128];
+    \\    const device half* xg = xgp + ulong(row * TOPKC + k) * ulong(HIDC);
+    \\    const device half* xu = xup + ulong(row * TOPKC + k) * ulong(HIDC);
+    \\    // 2. the GEMV over this simdgroup's quarter of the input tiles, the block's 8 output tiles, gate and up
+    \\    constexpr bool INTK = (N % 16u) == 0u;
+    \\    const uint base = INTK ? exl3_int_qb<N>(L) : exl3_lane_base<N>(L);
+    \\    const uint ia = INTK ? exl3_int_a<N>(L) : 0u;
+    \\    const uint ib = INTK ? exl3_int_b<N>(L) : 0u;
+    \\    uint off[8];
+    \\    for (uint m = 0; m < 8u; ++m) off[m] = INTK ? 0u : exl3_lane_off<N>(L, m, base);
+    \\    uint rows_of[4];
+    \\    for (uint m = 0; m < 4u; ++m) rows_of[m] = exl3lib_row_of(L, m);
+    \\    float ag[8][2]; float au[8][2];
+    \\    for (uint t = 0; t < 8u; ++t) { ag[t][0] = 0.0f; ag[t][1] = 0.0f; au[t][0] = 0.0f; au[t][1] = 0.0f; }
+    \\    const uint tk_per = IN_TILES / 4u;
+    \\    const device uint* gbase = (const device uint*)(gate_t) + ulong(e) * ulong(IN_TILES) * ulong(OUT_TILES) * ulong(NW);
+    \\    const device uint* ubase = (const device uint*)(up_t) + ulong(e) * ulong(IN_TILES) * ulong(OUT_TILES) * ulong(NW);
+    \\    for (uint tk = sg * tk_per; tk < (sg + 1u) * tk_per; ++tk) {
+    \\        float xr_g[4]; float xr_u[4];
+    \\        for (uint m = 0; m < 4u; ++m) { xr_g[m] = float(xg[tk * 16u + rows_of[m]]); xr_u[m] = float(xu[tk * 16u + rows_of[m]]); }
+    \\        for (uint t = 0; t < 8u; ++t) {
+    \\            const uint tn = blk * 8u + t;
+    \\            const ulong toff = (ulong(tk) * OUT_TILES + tn) * ulong(NW);
+    \\            if (INTK) {
+    \\                const IntWords wg = exl3_int_words<N>(gbase + toff, base, ia);
+    \\                const IntWords wu = exl3_int_words<N>(ubase + toff, base, ia);
+    \\                uint cg[8], cu[8];
+    \\                cg[0] = exl3_int_cw<N, WMASK, 0>(wg, ib); cg[1] = exl3_int_cw<N, WMASK, 1>(wg, ib); cg[2] = exl3_int_cw<N, WMASK, 2>(wg, ib); cg[3] = exl3_int_cw<N, WMASK, 3>(wg, ib);
+    \\                cg[4] = exl3_int_cw<N, WMASK, 4>(wg, ib); cg[5] = exl3_int_cw<N, WMASK, 5>(wg, ib); cg[6] = exl3_int_cw<N, WMASK, 6>(wg, ib); cg[7] = exl3_int_cw<N, WMASK, 7>(wg, ib);
+    \\                cu[0] = exl3_int_cw<N, WMASK, 0>(wu, ib); cu[1] = exl3_int_cw<N, WMASK, 1>(wu, ib); cu[2] = exl3_int_cw<N, WMASK, 2>(wu, ib); cu[3] = exl3_int_cw<N, WMASK, 3>(wu, ib);
+    \\                cu[4] = exl3_int_cw<N, WMASK, 4>(wu, ib); cu[5] = exl3_int_cw<N, WMASK, 5>(wu, ib); cu[6] = exl3_int_cw<N, WMASK, 6>(wu, ib); cu[7] = exl3_int_cw<N, WMASK, 7>(wu, ib);
+    \\                for (uint m = 0; m < 8u; ++m) {
+    \\                    const float wgv = (PRB == 0) ? float(exl3_decode<CB>(cg[m])) : ((PRB == 1) ? float(as_type<half>(ushort(cg[m] & 0x3fffu))) : float(as_type<half>(ushort((wg.h[0] >> (m * 2u)) & 0x3fffu))));
+    \\                    const float wuv = (PRB == 0) ? float(exl3_decode<CB>(cu[m])) : ((PRB == 1) ? float(as_type<half>(ushort(cu[m] & 0x3fffu))) : float(as_type<half>(ushort((wu.h[0] >> (m * 2u)) & 0x3fffu))));
+    \\                    const uint c = (m >> 2);
+    \\                    ag[t][c] = fma(xr_g[m & 3u], wgv, ag[t][c]);
+    \\                    au[t][c] = fma(xr_u[m & 3u], wuv, au[t][c]);
+    \\                }
+    \\            } else {
+    \\                const LaneWords wg = exl3_lane_words<N>(gbase + toff, base);
+    \\                const LaneWords wu = exl3_lane_words<N>(ubase + toff, base);
+    \\                for (uint m = 0; m < 8u; ++m) {
+    \\                    const float wgv = float(exl3_decode<CB>(exl3_lane_cw<WMASK>(wg, off[m])));
+    \\                    const float wuv = float(exl3_decode<CB>(exl3_lane_cw<WMASK>(wu, off[m])));
+    \\                    const uint c = (m >> 2);
+    \\                    ag[t][c] = fma(xr_g[m & 3u], wgv, ag[t][c]);
+    \\                    au[t][c] = fma(xr_u[m & 3u], wuv, au[t][c]);
+    \\                }
+    \\            }
+    \\        }
+    \\    }
+    \\    // 3. the column sums: lanes 4c..4c+3 hold column c (and c + 8); fold them, then the four simdgroups
+    \\    for (uint t = 0; t < 8u; ++t) for (uint c = 0; c < 2u; ++c) {
+    \\        ag[t][c] += simd_shuffle_xor(ag[t][c], ushort(1)); ag[t][c] += simd_shuffle_xor(ag[t][c], ushort(2));
+    \\        au[t][c] += simd_shuffle_xor(au[t][c], ushort(1)); au[t][c] += simd_shuffle_xor(au[t][c], ushort(2));
+    \\    }
+    \\    if ((L & 3u) == 0u) {
+    \\        for (uint t = 0; t < 8u; ++t) {
+    \\            red_g[sg][t * 16u + (L >> 2)] = ag[t][0]; red_g[sg][t * 16u + (L >> 2) + 8u] = ag[t][1];
+    \\            red_u[sg][t * 16u + (L >> 2)] = au[t][0]; red_u[sg][t * 16u + (L >> 2) + 8u] = au[t][1];
+    \\        }
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    // 4. simdgroup 0: the block's 128 outputs (positions L + 32 j): f16 round, H128, svh, f16 round, SwiGLU
+    \\    if (sg == 0u) {
+    \\        float vg[4]; float vu[4];
+    \\        for (uint j = 0; j < 4u; ++j) {
+    \\            const uint i = L + 32u * j;
+    \\            vg[j] = float(half(((red_g[0][i] + red_g[1][i]) + red_g[2][i]) + red_g[3][i]));
+    \\            vu[j] = float(half(((red_u[0][i] + red_u[1][i]) + red_u[2][i]) + red_u[3][i]));
+    \\        }
+    \\        for (uint s = 0; s < 5u; ++s) {
+    \\            const uint bit = 1u << s;
+    \\            for (uint j = 0; j < 4u; ++j) {
+    \\                const float pg = simd_shuffle_xor(vg[j], ushort(bit));
+    \\                const float pu = simd_shuffle_xor(vu[j], ushort(bit));
+    \\                vg[j] = (L & bit) ? (pg - vg[j]) : (vg[j] + pg);
+    \\                vu[j] = (L & bit) ? (pu - vu[j]) : (vu[j] + pu);
+    \\            }
+    \\        }
+    \\        {
+    \\            float tg0 = vg[0] + vg[1], tg1 = vg[0] - vg[1], tg2 = vg[2] + vg[3], tg3 = vg[2] - vg[3];
+    \\            float tu0 = vu[0] + vu[1], tu1 = vu[0] - vu[1], tu2 = vu[2] + vu[3], tu3 = vu[2] - vu[3];
+    \\            vg[0] = tg0 + tg2; vg[1] = tg1 + tg3; vg[2] = tg0 - tg2; vg[3] = tg1 - tg3;
+    \\            vu[0] = tu0 + tu2; vu[1] = tu1 + tu3; vu[2] = tu0 - tu2; vu[3] = tu1 - tu3;
+    \\        }
+    \\        for (uint j = 0; j < 4u; ++j) {
+    \\            const uint o = blk * 128u + L + 32u * j;
+    \\            const float g = float(half(vg[j] * HAD_SCALE * float(gate_svh[e * INTC + o])));
+    \\            const float u = float(half(vu[j] * HAD_SCALE * float(up_svh[e * INTC + o])));
+    \\            h[(row * TOPKC + k) * INTC + o] = (g / (1.0f + metal::exp(-g))) * u;
+    \\        }
+    \\    }
+    \\
+;
+
 /// Launch 2's text.
 pub const text_down =
     \\    constexpr uint N = uint(NHW);
@@ -289,12 +405,97 @@ pub const text_down =
     \\
 ;
 
+/// Launch 2 of form 1b: `text_down` with each slot's h rotation done once by `unfused.text_prep` (over inter).
+pub const text_down4 =
+    \\    constexpr uint N = uint(NHW);
+    \\    constexpr uint NW = N / 2u;
+    \\    constexpr uint WMASK = (WBITS >= 16) ? 0xffffu : ((1u << uint(WBITS)) - 1u);
+    \\    constexpr int CB = int(CODEBOOK);
+    \\    constexpr int PRB = int(PROBE);
+    \\    constexpr uint HIDC = uint(HID);
+    \\    constexpr uint INTC = uint(INTER);
+    \\    constexpr uint TOPKC = uint(TOPK);
+    \\    constexpr uint IN_TILES = INTC / 16u;
+    \\    constexpr uint OUT_TILES = HIDC / 16u;
+    \\    constexpr float HAD_SCALE = 0.08838834764831845f;
+    \\    const uint blk = threadgroup_position_in_grid.x;      // 128-wide block of the hidden output
+    \\    const uint row = threadgroup_position_in_grid.y;
+    \\    const uint sg = simdgroup_index_in_threadgroup;
+    \\    const uint L = thread_index_in_simdgroup;
+    \\    threadgroup float red[4][128];
+    \\    constexpr bool INTK = (N % 16u) == 0u;
+    \\    const uint base = INTK ? exl3_int_qb<N>(L) : exl3_lane_base<N>(L);
+    \\    const uint ia = INTK ? exl3_int_a<N>(L) : 0u;
+    \\    const uint ib = INTK ? exl3_int_b<N>(L) : 0u;
+    \\    uint off[8];
+    \\    for (uint m = 0; m < 8u; ++m) off[m] = INTK ? 0u : exl3_lane_off<N>(L, m, base);
+    \\    uint rows_of[4];
+    \\    for (uint m = 0; m < 4u; ++m) rows_of[m] = exl3lib_row_of(L, m);
+    \\    const uint tk_per = IN_TILES / 4u;
+    \\    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};              // simdgroup 0's outputs L + 32 j, summed over the slots
+    \\    for (uint k = 0; k < TOPKC; ++k) {
+    \\        const uint e = slots[row * TOPKC + k];
+    \\        const float score = scores[row * TOPKC + k];
+    \\        const device half* hd = hdp + ulong(row * TOPKC + k) * ulong(INTC);
+    \\        // 2. the GEMV over this simdgroup's quarter of the input tiles, the block's 8 output tiles
+    \\        float a[8][2];
+    \\        for (uint t = 0; t < 8u; ++t) { a[t][0] = 0.0f; a[t][1] = 0.0f; }
+    \\        const device uint* dbase = (const device uint*)(down_t) + ulong(e) * ulong(IN_TILES) * ulong(OUT_TILES) * ulong(NW);
+    \\        for (uint tk = sg * tk_per; tk < (sg + 1u) * tk_per; ++tk) {
+    \\            float xr[4];
+    \\            for (uint m = 0; m < 4u; ++m) xr[m] = float(hd[tk * 16u + rows_of[m]]);
+    \\            for (uint t = 0; t < 8u; ++t) {
+    \\                const uint tn = blk * 8u + t;
+    \\                if (INTK) {
+    \\                    const IntWords w = exl3_int_words<N>(dbase + (ulong(tk) * OUT_TILES + tn) * ulong(NW), base, ia);
+    \\                    uint cw[8];
+    \\                    cw[0] = exl3_int_cw<N, WMASK, 0>(w, ib); cw[1] = exl3_int_cw<N, WMASK, 1>(w, ib); cw[2] = exl3_int_cw<N, WMASK, 2>(w, ib); cw[3] = exl3_int_cw<N, WMASK, 3>(w, ib);
+    \\                    cw[4] = exl3_int_cw<N, WMASK, 4>(w, ib); cw[5] = exl3_int_cw<N, WMASK, 5>(w, ib); cw[6] = exl3_int_cw<N, WMASK, 6>(w, ib); cw[7] = exl3_int_cw<N, WMASK, 7>(w, ib);
+    \\                    for (uint m = 0; m < 8u; ++m) {
+    \\                        const float wv = (PRB == 0) ? float(exl3_decode<CB>(cw[m])) : ((PRB == 1) ? float(as_type<half>(ushort(cw[m] & 0x3fffu))) : float(as_type<half>(ushort((w.h[0] >> (m * 2u)) & 0x3fffu))));
+    \\                        a[t][m >> 2] = fma(xr[m & 3u], wv, a[t][m >> 2]);
+    \\                    }
+    \\                } else {
+    \\                    const LaneWords w = exl3_lane_words<N>(dbase + (ulong(tk) * OUT_TILES + tn) * ulong(NW), base);
+    \\                    for (uint m = 0; m < 8u; ++m) {
+    \\                        const float wv = float(exl3_decode<CB>(exl3_lane_cw<WMASK>(w, off[m])));
+    \\                        a[t][m >> 2] = fma(xr[m & 3u], wv, a[t][m >> 2]);
+    \\                    }
+    \\                }
+    \\            }
+    \\        }
+    \\        for (uint t = 0; t < 8u; ++t) for (uint c = 0; c < 2u; ++c) { a[t][c] += simd_shuffle_xor(a[t][c], ushort(1)); a[t][c] += simd_shuffle_xor(a[t][c], ushort(2)); }
+    \\        if ((L & 3u) == 0u) for (uint t = 0; t < 8u; ++t) { red[sg][t * 16u + (L >> 2)] = a[t][0]; red[sg][t * 16u + (L >> 2) + 8u] = a[t][1]; }
+    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\        // 3. simdgroup 0: f16 round, H128, svh, f16 round, score-weighted accumulate
+    \\        if (sg == 0u) {
+    \\            float v[4];
+    \\            for (uint j = 0; j < 4u; ++j) { const uint i = L + 32u * j; v[j] = float(half(((red[0][i] + red[1][i]) + red[2][i]) + red[3][i])); }
+    \\            for (uint s = 0; s < 5u; ++s) {
+    \\                const uint bit = 1u << s;
+    \\                for (uint j = 0; j < 4u; ++j) { const float p = simd_shuffle_xor(v[j], ushort(bit)); v[j] = (L & bit) ? (p - v[j]) : (v[j] + p); }
+    \\            }
+    \\            { float t0 = v[0] + v[1], t1 = v[0] - v[1], t2 = v[2] + v[3], t3 = v[2] - v[3]; v[0] = t0 + t2; v[1] = t1 + t3; v[2] = t0 - t2; v[3] = t1 - t3; }
+    \\            for (uint j = 0; j < 4u; ++j) {
+    \\                const uint o = blk * 128u + L + 32u * j;
+    \\                acc[j] = fma(score, float(half(v[j] * HAD_SCALE * float(down_svh[e * HIDC + o]))), acc[j]);
+    \\            }
+    \\        }
+    \\        // the next slot's hd and red overwrite what every simdgroup just read
+    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    }
+    \\    if (sg == 0u) for (uint j = 0; j < 4u; ++j) y[row * HIDC + blk * 128u + L + 32u * j] = acc[j];
+    \\
+;
+
 pub const header: [:0]const u8 = lane.metal_helpers ++ metal_common;
 
 const gu_inputs = [_][*:0]const u8{ "x", "slots", "gate_t", "gate_suh", "gate_svh", "up_t", "up_suh", "up_svh" };
 const gu_outputs = [_][*:0]const u8{"h"};
 const down_inputs = [_][*:0]const u8{ "h", "slots", "scores", "down_t", "down_suh", "down_svh" };
 const down_outputs = [_][*:0]const u8{"y"};
+const gu4_inputs = [_][*:0]const u8{ "xgp", "xup", "slots", "gate_t", "gate_svh", "up_t", "up_svh" };
+const down4_inputs = [_][*:0]const u8{ "hdp", "slots", "scores", "down_t", "down_svh" };
 
 /// The two kernels of one geometry (compiled once per (rate, codebook, window, hidden, inter, topk)); configs per row count.
 pub const Kernels = struct {
@@ -423,3 +624,83 @@ test "exl3lib decode geometry admission: 128-aligned widths, top-k within the re
     try t.expect(!(Geometry{ .hidden = 2560, .inter = 600, .topk = 10, .rate = format.Rate.fromK(5), .dec = .mul1 }).admitted());
     try t.expect(!(Geometry{ .hidden = 2560, .inter = 640, .topk = 33, .rate = format.Rate.fromK(5), .dec = .mul1 }).admitted());
 }
+
+/// Form 1b: four launches per layer. The two prepares are `unfused.text_prep` (one simdgroup per 128-block and row-slot:
+/// each rotation computed once), then `text_gu4` (GEMV + finish + SwiGLU) and `text_down4` (GEMV + finish + reduce).
+pub const Kernels4 = struct {
+    geo: Geometry,
+    prep: mlx.mlx_fast_metal_kernel,
+    gu: mlx.mlx_fast_metal_kernel,
+    down: mlx.mlx_fast_metal_kernel,
+    cfg: [Kernels.max_rows + 1]?Cfg = @splat(null),
+
+    const Cfg = struct { prep_h: mlx.mlx_fast_metal_kernel_config, prep_i: mlx.mlx_fast_metal_kernel_config, gu: mlx.mlx_fast_metal_kernel_config, down: mlx.mlx_fast_metal_kernel_config };
+    const prep_in = [_][*:0]const u8{ "x", "slots", "suh" };
+    const prep_out = [_][*:0]const u8{"xp"};
+
+    pub fn init(geo: Geometry) !Kernels4 {
+        if (!geo.admitted()) return error.BadExl3Shape;
+        const unf = @import("unfused.zig");
+        return .{
+            .geo = geo,
+            .prep = ks.newKernel("exl3lib_prep", &prep_in, &prep_out, unf.text_prep, header, true) orelse return error.KernelCreateFailed,
+            .gu = ks.newKernel("exl3lib_gu4", &gu4_inputs, &gu_outputs, text_gu4, header, true) orelse return error.KernelCreateFailed,
+            .down = ks.newKernel("exl3lib_down4", &down4_inputs, &down_outputs, text_down4, header, true) orelse return error.KernelCreateFailed,
+        };
+    }
+
+    pub fn deinit(self: *Kernels4) void {
+        for (&self.cfg) |*c| if (c.*) |cc| {
+            inline for (.{ cc.prep_h, cc.prep_i, cc.gu, cc.down }) |k| _ = mlx.mlx_fast_metal_kernel_config_free(k);
+            c.* = null;
+        };
+        inline for (.{ self.prep, self.gu, self.down }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+    }
+
+    fn cfgs(self: *Kernels4, rows: usize) !Cfg {
+        if (rows == 0 or rows > Kernels.max_rows) return error.BadExl3Shape;
+        if (self.cfg[rows]) |c| return c;
+        const g = self.geo;
+        const rk: u32 = @as(u32, @intCast(rows)) * g.topk;
+        const rkc: c_int = @intCast(rk);
+        const H: c_int = @intCast(g.hidden);
+        const I: c_int = @intCast(g.inter);
+        const t = [_]ks.TemplateArg{
+            .{ .name = "NHW", .value = .{ .int = @intCast(g.rate.n) } },
+            .{ .name = "CODEBOOK", .value = .{ .int = @backingInt(g.dec.codebook) } },
+            .{ .name = "WBITS", .value = .{ .int = @intCast(g.dec.window.bits()) } },
+            .{ .name = "HID", .value = .{ .int = H } },
+            .{ .name = "INTER", .value = .{ .int = I } },
+            .{ .name = "TOPK", .value = .{ .int = @intCast(g.topk) } },
+            .{ .name = "PROBE", .value = .{ .int = 0 } },
+        };
+        const c: Cfg = .{
+            .prep_h = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 32, rk, 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, H }}, .out_dtypes = &.{.float16}, .template = &.{ .{ .name = "DIM", .value = .{ .int = H } }, .{ .name = "TOPK", .value = .{ .int = @intCast(g.topk) } } } }),
+            .prep_i = try ks.buildConfig(.{ .grid = .{ (g.inter / 128) * 32, rk, 1 }, .threadgroup = .{ 32, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, I }}, .out_dtypes = &.{.float16}, .template = &.{ .{ .name = "DIM", .value = .{ .int = I } }, .{ .name = "TOPK", .value = .{ .int = 1 } } } }),
+            .gu = try ks.buildConfig(.{ .grid = .{ (g.inter / 128) * 128, g.topk, @intCast(rows) }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ rkc, I }}, .out_dtypes = &.{.float32}, .template = &t }),
+            .down = try ks.buildConfig(.{ .grid = .{ (g.hidden / 128) * 128, @intCast(rows), 1 }, .threadgroup = .{ 128, 1, 1 }, .out_shapes = &.{&[_]c_int{ @intCast(rows), H }}, .out_dtypes = &.{.float32}, .template = &t }),
+        };
+        self.cfg[rows] = c;
+        return c;
+    }
+
+    fn one(k: mlx.mlx_fast_metal_kernel, c: mlx.mlx_fast_metal_kernel_config, ins: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        var outs: [1]mlx.mlx_array = undefined;
+        try ks.applyConfig(k, c, ins, &outs, s);
+        return outs[0];
+    }
+
+    /// The four launches; the caller frees y.
+    pub fn moe(self: *Kernels4, s: mlx.mlx_stream, x: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, bank: Kernels.Bank, rows: usize) !mlx.mlx_array {
+        const c = try self.cfgs(rows);
+        const xg = try one(self.prep, c.prep_h, &.{ x, slots, bank.gate_suh }, s);
+        defer _ = mlx.mlx_array_free(xg);
+        const xu = try one(self.prep, c.prep_h, &.{ x, slots, bank.up_suh }, s);
+        defer _ = mlx.mlx_array_free(xu);
+        const h = try one(self.gu, c.gu, &.{ xg, xu, slots, bank.gate_t, bank.gate_svh, bank.up_t, bank.up_svh }, s);
+        defer _ = mlx.mlx_array_free(h);
+        const hd = try one(self.prep, c.prep_i, &.{ h, slots, bank.down_suh }, s);
+        defer _ = mlx.mlx_array_free(hd);
+        return one(self.down, c.down, &.{ hd, slots, scores, bank.down_t, bank.down_svh }, s);
+    }
+};
