@@ -129,6 +129,29 @@ wider calls dequantize the trellis to an f16 matrix once and run MLX's GEMM on t
 the finish's first rounding). `root.linear` is the host entry (`mlx_stream.exl3Linear`), dispatched from mlx-serve's `qmatmul`
 for every weight the loader registered from a `trunk_quant` pack. The prefill side is the stopgap until the M3 GEMM.
 
+### Decode rows share one decode (the multi-row GEMV)
+
+The trunk is about half of a Qwen3.8-Flash-Next token's active weights (attention, GDN and shared-expert projections ~3.0 G
+per row, lm_head 0.64 G, the routed experts ~2.4 G), and a trellis weight costs ~13 ALU ops to decode, so on Apple GPUs the
+trunk is ALU-bound, not bandwidth-bound. The first dense path ran the row-slot GEMV once per row: an MTP verify of R rows
+decoded every trunk weight R times. `text_dgemv` decodes each weight once per threadgroup and feeds it to RB rows (cap 4,
+`MLX_SERVE_EXL3LIB_DENSE_RB`; further rows take more chunks), BT output tiles per threadgroup (4 at one row, 2 at 2-4:
+2 BT RB f32 accumulators per lane, `MLX_SERVE_EXL3LIB_DENSE_BT`), and a K split fixed per shape (the smallest that puts 160
+threadgroups in flight at one row, `MLX_SERVE_EXL3LIB_DENSE_KS`) written as partial planes that `text_dfinish` sums in slice
+order. Because the split depends on the shape alone, a row's output bytes are identical alone or among 16 rows (tested).
+`MLX_SERVE_EXL3LIB_DENSE=rowslot` keeps the old path for A/B. Laptop M5: 2-3x faster than the row-slot GEMV at 3-8 rows, a
+tie at one row.
+
+### MUL1's affine map leaves the inner loop
+
+A MUL1 weight is `A t + C`: t is the hashed codeword's byte sum in [0, 1020], A = half 0x1EEE and C = 1024 A + half 0xC931
+= -3.453125, both exact in f32. So `sum_i x_i w_i = A sum_i x_i t_i + C sum_i x_i`: the GEMVs accumulate x t
+(`exl3_mul1_t`: no half FMA and no half-to-float convert per weight), the prepare kernels write each 128-block's sum of the
+rounded inputs, and the finishes apply A to the summed planes and C to the input sum before their first f16 rounding. The
+reference rounds every weight to f16 first; skipping that rounding moves results far less than the parity bar (max ratio
+3.9e-3 of the 5e-3 bar over 69 checks). Dense: `MLX_SERVE_EXL3LIB_DENSE_DEFER=0`, experts: `MLX_SERVE_EXL3LIB_DEFER=0`
+restore the per-weight decode. MCG packs always decode per weight.
+
 ## The fully EXL3 pack contract (trunk_quant)
 
 A pack whose trunk is EXL3 too (turboderp's as published) carries, beside `expert_quant`:

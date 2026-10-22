@@ -1,5 +1,15 @@
 # Changelog
 
+## exl3lib (2026-10-22, later)
+
+- Dense: multi-row split-K GEMV (`text_dgemv`/`text_dfinish`): every trunk weight decoded once per verify round for up to 4 rows,
+  K split fixed per shape so a row's bytes do not depend on how many rows share the launch; the row-slot path stays behind
+  `MLX_SERVE_EXL3LIB_DENSE=rowslot`.
+- MUL1's affine map deferred out of the GEMVs' inner loops, dense and form-3 experts (knobs `MLX_SERVE_EXL3LIB_DENSE_DEFER`,
+  `MLX_SERVE_EXL3LIB_DEFER`).
+- Tools: `EXL3LIB_PERM_FILE` column-order check of EXL3 vs affine trunk weights; `EXL3LIB_DENSE_TIME` dense timing (multi-row vs
+  row-slot vs MLX affine q8 at the trunk's shapes).
+
 ## Unreleased
 
 - tools/qwen38: `fetch_exl3_trunk.py` (turboderp's non-expert tensors by HTTP byte range), `restack_exl3_full.py` (the fully EXL3
