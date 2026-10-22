@@ -129,6 +129,24 @@ wider calls dequantize the trellis to an f16 matrix once and run MLX's GEMM on t
 the finish's first rounding). `root.linear` is the host entry (`mlx_stream.exl3Linear`), dispatched from mlx-serve's `qmatmul`
 for every weight the loader registered from a `trunk_quant` pack. The prefill side is the stopgap until the M3 GEMM.
 
+## The fully EXL3 pack contract (trunk_quant)
+
+A pack whose trunk is EXL3 too (turboderp's as published) carries, beside `expert_quant`:
+
+- `trunk_quant {format: exl3, codebook: mul1 | mcg, window: 16}` in config.json. Every trunk linear is stored under the host's
+  affine names so the existing loader picks it up: `<module>.weight` U16 [in/16, out/16, n] (the trellis; K = n/16 per module,
+  5.05bpw_h6 has K7 projections, K6 lm_head/MTP, K5 indexers), `<module>.scales` suh F16 [in], `<module>.biases` svh F16 [out].
+  The host registers each 3-D U16 `.weight` with 1-D `.scales`/`.biases` once after load and routes it from `qmatmul` to
+  `exl3lib.linear`; nothing else in the forward changes. Plain tensors (embeddings, router, hyper-connection, norms, PLE
+  projections, GDN a/b/conv/A_log/dt_bias) are bf16 (f16 originals converted losslessly).
+- `ngram_table {file, format: exl3_ngram_trellis, k, row_dim}`: the PLE table as turboderp's rings (one I16 tensor
+  [rows, 1 + row_dim*k/16]: an f16 scale word then row_dim k-bit symbols; state_i stacks the symbols of i, i-1, i-2) with the
+  per-hash-head bias tensor `...ple.ple_embedding.ngram_embedding.head_bias` F16 [heads, row_dim] in the trunk shards. The
+  host's n-gram table reader decodes rows on the CPU (mul1 codebook) and adds the bias of the row's head (rows are head-minor).
+- Expert shards and the table are hard links of the source files; `restack_exl3_full.py` on the box builds the pack from the
+  hybrid pack (experts, tokenizer, vision) and a fetched trunk directory (`fetch_exl3_trunk.py`: the non-expert tensors by
+  HTTP byte range).
+
 ## Status of the served Qwen pack
 
 The Qwen3.8-Flash-Next EXL3 5.05 pack (`~/models/Qwen3.8-Flash-Next-EXL3-5.05-mlx-serve` on ai-server: turboderp's K5
