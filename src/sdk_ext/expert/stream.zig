@@ -493,6 +493,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// expert (`PlanOpts.staged`) and overwrite the rest after their reads land. Needs `overlap`. Exact: a plan's row
             /// holds its record before any kernel reads it either way; only when the read runs changes.
             stage_transient: bool = false,
+            /// P7 `overlap` with an arch that holds its groups' base-bank rows to the call's end (DeepSeek's deferred base,
+            /// `holdBase`): the up-front plans hold every earlier group's persistent rows, as the stock `route` has them in
+            /// `held_base` when it plans a group at its route. Off (MiMo, GLM): the last `wide_depth - 1` groups', the stock's.
+            plan_holds_call: bool = false,
             /// The rate tally (`expert.tally`, `LayerPolicy.setTally`) on every layer: null, off.
             tally: ?Tally = null,
         };
@@ -773,6 +777,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             prompt_relocate: bool = false,
             /// P7 overlap transient staging (`Options.stage_transient`), fixed at construction.
             stage_transient: bool = false,
+            /// P7 overlap: the plans hold every earlier group's persistent rows (`Options.plan_holds_call`).
+            plan_holds_call: bool = false,
             /// The staged layer's prediction: each expert's rank in it (`no_rank`: not predicted), so the arch's hot order
             /// can group the call as the stage grouped the windows (`predictedRank`).
             pred_rank: []u16 = &.{},
@@ -1026,6 +1032,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .ahead_cap = opt.ahead_cap,
                     .prompt_relocate = opt.prompt_relocate,
                     .stage_transient = opt.stage_transient,
+                    .plan_holds_call = opt.plan_holds_call,
                     .pred_rank = pred_rank,
                     .p7_rows = p7_rows,
                     .ahead_job = ahead_job,
@@ -2110,13 +2117,18 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (0..n_groups) |gi| {
                     const g: u32 = @intCast(gi);
                     // The stock schedule routes group g beside groups g - depth + 1 .. g - 1 (`route`): their windows are
-                    // taken and their persistent slots held.
+                    // taken and their persistent slots held. With `plan_holds_call` every earlier group's persistent slots
+                    // are held too: an arch that defers its base-bank rows (DeepSeek's `holdBase`) keeps each group's
+                    // persistent rows pinned to the call's end and the stock schedule, planning a group at its route, has
+                    // them in `held_base`; the plans made here up front would otherwise evict such a row for a later
+                    // group's load and refuse at its submit (SlotStillPinned, window 67). Exact either way: a miss the plan
+                    // cannot place in a persistent row takes a transient one.
                     const held = &self.held_scratch;
                     held.clearRetainingCapacity();
                     var used: u8 = 0;
-                    var q: u32 = g -| (depth - 1);
+                    var q: u32 = if (self.plan_holds_call) 0 else g -| (depth - 1);
                     while (q < g) : (q += 1) {
-                        used |= @as(u8, 1) << @intCast(p.window[q]);
+                        if (q + depth > g) used |= @as(u8, 1) << @intCast(p.window[q]);
                         const o = &self.routes[p.route[q]];
                         for (o.hit_slots[0..o.plan.n_hits]) |hs| if (hs < cap) {
                             held.append(self.allocator, hs) catch return self.fail(error.RoutesExhausted);

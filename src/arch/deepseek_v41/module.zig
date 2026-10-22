@@ -2271,6 +2271,8 @@ pub fn armOptions(config: *const settings.Config, ceiling: expert_admission.Ceil
         .prompt_reads = if (config.dsv41PromptOverlap()) .overlap else .stock,
         .prompt_ahead = if (config.dsv41PromptOverlap()) .whole_trim else .head,
         .stage_transient = config.dsv41PromptStage(),
+        // The deferred base holds each group's base-bank rows to the call's end: the overlap plans must not evict them.
+        .plan_holds_call = config.dsv41PromptOverlap() and config.dsv41WideDeferBase(),
     };
 }
 
