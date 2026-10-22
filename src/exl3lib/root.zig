@@ -4,7 +4,7 @@
 //! `admitTopK`, `trellisAdmitted`, `Bank{gate,up,down: Proj{trellis,suh,svh}}`, `moe`, `moeWithShared`,
 //! `moeClamped`, `format.Decode`, `kernels.DECODE_ROWS_MAX`. The reference every kernel is held to is `format.project`.
 //!
-//! Status: M2 form 1. `moe` serves decode rows (<= DECODE_ROWS_MAX) through the two-launch chain (`decode.zig`); prefill
+//! Status: M2 form 3. `moe` serves decode rows (<= DECODE_ROWS_MAX) through the split-K chain (`decode.Kernels3`); prefill
 //! rows and the clamped (GLM) form refuse `error.Exl3EngineNotImplemented` until M3, so a host keeps its own arm for them.
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -90,9 +90,9 @@ fn validateCall(x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.m
 /// The compiled kernels of every geometry this process has served (a handful per model).
 /// a spinlock: the cache fills once per geometry and is read thereafter
 var cache_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
-var cache: [16]?decode.Kernels = @splat(null);
+var cache: [16]?decode.Kernels3 = @splat(null);
 
-fn kernelsFor(geo: decode.Geometry) !*decode.Kernels {
+fn kernelsFor(geo: decode.Geometry) !*decode.Kernels3 {
     while (cache_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
     defer cache_lock.store(0, .release);
     var free_slot: ?usize = null;
@@ -100,11 +100,13 @@ fn kernelsFor(geo: decode.Geometry) !*decode.Kernels {
         if (slot.*) |*k| {
             const g = k.geo;
             if (g.hidden == geo.hidden and g.inter == geo.inter and g.topk == geo.topk and g.rate.n == geo.rate.n and
-                g.dec.codebook == geo.dec.codebook and g.dec.window == geo.dec.window and g.probe == geo.probe) return k;
+                g.dec.codebook == geo.dec.codebook and g.dec.window == geo.dec.window) return k;
         } else if (free_slot == null) free_slot = i;
     }
     const i = free_slot orelse return error.Exl3EngineCacheFull;
-    cache[i] = try decode.Kernels.init(geo);
+    // form 3 at 2 output tiles per threadgroup and up to 4 K slices: the M5 Max bench's pick (ties or beats Sushi at every
+    // integer rate)
+    cache[i] = try decode.Kernels3.init(geo, 2, 4);
     return &cache[i].?;
 }
 
@@ -144,7 +146,7 @@ pub fn moe(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array,
     var sc = mlx.mlx_array_new();
     defer freeArr(sc);
     try mlx.check(mlx.mlx_astype(&sc, s1, .float32, s));
-    const out = try k.moe(s, xf, slots, sc, .{
+    const y0 = try k.moe(s, xf, slots, sc, .{
         .gate_t = bank.gate.trellis,
         .gate_suh = bank.gate.suh,
         .gate_svh = bank.gate.svh,
@@ -155,11 +157,10 @@ pub fn moe(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array,
         .down_suh = bank.down.suh,
         .down_svh = bank.down.svh,
     }, rows);
-    freeArr(out.h);
-    defer freeArr(out.y);
+    defer freeArr(y0);
     var y3 = mlx.mlx_array_new();
     defer freeArr(y3);
-    try mlx.check(mlx.mlx_reshape(&y3, out.y, xsh.ptr, 3, s));
+    try mlx.check(mlx.mlx_reshape(&y3, y0, xsh.ptr, 3, s));
     var y = mlx.mlx_array_new();
     errdefer freeArr(y);
     try mlx.check(mlx.mlx_astype(&y, y3, mlx.mlx_array_dtype(x), s));

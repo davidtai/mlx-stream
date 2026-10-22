@@ -1143,7 +1143,7 @@ pub const Kernels3 = struct {
     geo: Geometry,
     ks_gu: u32,
     ks_dn: u32,
-    /// output tiles per GEMV threadgroup (8, 4 or 2): 2 bt f32 accumulators per lane, 128 / (16 bt) x more threadgroups
+    /// output tiles per GEMV threadgroup (8, 4, 2 or 1): 2 bt f32 accumulators per lane, 128 / (16 bt) x more threadgroups
     bt: u32,
     prep: mlx.mlx_fast_metal_kernel,
     gu: mlx.mlx_fast_metal_kernel,
@@ -1158,11 +1158,11 @@ pub const Kernels3 = struct {
 
     /// K slices: gate/up over hidden/16 tiles in KS x 2 parts, down over inter/16 tiles in KS2 x 4 parts; each part
     /// at least 4 tiles.
-    pub fn init(geo: Geometry, bt: u32) !Kernels3 {
-        if (!geo.admitted() or (bt != 8 and bt != 4 and bt != 2)) return error.BadExl3Shape;
-        var ks_gu: u32 = 4;
+    pub fn init(geo: Geometry, bt: u32, ks_max: u32) !Kernels3 {
+        if (!geo.admitted() or (bt != 8 and bt != 4 and bt != 2 and bt != 1) or (ks_max != 1 and ks_max != 2 and ks_max != 4 and ks_max != 8)) return error.BadExl3Shape;
+        var ks_gu: u32 = ks_max;
         while (ks_gu > 1 and (geo.hidden / 16) % (ks_gu * 2) != 0) ks_gu /= 2;
-        var ks_dn: u32 = 4;
+        var ks_dn: u32 = ks_max;
         while (ks_dn > 1 and ((geo.inter / 16) % (ks_dn * 4) != 0 or (geo.inter / 16) / (ks_dn * 4) < 2)) ks_dn /= 2;
         const unf = @import("unfused.zig");
         return .{
