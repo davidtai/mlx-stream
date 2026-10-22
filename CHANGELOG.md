@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- DeepSeek-V4.1: the fused attention core for the prompt pass's compressed layers, a model setting (`prefill_attn_fused`,
+  off by default: the three-kernel chain is the control). One Metal kernel (`q3_ph_flash_cmp`) per query row and 16-head
+  block replaces QK, the ATTN_FUSE softmax and PV: each simdgroup keeps its query quarter in bf16 fragments, gathers its
+  quarter of a 32-key chunk of the row's selected keys once and uses it for the partial scores and as the values; the
+  scores stay in the threadgroup (an online softmax with the sink as the first key, the probabilities in bf16). The keys
+  are read once instead of twice and the f32 scores never round-trip memory. Not bit-identical to the chain (another
+  summation order, bf16 probabilities): max |diff| 1.8e-4 on outputs of 9e-2 in the GPU parity test (`DSV41_KERNELS_GPU=1`,
+  "dsv41 kernels flash gpu", which also times both). `PrefillAttn.fuse` takes it for the ropefuse compressed core on the
+  bf16 stream only; `scripts/dsv41_flash_manifest.py` registers the text; the cell harness takes
+  `DSV41_CELL_PREFILL_ATTN_FUSED`; the installed call-sites line names it ("attention fused").
 - DeepSeek-V4.1: the prompt pass's P7 overlap read schedule, a model setting (`expert_prompt_overlap`, off by default: the
   stock schedule is the control). On, the wide executor hands each layer's hot-ordered call to the stream before its
   first group route (`StreamSource.planWide`): every group is planned at once with the stock plans' slots and windows

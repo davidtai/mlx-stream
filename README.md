@@ -437,6 +437,7 @@ Settings (`model-settings.json`):
 | `layer_major_prefill` | the prompt layer by layer (`true`) or chunk by chunk (`false`) | `true` |
 | `expert_wide_depth` | prompt expert groups read ahead per layer, 1 to 8 (8 lets the transient stage cover every group) | 5 |
 | `expert_prompt_overlap` | the prompt pass's read schedule: `true` plans every expert group of a layer's call at its start and posts the read-ahead beside the attention (MiMo's and GLM5-next's schedule, exact); `false` the stock schedule | `false` |
+| `prefill_attn_fused` | the prompt pass's attention core on the compressed layers: `true` runs the fused kernel (keys read once, scores kept in the threadgroup, bf16 probabilities; not bit-identical to the chain, max diff ~2e-4), `false` (default) the three-kernel QK, softmax, PV chain. Refused unless the prefill attention core is installed. |
 | `mtp_depth` | the MTP draft lane's drafts per round, 0 to 5 (6 or more is refused at load) | 0 (off) |
 | `mtp_acceptance` | `exact` or `typical` | `exact` |
 | `mtp_typical_delta` | the typical acceptance's delta, read only under `typical` | 0.2 |
