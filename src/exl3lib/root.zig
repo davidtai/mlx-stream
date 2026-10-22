@@ -11,6 +11,8 @@ const mlx = @import("sdk").mlx;
 pub const format = @import("format.zig");
 pub const spec = @import("spec.zig");
 pub const lane = @import("lane.zig");
+pub const decode = @import("decode.zig");
+pub const ref = @import("ref.zig");
 
 pub const Spec = spec.Spec;
 pub const parseExpertQuant = spec.parseExpertQuant;
@@ -117,4 +119,6 @@ test {
     _ = format;
     _ = spec;
     _ = lane;
+    _ = decode;
+    _ = ref;
 }

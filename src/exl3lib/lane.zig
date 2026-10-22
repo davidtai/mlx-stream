@@ -72,32 +72,33 @@ pub fn laneCodewords(words: []const u16, rate: format.Rate, lane: u32, out: *[8]
     }
 }
 
-/// The Metal text of the helpers every exl3lib kernel includes: `NHW` (the rate's halfwords), `CODEBOOK` (0 MUL1,
-/// 1 MCG) and `WBITS` (the codeword window, 8..16) are template ints. `exl3_lane_words` loads a lane's four words,
-/// `exl3_lane_cw` extracts window m, `exl3_decode` turns a codeword into the f16 weight (Sushi's / exllamav3's bits).
+/// The Metal text of the helpers every exl3lib kernel includes, each templated on what the kernel body binds from its
+/// template ints (`NHW` the rate's halfwords, `WBITS` the window, `CODEBOOK` 0 MUL1 / 1 MCG): `exl3_lane_words<N>` loads
+/// a lane's four words, `exl3_lane_cw<WMASK>` extracts window m, `exl3_decode<CB>` turns a codeword into the f16 weight.
 pub const metal_helpers =
-    \\constexpr uint N = uint(NHW);
-    \\constexpr uint NW = N / 2u;
-    \\constexpr uint WMASK = (WBITS >= 16) ? 0xffffu : ((1u << uint(WBITS)) - 1u);
+    \\// exl3lib helpers: template parameters are only visible inside a kernel body, so every helper takes the rate's
+    \\// halfwords N (and the window mask / codebook) as its own template argument; the body binds them from NHW, WBITS,
+    \\// CODEBOOK once.
     \\struct LaneWords { uint w0, w1, w2, w3; uint wprev; };
-    \\// lane L's first needed word: base = ((8L + 1) N >> 4) - 16 + 16 N) >> 5; the lane's windows end at off_m bits past it
-    \\inline uint exl3_lane_base(uint L) { return ((((8u * L + 1u) * N) >> 4u) + 16u * N - 16u) >> 5u; }
-    \\inline uint exl3_lane_off(uint L, uint m, uint base) { return (((8u * L + m + 1u) * N) >> 4u) + 16u * N - 32u * base; }
-    \\inline LaneWords exl3_lane_words(const device uint* tile, uint base) {
+    \\// lane L's first needed word: base = ((8L + 1) N >> 4) + 16 N - 16) >> 5; the lane's windows end off_m bits past it
+    \\template <uint N> inline uint exl3_lane_base(uint L) { return ((((8u * L + 1u) * N) >> 4u) + 16u * N - 16u) >> 5u; }
+    \\template <uint N> inline uint exl3_lane_off(uint L, uint m, uint base) { return (((8u * L + m + 1u) * N) >> 4u) + 16u * N - 32u * base; }
+    \\template <uint N> inline LaneWords exl3_lane_words(const device uint* tile, uint base) {
+    \\  constexpr uint NW = N / 2u;
     \\  LaneWords r; const uint b = base % NW;
     \\  r.w0 = tile[b]; r.w1 = tile[(b + 1u) % NW]; r.w2 = tile[(b + 2u) % NW]; r.w3 = tile[(b + 3u) % NW]; r.wprev = tile[(b + NW - 1u) % NW];
     \\  return r;
     \\}
     \\inline uint exl3_funnel(uint lo, uint hi, uint sh) { return ((sh == 0u) ? hi : ((hi >> sh) | (lo << (32u - sh)))) & 0xffffu; }
     \\// window m of lane L from its loaded words: off = end bit past word base, q = its word, sh lands its last bit at bit 0
-    \\inline uint exl3_lane_cw(LaneWords w, uint off) {
+    \\template <uint WMASK> inline uint exl3_lane_cw(LaneWords w, uint off) {
     \\  const uint q = (off - 1u) >> 5u; const uint sh = 32u * (q + 1u) - off;
     \\  const uint hi = (q == 0u) ? w.w0 : ((q == 1u) ? w.w1 : ((q == 2u) ? w.w2 : w.w3));
     \\  const uint lo = (q == 0u) ? w.wprev : ((q == 1u) ? w.w0 : ((q == 2u) ? w.w1 : w.w2));
     \\  return exl3_funnel(lo, hi, sh) & WMASK;
     \\}
-    \\inline half exl3_decode(uint cw) {
-    \\  if (CODEBOOK == 1) {
+    \\template <int CB> inline half exl3_decode(uint cw) {
+    \\  if (CB == 1) {
     \\    const uint mixed = cw * 0xCBAC1FEDu; const uint pair = 0x3B603B60u ^ (mixed & 0x8FFF8FFFu);
     \\    return half(float(as_type<half>(ushort(pair & 0xffffu))) + float(as_type<half>(ushort(pair >> 16u))));
     \\  }
