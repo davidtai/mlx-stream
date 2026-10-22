@@ -103,6 +103,8 @@ comptime {
     _ = @import("exl3lib/spec.zig");
     _ = @import("exl3lib/lane.zig");
     _ = @import("exl3lib/gpu_test.zig");
+    _ = @import("exl3lib/bench.zig");
+    _ = @import("exl3lib/unfused.zig");
     _ = @import("exl3lib/ref.zig");
     _ = @import("exl3lib/decode.zig");
     _ = @import("exl3lib/root.zig");

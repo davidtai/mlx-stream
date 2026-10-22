@@ -13,6 +13,7 @@ pub const spec = @import("spec.zig");
 pub const lane = @import("lane.zig");
 pub const decode = @import("decode.zig");
 pub const ref = @import("ref.zig");
+pub const unfused = @import("unfused.zig");
 
 pub const Spec = spec.Spec;
 pub const parseExpertQuant = spec.parseExpertQuant;
@@ -191,4 +192,5 @@ test {
     _ = lane;
     _ = decode;
     _ = ref;
+    _ = unfused;
 }
