@@ -141,7 +141,7 @@ A pack whose trunk is EXL3 too (turboderp's as published) carries, beside `exper
   projections, GDN a/b/conv/A_log/dt_bias) are bf16 (f16 originals converted losslessly).
 - `ngram_table {file, format: exl3_ngram_trellis, k, row_dim}`: the PLE table as turboderp's rings (one I16 tensor
   [rows, 1 + row_dim*k/16]: an f16 scale word then row_dim k-bit symbols; state_i stacks the symbols of i, i-1, i-2) with the
-  per-hash-head bias tensor `...ple.ple_embedding.ngram_embedding.head_bias` F16 [heads, row_dim] in the trunk shards. The
+  per-hash-head bias tensor `...ple.ple_embedding.head_bias` F16 [heads, row_dim] in the trunk shards. The
   host's n-gram table reader decodes rows on the CPU (mul1 codebook) and adds the bias of the row's head (rows are head-minor).
 - Expert shards and the table are hard links of the source files; `restack_exl3_full.py` on the box builds the pack from the
   hybrid pack (experts, tokenizer, vision) and a fetched trunk directory (`fetch_exl3_trunk.py`: the non-expert tensors by
