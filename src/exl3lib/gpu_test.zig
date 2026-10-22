@@ -10,6 +10,7 @@ const G = @import("../arch/deepseek_v41/ops.zig").MlxOps;
 const format = @import("format.zig");
 const decode = @import("decode.zig");
 const ref = @import("ref.zig");
+const root = @import("root.zig");
 
 const testing = std.testing;
 
@@ -187,4 +188,62 @@ test "exl3lib gpu: the two-launch decode chain equals the host reference at ever
     var g = try G.init(a, s);
     defer g.deinit();
     for (cases) |c| try runCase(a, &g, s, c);
+}
+
+// The host's path: `root.moe` on a bf16 x [1, rows, D], i32 inds [1, rows, K] and bf16 scores, output in x's dtype.
+test "exl3lib gpu: root.moe (the sushi_exl3-shaped entry) equals the reference through the bf16 host operands (EXL3LIB_GPU=1)" {
+    _ = std.c.getenv("EXL3LIB_GPU") orelse return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const a = testing.allocator;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    const c: Case = .{ .hidden = 2560, .inter = 640, .topk = 10, .rows = 3, .experts = 12, .n = 80, .dec = .mul1 };
+    var prng = std.Random.DefaultPrng.init(0xB16);
+    const rnd = prng.random();
+    const rate = format.Rate.fromN(c.n).?;
+    var bank = try ref.synthBank(a, rnd, c.experts, c.hidden, c.inter, rate);
+    defer bank.deinit(a);
+    const nslots = c.rows * c.topk;
+    const x = try a.alloc(f32, c.rows * c.hidden);
+    defer a.free(x);
+    const bf = @import("../arch/deepseek_v41/ops.zig").bf16Bits;
+    for (x) |*v| v.* = @bitCast(@as(u32, bf(rnd.floatNorm(f32))) << 16); // bf16-exact inputs
+    const slots = try a.alloc(u32, nslots);
+    defer a.free(slots);
+    const scores = try a.alloc(f32, nslots);
+    defer a.free(scores);
+    for (0..c.rows) |r| for (0..c.topk) |k| {
+        slots[r * c.topk + k] = @intCast((k * 2 + r) % c.experts);
+        scores[r * c.topk + k] = @bitCast(@as(u32, bf(0.05 + 0.1 * rnd.float(f32))) << 16); // bf16-exact scores
+    };
+    const y_ref = try a.alloc(f32, c.rows * c.hidden);
+    defer a.free(y_ref);
+    for (0..c.rows) |r| try ref.moeRowDec(a, &bank, c.dec, x[r * c.hidden ..][0..c.hidden], slots[r * c.topk ..][0..c.topk], scores[r * c.topk ..][0..c.topk], y_ref[r * c.hidden ..][0..c.hidden]);
+    const ht = ci(c.hidden / 16);
+    const it = ci(c.inter / 16);
+    const bank_arrays: root.Bank = .{
+        .gate = .{ .trellis = try g.hostArray(std.mem.sliceAsBytes(bank.gate_t), &.{ ci(c.experts), ht, it, ci(c.n) }, .uint16), .suh = try g.hostArray(std.mem.sliceAsBytes(bank.gate_suh), &.{ ci(c.experts), ci(c.hidden) }, .float16), .svh = try g.hostArray(std.mem.sliceAsBytes(bank.gate_svh), &.{ ci(c.experts), ci(c.inter) }, .float16) },
+        .up = .{ .trellis = try g.hostArray(std.mem.sliceAsBytes(bank.up_t), &.{ ci(c.experts), ht, it, ci(c.n) }, .uint16), .suh = try g.hostArray(std.mem.sliceAsBytes(bank.up_suh), &.{ ci(c.experts), ci(c.hidden) }, .float16), .svh = try g.hostArray(std.mem.sliceAsBytes(bank.up_svh), &.{ ci(c.experts), ci(c.inter) }, .float16) },
+        .down = .{ .trellis = try g.hostArray(std.mem.sliceAsBytes(bank.down_t), &.{ ci(c.experts), it, ht, ci(c.n) }, .uint16), .suh = try g.hostArray(std.mem.sliceAsBytes(bank.down_suh), &.{ ci(c.experts), ci(c.inter) }, .float16), .svh = try g.hostArray(std.mem.sliceAsBytes(bank.down_svh), &.{ ci(c.experts), ci(c.hidden) }, .float16) },
+    };
+    const x3 = try g.astype(try g.hostArray(std.mem.sliceAsBytes(x), &.{ 1, ci(c.rows), ci(c.hidden) }, .float32), .bfloat16);
+    const inds_i32 = try a.alloc(i32, nslots);
+    defer a.free(inds_i32);
+    for (slots, inds_i32) |sl, *d| d.* = @intCast(sl);
+    const inds3 = try g.hostArray(std.mem.sliceAsBytes(inds_i32), &.{ 1, ci(c.rows), ci(c.topk) }, .int32);
+    const sc3 = try g.astype(try g.hostArray(std.mem.sliceAsBytes(scores), &.{ 1, ci(c.rows), ci(c.topk) }, .float32), .bfloat16);
+    const y = try g.adopt(try root.moe(s, x3, bank_arrays, inds3, sc3, c.dec, false));
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
+    const got = try a.alloc(f32, c.rows * c.hidden);
+    defer a.free(got);
+    _ = try g.hostF32(try g.astype(y, .float32), got);
+    const e = ref.compare(got, y_ref);
+    std.debug.print("EXL3LIB_PARITY root.moe bf16 geo={d}x{d} rows={d} topk={d} max_abs={e:.3} rms={e:.3} ratio={e:.3} {s}\n", .{ c.hidden, c.inter, c.rows, c.topk, e.max_abs, e.rms_ref, e.max_ratio, if (e.max_ratio <= 1.5e-2) "PASS" else "FAIL" });
+    try testing.expect(e.max_ratio <= 1.5e-2); // the bf16 output rounding (2^-8) on top of the chain's tolerance
+    // a prefill-width call refuses by name (the host keeps its arm)
+    const xw = try g.zeros(&.{ 1, 32, ci(c.hidden) }, .bfloat16);
+    const iw = try g.zeros(&.{ 1, 32, ci(c.topk) }, .int32);
+    const sw = try g.zeros(&.{ 1, 32, ci(c.topk) }, .bfloat16);
+    try testing.expectError(error.Exl3EngineNotImplemented, root.moe(s, xw, bank_arrays, iw, sw, c.dec, false));
 }

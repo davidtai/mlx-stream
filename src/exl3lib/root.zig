@@ -4,8 +4,8 @@
 //! `admitTopK`, `trellisAdmitted`, `Bank{gate,up,down: Proj{trellis,suh,svh}}`, `moe`, `moeWithShared`,
 //! `moeClamped`, `format.Decode`, `kernels.DECODE_ROWS_MAX`. The reference every kernel is held to is `format.project`.
 //!
-//! Status: M1, the format reference and the contract. The GPU chains (`moe*`) refuse with
-//! `error.Exl3EngineNotImplemented` until M2 (decode) and M3 (prefill) land; their validation already runs.
+//! Status: M2 form 1. `moe` serves decode rows (<= DECODE_ROWS_MAX) through the two-launch chain (`decode.zig`); prefill
+//! rows and the clamped (GLM) form refuse `error.Exl3EngineNotImplemented` until M3, so a host keeps its own arm for them.
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 pub const format = @import("format.zig");
@@ -86,24 +86,94 @@ fn validateCall(x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.m
     return bankGeometry(bank, sh[2]);
 }
 
+/// The compiled kernels of every geometry this process has served (a handful per model).
+/// a spinlock: the cache fills once per geometry and is read thereafter
+var cache_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+var cache: [16]?decode.Kernels = @splat(null);
+
+fn kernelsFor(geo: decode.Geometry) !*decode.Kernels {
+    while (cache_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    defer cache_lock.store(0, .release);
+    var free_slot: ?usize = null;
+    for (&cache, 0..) |*slot, i| {
+        if (slot.*) |*k| {
+            const g = k.geo;
+            if (g.hidden == geo.hidden and g.inter == geo.inter and g.topk == geo.topk and g.rate.n == geo.rate.n and
+                g.dec.codebook == geo.dec.codebook and g.dec.window == geo.dec.window and g.probe == geo.probe) return k;
+        } else if (free_slot == null) free_slot = i;
+    }
+    const i = free_slot orelse return error.Exl3EngineCacheFull;
+    cache[i] = try decode.Kernels.init(geo);
+    return &cache[i].?;
+}
+
+fn freeArr(a: mlx.mlx_array) void {
+    _ = mlx.mlx_array_free(a);
+}
+
 /// Routed SwiGLU experts over `x` [B, S, D] for the top-k `inds`/`scores` [B, S, K], in x's shape and dtype.
-/// Up to `kernels.DECODE_ROWS_MAX` rows (or any verify rows) take the decode chain, wider the prefill GEMM.
+/// Rows up to `kernels.DECODE_ROWS_MAX` take the two-launch decode chain; wider calls refuse
+/// `Exl3EngineNotImplemented` until M3 (the host keeps its prefill arm for them). Gate, up and down must share a rate.
 pub fn moe(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool) !mlx.mlx_array {
-    _ = s;
-    _ = dec;
     _ = verify_rows;
-    _ = try validateCall(x, bank, inds, scores);
-    return error.Exl3EngineNotImplemented;
+    const geo = try validateCall(x, bank, inds, scores);
+    if (geo.gate_up.n != geo.down.n) return error.Exl3EngineNotImplemented;
+    const xsh = mlx.getShape(x);
+    const rows_c: c_int = xsh[0] * xsh[1];
+    const rows: usize = @intCast(rows_c);
+    if (rows > kernels.DECODE_ROWS_MAX) return error.Exl3EngineNotImplemented;
+    const K: c_int = mlx.getShape(inds)[2];
+    const k = try kernelsFor(.{ .hidden = @intCast(geo.hidden), .inter = @intCast(geo.width), .topk = @intCast(K), .rate = geo.gate_up, .dec = dec });
+    // the operands the kernels take: x f32 [rows, D], slots u32 [rows * K], scores f32 [rows * K]
+    var x2 = mlx.mlx_array_new();
+    defer freeArr(x2);
+    try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ rows_c, xsh[2] }, 2, s));
+    var xf = mlx.mlx_array_new();
+    defer freeArr(xf);
+    try mlx.check(mlx.mlx_astype(&xf, x2, .float32, s));
+    var inds1 = mlx.mlx_array_new();
+    defer freeArr(inds1);
+    try mlx.check(mlx.mlx_reshape(&inds1, inds, &[_]c_int{rows_c * K}, 1, s));
+    var slots = mlx.mlx_array_new();
+    defer freeArr(slots);
+    try mlx.check(mlx.mlx_astype(&slots, inds1, .uint32, s));
+    var s1 = mlx.mlx_array_new();
+    defer freeArr(s1);
+    try mlx.check(mlx.mlx_reshape(&s1, scores, &[_]c_int{rows_c * K}, 1, s));
+    var sc = mlx.mlx_array_new();
+    defer freeArr(sc);
+    try mlx.check(mlx.mlx_astype(&sc, s1, .float32, s));
+    const out = try k.moe(s, xf, slots, sc, .{
+        .gate_t = bank.gate.trellis,
+        .gate_suh = bank.gate.suh,
+        .gate_svh = bank.gate.svh,
+        .up_t = bank.up.trellis,
+        .up_suh = bank.up.suh,
+        .up_svh = bank.up.svh,
+        .down_t = bank.down.trellis,
+        .down_suh = bank.down.suh,
+        .down_svh = bank.down.svh,
+    }, rows);
+    freeArr(out.h);
+    defer freeArr(out.y);
+    var y3 = mlx.mlx_array_new();
+    defer freeArr(y3);
+    try mlx.check(mlx.mlx_reshape(&y3, out.y, xsh.ptr, 3, s));
+    var y = mlx.mlx_array_new();
+    errdefer freeArr(y);
+    try mlx.check(mlx.mlx_astype(&y, y3, mlx.mlx_array_dtype(x), s));
+    return y;
 }
 
 /// `moe` plus an already gated shared expert, added at the routed output's rounding point.
 pub fn moeWithShared(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, shared: mlx.mlx_array) !mlx.mlx_array {
-    _ = s;
-    _ = dec;
-    _ = verify_rows;
-    _ = try validateCall(x, bank, inds, scores);
     if (mlx.mlx_array_dtype(shared) != mlx.mlx_array_dtype(x) or mlx.mlx_array_size(shared) != mlx.mlx_array_size(x)) return error.BadExl3Shape;
-    return error.Exl3EngineNotImplemented;
+    const routed = try moe(s, x, bank, inds, scores, dec, verify_rows);
+    defer freeArr(routed);
+    var y = mlx.mlx_array_new();
+    errdefer freeArr(y);
+    try mlx.check(mlx.mlx_add(&y, routed, shared, s));
+    return y;
 }
 
 /// GLM's gate is upper-clamped and its up branch symmetrically clamped before SwiGLU and the down projection.
