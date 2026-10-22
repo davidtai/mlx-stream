@@ -147,6 +147,7 @@ pub fn laneCodewordsGen(words: []const u16, rate: format.Rate, l: u32, out: *[8]
         const pos = p.lp + genOffset(rate, m);
         const j = pos >> 4;
         std.debug.assert(j == (genOffset(rate, m) >> 4) or j == (genOffset(rate, m) >> 4) + 1);
+        std.debug.assert(j + p.a <= 5); // the Metal IntWords holds halfword offsets 0..5
         const r = pos & 15;
         const h = hword(words, rate, p.qb, j + p.a);
         out[m] = @truncate((h >> @intCast(16 - r)) & 0xFFFF);
@@ -182,15 +183,17 @@ pub const metal_helpers =
     \\template <uint N> inline uint exl3_int_qb(uint L) { constexpr uint K = N / 16u; return (8u * L * K + K + 16u * N - 16u) >> 5u; }
     \\template <uint N> inline uint exl3_int_a(uint L) { constexpr uint K = N / 16u; return ((8u * L * K + K + 16u * N - 16u) >> 4u) & 1u; }
     \\template <uint N> inline uint exl3_int_b(uint L) { constexpr uint K = N / 16u; return ((8u * L * K + K + 16u * N - 16u) >> 3u) & 1u; }
-    \\struct IntWords { uint h[8]; };   // the 32-bit values at halfword offsets a + 0..7 of the lane's word qb
+    \\// the 32-bit values at halfword offsets a + 0..5 of the lane's word qb: a lane's eight windows span at most
+    \\// 15 + 7 N / 16 + 16 <= 87 bits past that halfword at N <= 128, so four words cover them (h[6], h[7] unreachable)
+    \\struct IntWords { uint h[6]; };
     \\template <uint N> inline IntWords exl3_int_words(const device uint* tile, uint qb, uint a) {
     \\  constexpr uint NW = N / 2u;
     \\  const uint b0 = qb % NW;
-    \\  const uint w0 = tile[b0], w1 = tile[(b0 + 1u) % NW], w2 = tile[(b0 + 2u) % NW], w3 = tile[(b0 + 3u) % NW], w4 = tile[(b0 + 4u) % NW];
-    \\  const uint o1 = (w0 << 16u) | (w1 >> 16u), o3 = (w1 << 16u) | (w2 >> 16u), o5 = (w2 << 16u) | (w3 >> 16u), o7 = (w3 << 16u) | (w4 >> 16u);
+    \\  const uint w0 = tile[b0], w1 = tile[(b0 + 1u) % NW], w2 = tile[(b0 + 2u) % NW], w3 = tile[(b0 + 3u) % NW];
+    \\  const uint o1 = (w0 << 16u) | (w1 >> 16u), o3 = (w1 << 16u) | (w2 >> 16u), o5 = (w2 << 16u) | (w3 >> 16u);
     \\  IntWords r;
-    \\  if (a == 0u) { r.h[0] = w0; r.h[1] = o1; r.h[2] = w1; r.h[3] = o3; r.h[4] = w2; r.h[5] = o5; r.h[6] = w3; r.h[7] = o7; }
-    \\  else { r.h[0] = o1; r.h[1] = w1; r.h[2] = o3; r.h[3] = w2; r.h[4] = o5; r.h[5] = w3; r.h[6] = o7; r.h[7] = w4; }
+    \\  if (a == 0u) { r.h[0] = w0; r.h[1] = o1; r.h[2] = w1; r.h[3] = o3; r.h[4] = w2; r.h[5] = o5; }
+    \\  else { r.h[0] = o1; r.h[1] = w1; r.h[2] = o3; r.h[3] = w2; r.h[4] = o5; r.h[5] = w3; }
     \\  return r;
     \\}
     \\// window m: cm = (K mod 8) + K m, j = (cm >> 4) + carry, the 16 bits of h[j] at (8 b + cm) & 15 from the top; M is the unrolled m
