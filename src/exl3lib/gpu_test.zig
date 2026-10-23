@@ -649,7 +649,9 @@ test "exl3lib gpu: dense timing, multi-row vs row-slot vs affine q8 (EXL3LIB_DEN
         .{ .name = "shared.down", .in = 640, .out = 2560, .n = 112 },
         .{ .name = "lm_head/10", .in = 2560, .out = 24832, .n = 96 },
     };
-    const row_counts = [_]u32{ 1, 2, 3, 4, 5, 8 };
+    // EXL3LIB_DENSE_TIME_PREFILL=1: prompt-chunk row counts (the dequantize-and-matmul path) instead of decode rows
+    const prefill = std.c.getenv("EXL3LIB_DENSE_TIME_PREFILL") != null;
+    const row_counts: []const u32 = if (prefill) &.{ 512, 2048 } else &.{ 1, 2, 3, 4, 5, 8 };
     const calls = 16;
     for (shapes) |sh| {
         var prng = std.Random.DefaultPrng.init(0x7173 ^ sh.out);
@@ -702,6 +704,10 @@ test "exl3lib gpu: dense timing, multi-row vs row-slot vs affine q8 (EXL3LIB_DEN
             var med: [3]f64 = .{ 0, 0, 0 };
             const arms: usize = if (std.c.getenv("EXL3LIB_DENSE_TIME_MULTI_ONLY") != null) 1 else 3;
             for (0..arms) |arm| {
+                if (prefill and arm == 1) {
+                    med[1] = med[0]; // rows > 16 take the same dequantize-and-matmul path in both dense modes
+                    continue;
+                }
                 var samples: [7]f64 = undefined;
                 for (0..9) |round| {
                     var ys: [calls]mlx.mlx_array = undefined;
