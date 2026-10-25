@@ -139,6 +139,9 @@ pub const RouteOverrides = struct {
     prefill_shared_mid: ?bool = null,
     /// PREFILL_HCPOST: both HC combines at prompt widths in one pass on the region's numerics. null: the default, off.
     prefill_hcpost: ?bool = null,
+    /// Resolved device capability, not a model setting: the custom HC post reproduces NAX GEMM numerics.
+    /// Host-only bills retain their declared route; construction resolves this before admission.
+    prefill_hcpost_supported: bool = true,
     /// HEAD_MODE: the output head's codec (target and draft). mxfp8 quantizes the head once at construction and the
     /// Module drops the dense bf16 head; the verify head's m1rows kernel (C11) reads bf16 only, so it goes with it.
     /// Rounding-class: the ids change by design (the grader battery gates it).
@@ -298,6 +301,26 @@ pub fn reverseResidents(coming: Coming, fresh: sdk_ext.expert.usage.PromptReside
         },
         .unknown => .forget,
     };
+}
+
+/// Hardware-dependent routes are resolved before admission so the bill and execution agree.
+fn compatibleRoutes(requested: RouteOverrides, nax: bool) RouteOverrides {
+    var out = requested;
+    if (!nax) {
+        out.prefill_attn = false;
+        out.prefill_index = false;
+        // This projection consumes the specialized attention core's output layout.
+        out.prefill_oproj = false;
+        out.prefill_hcpost_supported = false;
+    }
+    return out;
+}
+
+/// Shared by the execution route and its group-workspace bill. A setting cannot enable NAX-specific
+/// arithmetic on another device; the ordinary compiled HC post remains available there.
+pub fn prefillHcpostRoute(config: *const settings.Config, ov: RouteOverrides) bool {
+    return ov.prefill_hcpost_supported and
+        (config.kv16_hcpost orelse ov.prefill_hcpost orelse numericTier(config.numeric_tier orelse .served).routes.prefill_hcpost);
 }
 
 /// The continuation call's wave (`bill.turnCallWave`) at the served bill's prompt geometry.
@@ -604,7 +627,8 @@ pub const Module = struct {
     }
 
     /// `init` with a harness's route overrides (the served path passes none).
-    pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host, ov: RouteOverrides) !*Module {
+    pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host, requested_ov: RouteOverrides) !*Module {
+        const ov = compatibleRoutes(requested_ov, xk.naxAvailable());
         try checkCtxSize(config);
         try config.tally.check("deepseek_v41");
         try config.checkResidency();
@@ -758,7 +782,6 @@ pub const Module = struct {
         if (ov.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
         tier.routes.input_stream_early_release = inputStreamEarlyRelease(ov);
         if (ov.prefill_shared_mid) |v| tier.routes.prefill_shared_mid = v;
-        if (ov.prefill_hcpost) |v| tier.routes.prefill_hcpost = v;
         if (ov.head_mode) |h| {
             tier.routes.head = h;
             if (h != .bf16) tier.routes.rc_head = false;
@@ -779,7 +802,7 @@ pub const Module = struct {
         if (tier.routes.prefill_attn_bf16mma and !tier.routes.prefill_attn) return error.PrefillAttnBf16MmaNeedsPrefillAttn;
         // kv16-opt route switches (model settings, construction only; default: the tier's route, on).
         if (config.kv16_oproj_bf16) |v| tier.routes.prefill_oproj_bf16 = v;
-        if (config.kv16_hcpost) |v| tier.routes.prefill_hcpost = v;
+        tier.routes.prefill_hcpost = prefillHcpostRoute(config, ov);
         if (config.prefill_shared_mid) |v| tier.routes.prefill_shared_mid = v;
         tier.layer_major = layer_major;
         log.info("numeric tier: {t}\n", .{config.numeric_tier orelse .served});
@@ -3630,4 +3653,33 @@ test "dsv41 module: the arm's options from the shell's rows: native both, forced
     try std.testing.expectEqual(@as(u8, 5), plan.wide_depth);
     try std.testing.expectEqual(@as(u8, 1), armOptions(&.{ .expert_bank_dir = "/b", .numeric_tier = .stock }, ceiling, .host).wide_depth);
     try std.testing.expectEqual(lookahead.budget, plan.lookahead.?.budget);
+}
+
+test "dsv41 module: non-NAX prefill uses the eager attention and index bill" {
+    const requested: RouteOverrides = .{ .prefill_attn = true, .prefill_index = true, .prefill_oproj = true, .prefill_hc = true };
+    try std.testing.expectEqualDeep(requested, compatibleRoutes(requested, true));
+    const fallback = compatibleRoutes(requested, false);
+    try std.testing.expectEqual(@as(?bool, false), fallback.prefill_attn);
+    try std.testing.expectEqual(@as(?bool, false), fallback.prefill_index);
+    try std.testing.expectEqual(@as(?bool, false), fallback.prefill_oproj);
+    try std.testing.expectEqual(requested.prefill_hc, fallback.prefill_hc);
+    try std.testing.expect(!try prefillIndexRoute(&.{}, fallback));
+    const defaults = compatibleRoutes(.{}, false);
+    try std.testing.expect(!try prefillIndexRoute(&.{}, defaults));
+}
+
+test "dsv41 module: HC post capability dominates explicit settings and keeps the compiled region" {
+    const t = std.testing;
+    const requested: RouteOverrides = .{ .prefill_hcpost = true, .prefill_hc_post = true };
+    const supported = compatibleRoutes(requested, true);
+    const fallback = compatibleRoutes(requested, false);
+    try t.expect(prefillHcpostRoute(&.{}, supported));
+    try t.expect(!prefillHcpostRoute(&.{}, fallback));
+    try t.expect(!prefillHcpostRoute(&.{ .kv16_hcpost = true }, fallback));
+    try t.expect(!prefillHcpostRoute(&.{ .kv16_hcpost = false }, supported));
+    // The established model-setting precedence remains unchanged on supported hardware.
+    try t.expect(prefillHcpostRoute(&.{ .kv16_hcpost = true }, compatibleRoutes(.{ .prefill_hcpost = false }, true)));
+    try t.expectEqual(@as(?bool, true), fallback.prefill_hc_post);
+    try t.expect(!bill_mod.derivedGroupRoute(&.{ .kv16_hcpost = true }, fallback));
+    try t.expect(bill_mod.derivedGroupRoute(&.{ .kv16_hcpost = true }, supported));
 }

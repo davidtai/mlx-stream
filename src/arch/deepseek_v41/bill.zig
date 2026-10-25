@@ -510,7 +510,7 @@ pub fn prefillBillAt(config: *const settings.Config, ov: module.RouteOverrides, 
 /// the shared chain's f32 intermediates, a tap's held stream).
 pub fn derivedGroupRoute(config: *const settings.Config, ov: module.RouteOverrides) bool {
     const routes = module.numericTier(config.numeric_tier orelse .served).routes;
-    const hcpost = config.kv16_hcpost orelse ov.prefill_hcpost orelse routes.prefill_hcpost;
+    const hcpost = module.prefillHcpostRoute(config, ov);
     const shared_mid = config.prefill_shared_mid orelse ov.prefill_shared_mid orelse routes.prefill_shared_mid;
     return model_taps_fenced and joinlessRoute(ov) and config.dsv41ExpertBf16() and hcpost and shared_mid;
 }
