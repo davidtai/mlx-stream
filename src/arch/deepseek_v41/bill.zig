@@ -87,6 +87,13 @@ pub const Bill = struct {
     draft_wave: u64,
     /// The admission's host reserve (pools, tables, the token map, the process).
     host_reserve: u64,
+    /// Other live requests: full KV, bounded draft state and retained boundary, shared weights excluded.
+    parked_context: u64 = 0,
+    /// Conservative host allowance for the other requests' lookup arenas, token histories and scratch.
+    parked_context_host: u64 = 0,
+    /// One checkpoint tensor beside its input/contiguous copy, shared by all request slots.
+    checkpoint_staging: u64 = 0,
+    checkpoint_index_host: u64 = 0,
     /// The wide read schedule's depth window (the admission's `wide_window_bytes`: process lifetime).
     wide_window: u64 = 0,
     /// The process overhead no term above names (`unbilled_process_overhead_bytes`), in the prompt phase.
@@ -95,9 +102,8 @@ pub const Bill = struct {
     /// device table is freed after the install warm-up, so no phase holds it.
     embedding_host_rows: bool = false,
     /// What the prompt pass leaves alive through decode beyond the KV: the DSpark seed's retained state, as
-    /// the loop states it (`dsl.seedRetainedBytes`; today a view of the whole prompt's main taps and each draft
-    /// stage's window a view of its whole-prompt main KV, 1.11 GB at 16K; v6b measured +1.30 GB persistent
-    /// after the prompt). Decode phase only (inside the prompt wave's kept state during the pass).
+    /// the loop states it (`dsl.seedRetainedBytes`: the copied last main row and bounded draft windows).
+    /// Decode phase only (inside the prompt wave's kept state during the pass).
     prompt_state: u64 = 0,
     /// Multi-turn's kept boundary (`turnBoundaryCovering`: the rings copied at a prompt's end, the draft caches and main
     /// row), billed in BOTH phases: taken after a prompt's last call, held through decode and between requests, spent or
@@ -124,7 +130,7 @@ pub const Bill = struct {
 
     /// The prompt phase's process terms (the prompt pass's peak: every term live at once).
     pub fn prefillTerms(b: Bill) PhaseTerms {
-        var t = withWireTables(.{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv + b.lane_copy, .mlx_cache = b.prefill_cache, .mlx_cache_overshoot = b.cache_overshoot_prompt, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .engram_posted = b.engram_posted, .prompt_state = b.turn_boundary });
+        var t = withWireTables(.{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv + b.lane_copy, .mlx_cache = b.prefill_cache, .mlx_cache_overshoot = b.cache_overshoot_prompt, .host_reserve = b.host_reserve, .parked_context = b.parked_context, .parked_context_host = b.parked_context_host, .checkpoint_staging = b.checkpoint_staging, .checkpoint_index_host = b.checkpoint_index_host, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .engram_posted = b.engram_posted, .prompt_state = b.turn_boundary });
         t.prompt_buffer_allowance = prompt_buffer_allowance_bytes;
         return t;
     }
@@ -132,7 +138,7 @@ pub const Bill = struct {
     /// The decode phase's process terms (the embedding off at the fence; the larger of the verify and draft waves:
     /// a round drafts, then verifies, so the two never hold their transients at once).
     pub fn decodeTerms(b: Bill) PhaseTerms {
-        var t = withWireTables(.{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = @max(b.decode_wave, b.draft_wave), .kv = b.kv_decode, .mlx_cache = b.decode_cache, .mlx_cache_overshoot = b.cache_overshoot_decode, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .prompt_state = b.prompt_state + b.turn_boundary });
+        var t = withWireTables(.{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = @max(b.decode_wave, b.draft_wave), .kv = b.kv_decode, .mlx_cache = b.decode_cache, .mlx_cache_overshoot = b.cache_overshoot_decode, .host_reserve = b.host_reserve, .parked_context = b.parked_context, .parked_context_host = b.parked_context_host, .checkpoint_staging = b.checkpoint_staging, .checkpoint_index_host = b.checkpoint_index_host, .wide_window = b.wide_window, .prompt_state = b.prompt_state + b.turn_boundary });
         t.decode_buffer_allowance = decode_buffer_allowance_bytes;
         return t;
     }
@@ -142,6 +148,11 @@ pub const Bill = struct {
     pub fn constructionTerms(b: Bill) PhaseTerms {
         var t = b.prefillTerms();
         t.host_reserve = @min(b.host_reserve, construction_host_side_bytes);
+        t.prompt_state = 0;
+        t.parked_context = 0;
+        t.parked_context_host = 0;
+        t.checkpoint_staging = 0;
+        t.checkpoint_index_host = 0;
         t.waves = 0;
         t.kv = 0;
         t.mlx_cache = 0;
@@ -169,6 +180,10 @@ pub const PhaseTerms = struct {
     kv: u64 = 0,
     mlx_cache: u64 = 0,
     host_reserve: u64 = 0,
+    parked_context: u64 = 0,
+    parked_context_host: u64 = 0,
+    checkpoint_staging: u64 = 0,
+    checkpoint_index_host: u64 = 0,
     wide_window: u64 = 0,
     unbilled_overhead: u64 = 0,
     /// The retained prompt state (decode phase).
@@ -201,7 +216,7 @@ fn withWireTables(t: PhaseTerms) PhaseTerms {
 
 /// A phase's wired bytes: its terms less the host ones and the wiring terms themselves.
 pub fn wiredOf(t: PhaseTerms) u64 {
-    return t.sum() - t.wire_tables - t.decode_buffer_allowance - t.prompt_buffer_allowance - t.host_reserve - t.lookahead_staging - t.wide_window - t.unbilled_overhead - t.engram_posted;
+    return t.sum() - t.wire_tables - t.decode_buffer_allowance - t.prompt_buffer_allowance - t.host_reserve - t.parked_context_host - t.checkpoint_index_host - t.lookahead_staging - t.wide_window - t.unbilled_overhead - t.engram_posted;
 }
 
 /// The page granule and the page tables of a phase's wired bytes (`phase_memory.wireTables`, shared with GLM-5.3's bill).
@@ -500,7 +515,7 @@ pub fn joinlessRoute(ov: module.RouteOverrides) bool {
 pub fn prefillBillAt(config: *const settings.Config, ov: module.RouteOverrides, c: *const v41.Config, group_streams: u64) !v41.PrefillBill {
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids, .base_calls = v41.PrefillBill.wide_base_calls, .inflight = exl3.PrefillShape.tier.inflight };
     const expert_bf16 = config.dsv41ExpertBf16();
-    return v41.PrefillBill.of(c, try module.ringGeometry(config, ov)).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinlessRoute(ov)) shape else null).withGroupStreams(group_streams).withPrefillSub(module.prefillSub(ov, config.dsv41LayerMajor())).withDerivedGroup(derivedGroupRoute(config, ov), if (expert_bf16) 2 else 4);
+    return v41.PrefillBill.of(c, try module.ringGeometry(config, ov)).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinlessRoute(ov)) shape else null).withGroupStreams(group_streams).withPrefillSub(try module.prefillSub(config, ov, config.dsv41LayerMajor())).withDerivedGroup(derivedGroupRoute(config, ov), if (expert_bf16) 2 else 4);
 }
 
 /// The routes `PrefillBill.groupTerms` is derived from, as the Module installs them (`Module.init`: the tier's route, an
@@ -510,7 +525,7 @@ pub fn prefillBillAt(config: *const settings.Config, ov: module.RouteOverrides, 
 /// the shared chain's f32 intermediates, a tap's held stream).
 pub fn derivedGroupRoute(config: *const settings.Config, ov: module.RouteOverrides) bool {
     const routes = module.numericTier(config.numeric_tier orelse .served).routes;
-    const hcpost = config.kv16_hcpost orelse ov.prefill_hcpost orelse routes.prefill_hcpost;
+    const hcpost = module.prefillHcpostRoute(config, ov);
     const shared_mid = config.prefill_shared_mid orelse ov.prefill_shared_mid orelse routes.prefill_shared_mid;
     return model_taps_fenced and joinlessRoute(ov) and config.dsv41ExpertBf16() and hcpost and shared_mid;
 }
@@ -633,7 +648,6 @@ fn headRoute(ov: module.RouteOverrides) graph.Routes.Head {
     return ov.head_mode orelse module.numericTier(.served).routes.head;
 }
 
-
 /// Device bytes the model builds at construction beyond the checkpoint's residents (`Model.builtBytes`, computed before
 /// construction from the same formulas): HEAD_MODE mxfp8's codes and scales (vocab x hidden x 33 / 32), and W97's dense
 /// f32 wo_a per layer when the served tier routes it (off today).
@@ -714,6 +728,10 @@ pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
         .{ .name = "MLX allocator cache", .bytes = .{ p.mlx_cache, d.mlx_cache }, .at_construction = false },
         .{ .name = "MLX cache overshoot", .bytes = .{ p.mlx_cache_overshoot, d.mlx_cache_overshoot }, .at_construction = true },
         .{ .name = "host side", .bytes = .{ p.host_reserve, d.host_reserve }, .at_construction = true, .measured = true, .construction = c.host_reserve },
+        .{ .name = "other live contexts (GPU)", .bytes = .{ p.parked_context, d.parked_context }, .at_construction = false },
+        .{ .name = "checkpoint index (host)", .bytes = .{ p.checkpoint_index_host, d.checkpoint_index_host }, .at_construction = false },
+        .{ .name = "checkpoint staging", .bytes = .{ p.checkpoint_staging, d.checkpoint_staging }, .at_construction = false },
+        .{ .name = "other live contexts (host allowance)", .bytes = .{ p.parked_context_host, d.parked_context_host }, .at_construction = false },
         .{ .name = "wide read windows", .bytes = .{ p.wide_window, d.wide_window }, .at_construction = true },
         // Created at the prompt's end, never held from construction (0 in the prompt phase today).
         .{ .name = "retained prompt state", .bytes = .{ p.prompt_state, d.prompt_state }, .at_construction = false },
@@ -762,10 +780,23 @@ pub fn fillExtraRecords(b: Bill, target: u64) u32 {
 
 /// The bill at the fill's floor rows (`min_fill_rows` in both phases).
 pub fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: settings.Config, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
+    try config.checkActiveSlots();
     var c = config;
     c.expert_rows = min_fill_rows;
     c.expert_prefill_rows = min_fill_rows;
+    if (c.active_slots > 1) {
+        if (ov.bill_pinned_prompt != null) return error.Dsv41ActiveSlotsPinnedPrompt;
+        return servedBillAt(a, io, &c, max_tokens, wired_bytes, ceiling_bytes, ov);
+    }
     return billAt(a, io, &c, prompt_tokens, max_tokens, wired_bytes, ceiling_bytes, ov);
+}
+
+/// Production preflight includes every served context and checkpoint reserve even with one active slot.
+pub fn servedBillAtFloor(a: std.mem.Allocator, io: std.Io, config: settings.Config, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
+    var c = config;
+    c.expert_rows = min_fill_rows;
+    c.expert_prefill_rows = min_fill_rows;
+    return servedBillAt(a, io, &c, max_tokens, wired_bytes, ceiling_bytes, ov);
 }
 
 /// What the module needs free to load at all, for upstream's load preflight (`scheduler.loadRequirementBytes`
@@ -777,7 +808,10 @@ pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: settings.C
     // The server's load preflight: the served routes, no harness override. The standard request's bill at the floor
     // rows (the host's contract: the term-wise `bill` of that request bounds the process as this does); the construction's
     // admission then bills every prompt up to the context (`servedBill`) and refuses by name before any allocation.
-    const b = try billAtFloor(a, io, c, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
+    const b = if (c.checkpoint_cache or c.active_slots > 1)
+        try servedBillAtFloor(a, io, c, fill_max_tokens, null, ceiling_bytes, .{})
+    else
+        try billAtFloor(a, io, c, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
     return b.processBound();
 }
 
@@ -900,7 +934,12 @@ pub fn subCallMax(pb: v41.PrefillBill, joinless: bool, max_context: u64) struct 
 /// length alone under-bills a shorter prompt. A harness that pins ONE prompt (`RouteOverrides.bill_pinned_prompt`, the
 /// timed cell) bills that prompt alone (`billAt`) and the Module refuses any other length by name.
 pub fn servedBill(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
-    if (ov.bill_pinned_prompt) |p| return billAt(a, io, config, p, fill_max_tokens, wired_bytes, ceiling_bytes, ov);
+    try config.checkActiveSlots();
+    if (ov.bill_pinned_prompt) |p| {
+        // A pinned harness does not provide the covering state bound required by concurrent requests.
+        if (config.active_slots != 1) return error.Dsv41ActiveSlotsPinnedPrompt;
+        return billAt(a, io, config, p, fill_max_tokens, wired_bytes, ceiling_bytes, ov);
+    }
     return servedBillAt(a, io, config, fill_max_tokens, wired_bytes, ceiling_bytes, ov);
 }
 
@@ -908,6 +947,7 @@ pub fn servedBill(a: std.mem.Allocator, io: std.Io, config: *const settings.Conf
 /// the kept boundary (`turn_boundary`, both phases) and a reused turn's prompt calls (`reusedTurnWave`: its rows' own
 /// chunk rule over every position up to the context, which no cold prompt of any length makes).
 pub fn servedBillAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
+    try config.checkActiveSlots();
     const ctx = servedContext(config);
     var b = try billCovering(a, io, config, ctx, max_tokens, wired_bytes, ceiling_bytes, ov);
     if (module.multiturnRoute(ov)) {
@@ -917,11 +957,44 @@ pub fn servedBillAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Co
         const pb = try prefillBillAt(config, ov, &c, if (b.variant == .tight) tight else 4);
         const lm = config.dsv41LayerMajor();
         const joinless = joinlessRoute(ov);
+        if (config.active_slots > 1 or config.prefill_sub != null) coverRetainedKv(&b, pb, ctx, max_tokens);
         b.turn_boundary = turnBoundaryCovering(pb, &c, ctx);
+        if (config.checkpoint_cache) {
+            b.turn_boundary *= 2;
+            b.checkpoint_staging = @import("checkpoint_adapter.zig").staging_bytes;
+            b.checkpoint_index_host = 192 << 20;
+        }
         b.prefill_wave = @max(b.prefill_wave, reusedTurnWave(pb, lm, joinless, ctx));
         b.prefill_wave_tight = @max(b.prefill_wave_tight, reusedTurnWave(pb.withGroupStreams(tight), lm, joinless, ctx));
     }
+    try reserveActiveSlots(&b, config.active_slots, ctx, max_tokens);
     return b;
+}
+
+// Multi-turn requests allocate the full configured lane capacity even at a short prompt. Combine that capacity
+// with each covered ring size, instead of comparing short rings with short lanes against long rings with long lanes.
+fn coverRetainedKv(b: *Bill, pb: v41.PrefillBill, context: u64, max_tokens: u64) void {
+    const positions = billedPositions(context, max_tokens);
+    b.kv = @max(b.kv, pb.kvPromptBytes(context, positions));
+    b.kv_decode = @max(b.kv_decode, pb.kvDecodeBytes(context, positions));
+    const covered = coveredPromptLengths(pb, @min(context, pb.prefill_sub));
+    for (covered.at[0..covered.n]) |n| {
+        b.kv = @max(b.kv, pb.kvPromptBytes(n, positions));
+        b.kv_decode = @max(b.kv_decode, pb.kvDecodeBytes(n, positions));
+    }
+}
+
+/// Reserve the other whole request states before the row fill. The covering bill already bounds short-prompt
+/// ring knees and generation headroom. Boundary rings are additional to the live state; immutable model weights,
+/// expert banks and execution waves are shared. Only one request executes at a time.
+fn reserveActiveSlots(b: *Bill, slots: u32, context: u64, max_tokens: u64) !void {
+    if (slots < 1 or slots > 2) return error.Dsv41ActiveSlotsSetting;
+    const extra: u64 = slots - 1;
+    b.parked_context = extra * (@max(b.kv, b.kv_decode) + b.prompt_state + b.turn_boundary);
+    // Provisional allowance, not a measured footprint: reuse the entire single-request host allowance, plus
+    // 1 KiB per reserved position for lookup hash tables/arena growth and token histories. This intentionally
+    // over-reserves shared process overhead until per-context host allocation measurements are available.
+    b.parked_context_host = extra * (measured_host_side_bytes + 1024 * billedPositions(context, max_tokens));
 }
 
 /// The prefill bill `servedBillAt` bills the waves with (the bill's variant's group streams), for the multi-turn tests.
@@ -1001,7 +1074,6 @@ pub fn servedContext(config: *const settings.Config) u64 {
 
 /// The fewest rows per layer the fill admits (the envelope admission's prefill floor; `phase_memory`'s).
 pub const min_fill_rows = phase_mem.min_fill_rows;
-
 
 // ── Tests ──
 
@@ -1784,7 +1856,6 @@ test "dsv41 memory: the grow is refused when the two-count decode total exceeds 
     try std.testing.expectError(error.PromptOverTarget, admitOf(b, target));
 }
 
-
 // DSV41_BANK=<bank> (host): what upstream's load preflight bills for the module (in place of the shards' disk
 // bytes): the standard request's process bound at the fill's floor rows, well above the shards' bytes and
 // well under a full fill's bound.
@@ -1800,7 +1871,7 @@ test "dsv41 memory: the load preflight's requirement is the bill at the fill's f
     floor.memory_baseline_bytes = 0;
     floor.expert_rows = min_fill_rows;
     floor.expert_prefill_rows = min_fill_rows;
-    const b = try billAt(a, testing.io, &floor, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
+    const b = try servedBillAt(a, testing.io, &floor, fill_max_tokens, null, ceiling_bytes, .{});
     try testing.expectEqual(b.processBound(), need);
     // Residents (17.7 GB) + the prompt wave (14.4 GB) + the floor's slot rows: tens of GB, never the bank's 204 GB.
     try testing.expect(need > 30_000_000_000 and need < 60_000_000_000);
@@ -1887,8 +1958,6 @@ test "dsv41 memory: MLX's cache overshoot (one freed buffer over the limit) is b
     try testing.expectEqual(@as(u64, 1_041_448_960), b.prefillTerms().mlx_cache_overshoot);
     try testing.expectEqual(cache_overshoot_decode_traced, b.decodeTerms().mlx_cache_overshoot);
 }
-
-
 
 // (a) The bill's ring bytes against the real LayerState rings (`LayerState.init` per layer of the real config, as the
 // model's state builder makes them, `Ring.append` through the bill's chunks and then decode) on the trace backend: the
@@ -2243,7 +2312,6 @@ test "dsv41 memory: a prompt up to the sub-chunk bills its one call byte for byt
     try testing.expectEqual(one.layerMajorWaveBytes(131072, .served), promptWave(one, true, true, 131072));
 }
 
-
 test "dsv41 memory: the default served bill's wave covers every prompt length 1 .. 16,384, the chunk rule's breakpoints included (no bank)" {
     const c = try realConfig();
     const config: settings.Config = .{};
@@ -2459,4 +2527,147 @@ test "dsv41 bill: the served indexer chain is its block's peak, both copies; the
         // (2 B a row and position, 8.4 GB at its deepest call); the bill keeps the unattributed 3 B. The lever cell (pass3f1)
         // measures it on this tree.
     }) |m| try testing.expect(m.billed >= m.peak);
+}
+
+test "dsv41 active slots: parked contexts share banks and reserve GPU and host bytes in both phases" {
+    var b = cell4Bill();
+    b.prompt_state = 847872;
+    b.turn_boundary = 400000000;
+    const one = b;
+    try reserveActiveSlots(&b, 1, 131072, fill_max_tokens);
+    try testing.expectEqual(one, b);
+    try reserveActiveSlots(&b, 2, 131072, fill_max_tokens);
+    const gpu = @max(one.kv, one.kv_decode) + one.prompt_state + one.turn_boundary;
+    const host = measured_host_side_bytes + 1024 * billedPositions(131072, fill_max_tokens);
+    try testing.expectEqual(gpu, b.parked_context);
+    try testing.expectEqual(host, b.parked_context_host);
+    try testing.expectEqual(one.slot_prefill, b.slot_prefill);
+    try testing.expectEqual(one.slot_decode, b.slot_decode);
+    try testing.expectEqual(one.residents, b.residents);
+    inline for (.{ "prefillTerms", "decodeTerms" }) |method| {
+        const before = @field(Bill, method)(one);
+        const after = @field(Bill, method)(b);
+        try testing.expectEqual(gpu, wiredOf(after) - wiredOf(before));
+        try testing.expectEqual(gpu + host + after.wire_tables - before.wire_tables, after.sum() - before.sum());
+    }
+    try testing.expectEqual(one.constructionTerms(), b.constructionTerms());
+    const target = @max(one.prefillTotal(), one.decodeTotal());
+    try expectSdkView(b, target);
+    const before_rows = try fillOf(fillBillOf(one), target, one.n_experts);
+    const after_rows = try fillOf(fillBillOf(b), target, b.n_experts);
+    try testing.expect(after_rows.prefill <= before_rows.prefill);
+    try testing.expect(after_rows.decode <= before_rows.decode);
+    try testing.expect(after_rows.prefill < before_rows.prefill or after_rows.decode < before_rows.decode);
+    const short_host = b.parked_context_host;
+    try reserveActiveSlots(&b, 2, 262144, fill_max_tokens);
+    try testing.expect(b.parked_context_host > short_host);
+    try testing.expectError(error.Dsv41ActiveSlotsSetting, reserveActiveSlots(&b, 3, 131072, fill_max_tokens));
+}
+
+test "dsv41 active slots: 131k retained state bounds every covered prompt (no bank)" {
+    const c = try realConfig();
+    const config: settings.Config = .{ .active_slots = 2, .max_context_tokens = 131072 };
+    const pb = try prefillBillAt(&config, .{}, &c, 4);
+    const positions = billedPositions(131072, fill_max_tokens);
+    var b = cell4Bill();
+    b.kv = pb.kvPromptBytes(131072, positions);
+    b.kv_decode = pb.kvDecodeBytes(131072, positions);
+    const covered = coveredPromptLengths(pb, @min(131072, pb.prefill_sub));
+    for (covered.at[0..covered.n]) |n| {
+        b.kv = @max(b.kv, pb.kvPromptBytes(n, billedPositions(n, fill_max_tokens)));
+        b.kv_decode = @max(b.kv_decode, pb.kvDecodeBytes(n, billedPositions(n, fill_max_tokens)));
+    }
+    coverRetainedKv(&b, pb, 131072, fill_max_tokens);
+    b.prompt_state = dsl.seedRetainedBytes(&c, 131072);
+    b.turn_boundary = 2 * turnBoundaryCovering(pb, &c, 131072);
+    try reserveActiveSlots(&b, 2, 131072, fill_max_tokens);
+    try testing.expectEqual(@as(u64, 139272), positions);
+    for (covered.at[0..covered.n]) |n| {
+        const live = @max(pb.kvPromptBytes(n, positions), pb.kvDecodeBytes(n, positions));
+        try testing.expect(b.parked_context >= live + dsl.seedRetainedBytes(&c, n) + turnBoundaryBytes(pb, &c, n));
+    }
+    std.debug.print("\nDSV41_PARKED_CONTEXT context=131072 gpu={d} host_allowance={d}\n", .{ b.parked_context, b.parked_context_host });
+}
+
+test "dsv41 active slots: load preflight uses the served covering bill for two slots (bank)" {
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try @import("host.zig").loadConfig(testing.io, a, dir);
+    config.active_slots = 2;
+    config.max_context_tokens = 131072;
+    config.memory_baseline_bytes = 0;
+    const ceiling = 184 * (1 << 30);
+    const floor = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling, .{});
+    config.expert_rows = min_fill_rows;
+    config.expert_prefill_rows = min_fill_rows;
+    const served = try servedBillAt(a, testing.io, &config, fill_max_tokens, null, ceiling, .{});
+    try testing.expectEqual(served, floor);
+    try testing.expect(floor.parked_context > 0 and floor.parked_context_host > 0);
+    try testing.expectEqual(served.processBound(), try loadRequirementBytes(a, testing.io, config, ceiling));
+    try expectSdkView(floor, ceiling);
+}
+
+test "dsv41 checkpoint bill: staging is wired and bounded host index is not, both phases reserve them" {
+    const original = cell4Bill();
+    var b = original;
+    b.checkpoint_staging = @import("checkpoint_adapter.zig").staging_bytes;
+    b.checkpoint_index_host = 192 << 20;
+    inline for (.{ "prefillTerms", "decodeTerms" }) |method| {
+        const before = @field(Bill, method)(original);
+        const after = @field(Bill, method)(b);
+        try testing.expectEqual(b.checkpoint_staging, wiredOf(after) - wiredOf(before));
+        try testing.expectEqual(b.checkpoint_staging + b.checkpoint_index_host + after.wire_tables - before.wire_tables, after.sum() - before.sum());
+    }
+    try testing.expectEqual(original.constructionTerms(), b.constructionTerms());
+    try expectSdkView(b, @max(b.prefillTotal(), b.decodeTotal()));
+}
+
+test "dsv41 memory: prefill_sub setting and overrides resolve identically for runtime and bill" {
+    const c = try realConfig();
+    for ([_]?u64{ null, 4096, 8192, 16384 }) |sub| {
+        const config: settings.Config = .{ .prefill_sub = sub };
+        const pb = try prefillBillAt(&config, .{}, &c, 4);
+        try testing.expectEqual(sub orelse kvc.prefill_sub, pb.prefill_sub);
+        try testing.expectEqual(try module.prefillSub(&config, .{}, true), pb.prefill_sub);
+        const override: module.RouteOverrides = .{ .prefill_sub = 2048 };
+        try testing.expectEqual(@as(u64, 2048), (try prefillBillAt(&config, override, &c, 4)).prefill_sub);
+        try testing.expectEqual(@as(u64, 2048), try module.prefillSub(&config, override, true));
+        try testing.expectEqual(std.math.maxInt(u64), try module.prefillSub(&config, .{ .prefill_sub = std.math.maxInt(u64) }, true));
+        try testing.expectEqual(std.math.maxInt(u64), try module.prefillSub(&config, .{}, false));
+    }
+    const config: settings.Config = .{ .prefill_sub = 4096 };
+    const pb = try prefillBillAt(&config, .{}, &c, 4);
+    const standard = try prefillBillAt(&.{}, .{}, &c, 4);
+    const n: u32 = 196608;
+    const calls = try kvc.prefillSubCalls(testing.allocator, n, pb.chunkRows(n), pb.prefill_sub);
+    defer testing.allocator.free(calls);
+    var at: u32 = 0;
+    for (calls) |call| {
+        try testing.expectEqual(at, call[0]);
+        try testing.expect(call[1] > call[0]);
+        try testing.expect(call[1] - call[0] <= pb.promptCallRows(n));
+        at = call[1];
+    }
+    try testing.expectEqual(n, at);
+    try testing.expect(pb.promptCallRows(n) < standard.promptCallRows(n));
+    try testing.expect(promptWave(pb, true, true, n) < promptWave(standard, true, true, n));
+    // The public minimum stays above the model's widest one-span ring knee. Keep full-context
+    // KV lanes and both retained boundaries covered even when the call workspace is smaller.
+    const covered = coveredPromptLengths(pb, n);
+    try testing.expect(covered.at[1] < config.prefill_sub.?);
+    var b = cell4Bill();
+    b.kv = 0;
+    b.kv_decode = 0;
+    coverRetainedKv(&b, pb, n, fill_max_tokens);
+    const positions = billedPositions(n, fill_max_tokens);
+    for (covered.at[0..covered.n]) |length| {
+        try testing.expect(b.kv >= pb.kvPromptBytes(length, positions));
+        try testing.expect(b.kv_decode >= pb.kvDecodeBytes(length, positions));
+        try testing.expect(turnBoundaryCovering(pb, &c, n) >= turnBoundaryBytes(pb, &c, length));
+    }
+    const invalid: settings.Config = .{ .prefill_sub_bad = true };
+    try testing.expectError(error.Dsv41PrefillSubSetting, prefillBillAt(&invalid, .{}, &c, 4));
+    try testing.expectError(error.Dsv41PrefillSubSetting, module.prefillSub(&invalid, .{}, false));
 }

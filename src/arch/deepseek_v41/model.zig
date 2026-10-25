@@ -960,7 +960,10 @@ pub fn Model(comptime G: type) type {
                     // The profile's mark before the group's final evaluation (the merge, the combines, the HC posts and the new
                     // streams at once, as the timed pass runs it), then that evaluation's own stage.
                     probeGroupEval(probe, if (parts) |pt| pt.outs else &.{}, if (parts) |pt| pt.loc else null, pre_shared, hs[i..j], cat_xf);
-                    try g.evalAll(hs[i..j]);
+                    g.evalAll(hs[i..j]) catch |err| {
+                        probeGroupError(probe, err);
+                        return err;
+                    };
                     probeChunk(probe, i);
                     try probe.put("group.eval", hs[i]);
                     probeChunk(probe, j - 1);
@@ -1040,6 +1043,11 @@ pub fn Model(comptime G: type) type {
         fn probeGroupEval(probe: anytype, outs: []const T, loc: ?T, shared: []const ?T, next: []const T, cat_xf: ?T) void {
             const P = @TypeOf(probe);
             if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "groupEval")) probe.groupEval(outs, loc, shared, next, cat_xf);
+        }
+
+        fn probeGroupError(probe: anytype, err: anyerror) void {
+            const P = @TypeOf(probe);
+            if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "groupError")) probe.groupError(err);
         }
 
         /// The group's JOINLESS merge (the hook's record, profile builds) for a probe that reads it.
@@ -2013,6 +2021,71 @@ test "dsv41 model: P1 in the one-span prompt pass: every layer's predictor runs 
     try ex.flush();
     try testing.expectEqual(logged, src.ahead_log.items.len);
     for (src.log.items) |e| if (e.kind == .read_ahead) try testing.expect(e.layer < nl);
+}
+
+test "dsv41 prefill interleave: borrowed decode suppresses predictor and prompt resumes it without a phase change" {
+    const xp = @import("experts.zig");
+    const quant = @import("../../sdk_ext.zig").quant;
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const tier = try routes.parse(&.{.{ "MTPLX_DSV41_PREFILL_CHUNK", "64" }}, null);
+    const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    var st = try model_.newState();
+    defer st.deinit(&g, testing.allocator);
+    const nl = m.c.n_layers;
+    const n: u16 = @intCast(m.c.n_routed_experts);
+    var rows: [8]u32 = @splat(2);
+    var src = try xp.FakeSource.init(testing.allocator, .{ .hidden = m.c.hidden_size, .inter = m.c.moe_intermediate_size, .n_experts = n, .rows = rows[0..nl] });
+    defer src.deinit();
+    const Count = struct {
+        pub fn call(_: *@This(), gg: *TraceOps, act: u32, r: quant.PrefillRows, _: xp.BankArraysOf(u32)) !u32 {
+            return gg.input(&.{ @intCast(r.slot.len), gg.shapeOf(act).d[1] }, .float32);
+        }
+        pub fn finish(_: *@This(), _: *TraceOps) !void {}
+    };
+    var counts: [8]Count = @splat(.{});
+    const Math = xp.WithPrefillRoutes(TraceOps, xp.TraceMath, Count);
+    const Ex = xp.ExpertsWith(TraceOps, xp.FakeSource, Math, .{ .prefill = true });
+    var ex = try Ex.initWith(testing.allocator, &g, &src, .{ .d = .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, .routes = counts[0..nl] }, &m.c, .{ .wide = .{ .seed = true, .read_ahead = true } });
+    defer ex.deinit();
+    const Host = struct {
+        n: u16,
+        fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            for (out, 0..) |*o, i| o.* = @intCast((i * 3) % h.n);
+        }
+    };
+    var host: Host = .{ .n = n };
+    g.host_values = .{ .ctx = &host, .ids = Host.ids, .argmax = struct {
+        fn call(_: *anyopaque) anyerror!u32 {
+            return 7;
+        }
+    }.call };
+    for (0..2) |_| {
+        ex.prefill_predictor_suspended = true;
+        try testing.expect(!ex.at(0).readAhead());
+        try testing.expect(ex.at(0).prompting() and ex.wide_route.read_ahead);
+        const prior = src.log.items.len;
+        const r = try model_.forward(&g, &st, &.{7}, .{ .logits = .last }, &ex, graph.NoProbe{});
+        try TM.fence(&g, &st, &.{r.logits.?});
+        try ex.flush();
+        for (src.log.items[prior..]) |e| try testing.expect(e.kind != .read_ahead and e.kind != .await_read_ahead and e.kind != .grow);
+        ex.prefill_predictor_suspended = false;
+        try testing.expect(ex.at(0).readAhead() and ex.at(0).prompting());
+        const resumed = src.log.items.len;
+        const p = try model_.forward(&g, &st, &(@as([25]u32, @splat(1))), .{ .logits = .last }, &ex, graph.NoProbe{});
+        try TM.fence(&g, &st, &.{p.logits.?});
+        try ex.flush();
+        var predictions: usize = 0;
+        for (src.log.items[resumed..]) |e| {
+            if (e.kind == .read_ahead) predictions += 1;
+        }
+        try testing.expectEqual(nl, predictions);
+    }
 }
 
 test "dsv41 model: P1's predictor reads its chunks' ids in batches: one eval a batch of four, every chunk's ids counted" {

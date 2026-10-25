@@ -8,8 +8,6 @@ const sdk_ext = @import("sdk_ext.zig");
 const plugin = @import("root.zig").plugin;
 const plugin_mimo = @import("root.zig").plugin_mimo;
 
-
-
 comptime {
     _ = @import("sdk_ext/kinds.zig");
 }
@@ -123,6 +121,55 @@ test "mlx-stream conformance: both arches share one expert reader claim" {
     try mimo.claim_process.?();
     try std.testing.expectError(error.ExpertReaderInUse, dsv.claim_process.?());
     mimo.release_process.?();
+}
+
+test "sdk arch: optional request leases preserve handles and propagate errors" {
+    const Base = sdk.testing.FakeArch(.{});
+    const Leased = struct {
+        pub const name = Base.name;
+        pub const caps = Base.caps;
+        pub const Config = Base.Config;
+        pub const Module = Base.Module;
+        pub const claims = Base.claims;
+        pub const parse = Base.parse;
+        pub const freeConfig = Base.freeConfig;
+        pub const shell = Base.shell;
+        pub const applySettings = Base.applySettings;
+        pub const loadBytes = Base.loadBytes;
+        pub const init = Base.init;
+        pub const deinit = Base.deinit;
+        pub const prefill = Base.prefill;
+        pub const step = Base.step;
+        pub const position = Base.position;
+        pub fn acquireRequest(m: *Module, prefix: []const u32) !u64 {
+            m.position = prefix.len;
+            return 0x100000001;
+        }
+        pub fn activateRequest(m: *Module, handle: u64) !void {
+            if (handle != 0x100000001) return error.StaleRequest;
+            m.position += 1;
+        }
+        pub fn releaseRequest(m: *Module, handle: u64) !void {
+            if (handle != 0x100000001) return error.StaleRequest;
+            m.position = 0;
+        }
+        pub fn requestCapacity(_: *const Module) u32 {
+            return 2;
+        }
+    };
+    try std.testing.expect((comptime sdk.Arch.of(Base)).request_slots == null);
+    const slots = (comptime sdk.Arch.of(Leased)).request_slots.?;
+    var calls: sdk.testing.FakeCalls = .{};
+    var m: Base.Module = .{ .gpa = std.testing.allocator, .calls = &calls };
+    try std.testing.expectEqual(@as(u32, 2), slots.capacity(&m));
+    const handle = try slots.acquire(&m, &.{ 7, 9 });
+    try std.testing.expectEqual(@as(u64, 0x100000001), handle);
+    try slots.activate(&m, handle);
+    try std.testing.expectEqual(@as(u64, 3), m.position);
+    try std.testing.expectError(error.StaleRequest, slots.activate(&m, 1));
+    try slots.release(&m, handle);
+    try std.testing.expectEqual(@as(u64, 0), m.position);
+    try std.testing.expectError(error.StaleRequest, slots.release(&m, 1));
 }
 
 // Declared last so it runs after every other conformance test (the CPU lane's bar).

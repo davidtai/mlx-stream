@@ -139,6 +139,9 @@ pub const RouteOverrides = struct {
     prefill_shared_mid: ?bool = null,
     /// PREFILL_HCPOST: both HC combines at prompt widths in one pass on the region's numerics. null: the default, off.
     prefill_hcpost: ?bool = null,
+    /// Resolved device capability, not a model setting: the custom HC post reproduces NAX GEMM numerics.
+    /// Host-only bills retain their declared route; construction resolves this before admission.
+    prefill_hcpost_supported: bool = true,
     /// HEAD_MODE: the output head's codec (target and draft). mxfp8 quantizes the head once at construction and the
     /// Module drops the dense bf16 head; the verify head's m1rows kernel (C11) reads bf16 only, so it goes with it.
     /// Rounding-class: the ids change by design (the grader battery gates it).
@@ -221,7 +224,6 @@ pub fn decodeFillGranule(ov: RouteOverrides) arm_mod.DecodeFillGranule {
     return ov.decode_fill_granule orelse .row;
 }
 
-
 /// The decode cache limit the Module installs and the bill charges (one resolver: the setting over the envelope's).
 pub fn decodeCacheLimit(ov: RouteOverrides) error{DecodeCacheLimit}!u64 {
     const v = ov.decode_cache_bytes orelse return envelope.decode_cache_bytes;
@@ -298,6 +300,26 @@ pub fn reverseResidents(coming: Coming, fresh: sdk_ext.expert.usage.PromptReside
         },
         .unknown => .forget,
     };
+}
+
+/// Hardware-dependent routes are resolved before admission so the bill and execution agree.
+fn compatibleRoutes(requested: RouteOverrides, nax: bool) RouteOverrides {
+    var out = requested;
+    if (!nax) {
+        out.prefill_attn = false;
+        out.prefill_index = false;
+        // This projection consumes the specialized attention core's output layout.
+        out.prefill_oproj = false;
+        out.prefill_hcpost_supported = false;
+    }
+    return out;
+}
+
+/// Shared by the execution route and its group-workspace bill. A setting cannot enable NAX-specific
+/// arithmetic on another device; the ordinary compiled HC post remains available there.
+pub fn prefillHcpostRoute(config: *const settings.Config, ov: RouteOverrides) bool {
+    return ov.prefill_hcpost_supported and
+        (config.kv16_hcpost orelse ov.prefill_hcpost orelse numericTier(config.numeric_tier orelse .served).routes.prefill_hcpost);
 }
 
 /// The continuation call's wave (`bill.turnCallWave`) at the served bill's prompt geometry.
@@ -377,10 +399,11 @@ pub fn inputStreamEarlyRelease(ov: RouteOverrides) bool {
 
 /// The prompt's sub-chunk the Module installs and the bill reads (upstream deepseek_v4's `prefillSub()`, read by both
 /// its `extendState` and server.zig's prefill memory guard, deepseek_v4.zig:8063-8077): the override's, else
-/// `kvc.prefill_sub`. Only the layer-major pass takes sub-chunk calls (the chunk-major pass settles each span already).
-pub fn prefillSub(ov: RouteOverrides, layer_major: bool) u64 {
+/// the model setting, else `kvc.prefill_sub`. Only the layer-major pass takes sub-chunk calls (the chunk-major pass settles each span already).
+pub fn prefillSub(config: *const settings.Config, ov: RouteOverrides, layer_major: bool) !u64 {
+    try config.checkPrefillSub();
     if (!layer_major) return std.math.maxInt(u64);
-    return ov.prefill_sub orelse kvc.prefill_sub;
+    return ov.prefill_sub orelse config.prefill_sub orelse kvc.prefill_sub;
 }
 
 /// Multi-turn (`TurnBoundary`, `restorePrefix`) is installed on the served path; a harness that pins one prompt runs every
@@ -429,17 +452,56 @@ const Dspark = struct {
     caches: []H.Cache,
 };
 
-/// A conversation's last prompt, kept after its request (multi-turn): the prompt's ids, the request's state at the
-/// prompt's end (`Model.Boundary`: the rings copied, the stores' rows) and the strategy's draft caches and main row
-/// there (kept references: a decode replaces them, never writes them). The host's prefix cache decides what a later
-/// prompt reuses; `restorePrefix` honours it from here, and the prompt pass runs only what follows.
-const TurnBoundary = struct {
+/// Only request-owned data moves between contexts. Cache phase and terminal refusals stay on the Module.
+const RequestState = struct {
+    state: ?M.State = null,
+    dspark: ?Dspark = null,
+    turn_boundary: ?TurnBoundary = null,
+    completed_boundary: ?TurnBoundary = null,
+    request_completed: bool = false,
+    request_succeeded: bool = false,
+    resume_at: u64 = 0,
+    decode_host: DecodeHost = .{},
+    prompt_stats0: ?expert_stream.Stats = null,
+    prompt_tokens: usize = 0,
+    phase: PhaseGate.Phase = .idle,
+    seeded: bool = false,
+    sampler_pending: ?sdk_ext.acceptance.Params = null,
+    sampler_active: ?sdk_ext.acceptance.Params = null,
+
+    fn swap(self: *RequestState, m: *Module) void {
+        inline for (.{ "state", "dspark", "turn_boundary", "completed_boundary", "request_completed", "request_succeeded", "resume_at", "decode_host", "prompt_stats0", "prompt_tokens" }) |field|
+            std.mem.swap(@TypeOf(@field(self, field)), &@field(self, field), &@field(m, field));
+        std.mem.swap(PhaseGate.Phase, &self.phase, &m.gate.phase);
+        std.mem.swap(bool, &self.seeded, &m.gate.seeded);
+        std.mem.swap(?sdk_ext.acceptance.Params, &self.sampler_pending, &m.sampler.pending);
+        std.mem.swap(?sdk_ext.acceptance.Params, &self.sampler_active, &m.sampler.active);
+        if (self.dspark) |*d| d.lp.st = &self.state.?;
+        if (m.dspark) |*d| d.lp.st = &m.state.?;
+    }
+
+    fn deinit(self: *RequestState, m: *Module) void {
+        if (self.turn_boundary) |*b| b.deinit(&m.g, m.gpa);
+        if (self.completed_boundary) |*b| b.deinit(&m.g, m.gpa);
+        if (self.dspark) |*d| {
+            d.lp.deinit();
+            for (d.caches) |*c| c.deinit(&m.g);
+            m.gpa.free(d.caches);
+        }
+        if (self.state) |*st| st.deinit(&m.g, m.gpa);
+        self.* = .{};
+    }
+};
+
+/// A retained conversation boundary: exact token ids, copied rings, append-only store lengths, and draft caches.
+/// Each context keeps its original prompt; completed response boundaries are temporary exports.
+pub const TurnBoundary = struct {
     ids: []u32,
     state: mdl.Model(G).Boundary,
     caches: []H.Cache = &.{},
     main_h: ?G.T = null,
 
-    fn deinit(self: *TurnBoundary, g: *G, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *TurnBoundary, g: *G, gpa: std.mem.Allocator) void {
         self.state.deinit(g, gpa);
         for (self.caches) |*c| c.deinit(g);
         gpa.free(self.caches);
@@ -452,7 +514,7 @@ const TurnBoundary = struct {
 /// kept boundary (`TurnBoundary`, the last prompt's end) when the match reaches it, or one position short of it when the
 /// match stops there (a thinking turn re-renders the last prompt id; the same prompt again re-runs its last id): inside
 /// every ring's margin. The boundary's ids must be the prefix's there (the host's cache holds many conversations, the
-/// Module one state). Anything else: 0, the prompt runs cold.
+/// selected request owns the corresponding state). Anything else: 0, the prompt runs cold.
 pub fn boundaryKeep(boundary_ids: []const u32, prefix: []const u32) u64 {
     const p = boundary_ids.len;
     const keep = if (prefix.len >= p) p else if (prefix.len + 1 == p) p - 1 else return 0;
@@ -529,6 +591,9 @@ pub const Module = struct {
     head: *H,
     /// The request in flight (rebuilt at `cache.step == 0`).
     state: ?M.State = null,
+    request_slots: @import("request_slots.zig").Slots = .{},
+    active_request: usize = 0,
+    parked_requests: [2]RequestState = @splat(.{}),
     /// The DSpark strategy's settings (the served tier with a draft head); null: serial decode only.
     dspark_cfg: ?dsl.Config = null,
     /// The request's DSpark strategy, seeded by `prefill` when `dspark_cfg` is set.
@@ -536,6 +601,9 @@ pub const Module = struct {
     /// Multi-turn: the last prompt's boundary (`TurnBoundary`), kept after its request; null after a cold miss, an error
     /// or on a pinned harness.
     turn_boundary: ?TurnBoundary = null,
+    completed_boundary: ?TurnBoundary = null,
+    request_completed: bool = false,
+    request_succeeded: bool = false,
     /// Multi-turn is installed (the served path; off when the harness pins one prompt, `bill_pinned_prompt`).
     multiturn: bool = false,
     /// Multi-turn's continuation call bill (`turnCallWave`'s inputs, from the served bill at construction): the reverse
@@ -562,6 +630,10 @@ pub const Module = struct {
     /// The Module holds its prompt configuration (the scratch, the prompt rows, the prompt cache limit): false from a
     /// prompt's tail release or phase change until the reverse phase change (`requestEnd`).
     prompt_ready: bool = true,
+    /// Scoped to the host's whole-prompt call; never moved with the selected request.
+    prefill_control: ?sdk.PrefillControl = null,
+    /// A decoder borrows the prompt banks at a fenced sub-call boundary, without a phase change.
+    prefill_interleave: bool = false,
     /// The last reverse phase change's record.
     reverse_change: ?ReverseRecord = null,
     /// A harness's observer at the phase change's proof points (set before the first request; none on the served path).
@@ -604,10 +676,14 @@ pub const Module = struct {
     }
 
     /// `init` with a harness's route overrides (the served path passes none).
-    pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host, ov: RouteOverrides) !*Module {
+    pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host, requested_ov: RouteOverrides) !*Module {
+        const ov = compatibleRoutes(requested_ov, xk.naxAvailable());
         try checkCtxSize(config);
         try config.tally.check("deepseek_v41");
         try config.checkResidency();
+        try config.checkActiveSlots();
+        try config.checkPrefillSub();
+        if (config.active_slots > 1 and draftAhead(ov)) return error.RequestSlotsDraftAheadUnsupported;
         const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const layer_major = layerMajor(config) catch |e| {
@@ -628,6 +704,7 @@ pub const Module = struct {
         errdefer self.g.deinit();
         self.sampler = try Sampler.init(gpa, s);
         errdefer self.sampler.deinit();
+        self.request_slots.capacity = config.active_slots;
         self.owner = std.Thread.getCurrentId();
         self.io = io;
         self.overrides = ov;
@@ -758,7 +835,6 @@ pub const Module = struct {
         if (ov.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
         tier.routes.input_stream_early_release = inputStreamEarlyRelease(ov);
         if (ov.prefill_shared_mid) |v| tier.routes.prefill_shared_mid = v;
-        if (ov.prefill_hcpost) |v| tier.routes.prefill_hcpost = v;
         if (ov.head_mode) |h| {
             tier.routes.head = h;
             if (h != .bf16) tier.routes.rc_head = false;
@@ -779,7 +855,7 @@ pub const Module = struct {
         if (tier.routes.prefill_attn_bf16mma and !tier.routes.prefill_attn) return error.PrefillAttnBf16MmaNeedsPrefillAttn;
         // kv16-opt route switches (model settings, construction only; default: the tier's route, on).
         if (config.kv16_oproj_bf16) |v| tier.routes.prefill_oproj_bf16 = v;
-        if (config.kv16_hcpost) |v| tier.routes.prefill_hcpost = v;
+        tier.routes.prefill_hcpost = prefillHcpostRoute(config, ov);
         if (config.prefill_shared_mid) |v| tier.routes.prefill_shared_mid = v;
         tier.layer_major = layer_major;
         log.info("numeric tier: {t}\n", .{config.numeric_tier orelse .served});
@@ -827,7 +903,7 @@ pub const Module = struct {
         self.installed.decode_smallm = self.model.tier.routes.rc_smallm;
         self.installed.decode_mxfp8_rows = self.model.tier.routes.rc_mxfp8_rows;
         self.installed.input_stream_early_release = self.model.tier.routes.input_stream_early_release;
-        self.prefill_sub = prefillSub(ov, self.model.tier.layer_major);
+        self.prefill_sub = try prefillSub(config, ov, self.model.tier.layer_major);
         self.multiturn = multiturnRoute(ov);
         self.installed.prefill_sub = self.prefill_sub;
         self.installed.prefill_shared_mid = self.model.tier.routes.prefill_shared_mid;
@@ -1014,9 +1090,9 @@ pub const Module = struct {
         // LOOKAHEAD4 (the verification harness): a gated call's waves against the same slots waited.
         if (comptime AT == AGated) {
             if (self.overrides.verify) {
-            arm.hook.checkGates(&self.g, gpa, arm.config.n_experts_per_tok) catch |e|
-                return refused(refuse(diag, e, "event gates: the gated waves differ from the same slots waited, or a gate was forced", .{}), diag);
-            log.info("NATIVE event gates: the construction self-check passed (layer 0, {d} cold experts: gated == waited, bit for bit)\n", .{arm.config.n_experts_per_tok});
+                arm.hook.checkGates(&self.g, gpa, arm.config.n_experts_per_tok) catch |e|
+                    return refused(refuse(diag, e, "event gates: the gated waves differ from the same slots waited, or a gate was forced", .{}), diag);
+                log.info("NATIVE event gates: the construction self-check passed (layer 0, {d} cold experts: gated == waited, bit for bit)\n", .{arm.config.n_experts_per_tok});
             }
         }
         // P1 (the verification harness): records read ahead against the same records read on demand.
@@ -1132,11 +1208,14 @@ pub const Module = struct {
     }
 
     pub fn deinit(self: *Module) void {
+        self.dropCompletedBoundary();
         self.recordDecodeEnd();
         const gpa = self.gpa;
         if (self.tally_path) |p| gpa.free(p);
         if (self.tally_rates.len > 0) gpa.free(self.tally_rates);
+        for (&self.parked_requests) |*r| r.deinit(self);
         self.dropTurnBoundary();
+        self.dropCompletedBoundary();
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, gpa);
         self.head.deinit(&self.g);
@@ -1222,6 +1301,133 @@ pub const Module = struct {
         self.set.deinit();
     }
 
+    pub fn requestCapacity(self: *const Module) u32 {
+        return self.request_slots.capacity;
+    }
+
+    /// Lease an idle context, preferring its retained prefix. Busy contexts are never reused.
+    pub fn acquireRequest(self: *Module, prefix: []const u32) !u64 {
+        if (self.prefill_interleave) return error.PrefillDuringInterleave;
+        try self.gate.request();
+        var lengths: [2]u64 = @splat(0);
+        for (0..self.request_slots.capacity) |i| {
+            const boundary = if (i == self.active_request) self.turn_boundary else self.parked_requests[i].turn_boundary;
+            const completed = if (i == self.active_request) self.completed_boundary else self.parked_requests[i].completed_boundary;
+            if (boundary) |b| lengths[i] = boundaryKeep(b.ids, prefix);
+            if (completed) |b| lengths[i] = @max(lengths[i], boundaryKeep(b.ids, prefix));
+        }
+        const handle = try self.request_slots.acquire(&lengths);
+        errdefer self.request_slots.release(handle) catch {};
+        try self.selectRequest(try self.request_slots.index(handle));
+        self.gate.phase = .idle;
+        self.gate.seeded = false;
+        self.resume_at = 0;
+        self.request_completed = false;
+        self.request_succeeded = false;
+        return handle;
+    }
+
+    pub fn activateRequest(self: *Module, handle: u64) !void {
+        try self.gate.request();
+        try self.selectRequest(try self.request_slots.index(handle));
+        // Another request may have failed after returning the shared expert cache to its prompt phase.
+        if (!self.prefill_interleave) try ensureRequestDecode(self);
+    }
+
+    pub fn markRequestComplete(self: *Module, handle: u64, ids: []const u32) !void {
+        try self.activateRequest(handle);
+        if (self.gate.phase == .idle) return error.CompletionWithoutPrompt;
+        if (self.multiturn) {
+            const prompt = (self.turn_boundary orelse return error.CompletionHistoryMismatch).ids;
+            _ = try completionPlan(prompt, ids, self.position());
+        }
+        self.request_succeeded = true;
+    }
+
+    /// End only this lease. Successful completions remain reusable; cancelled or failed requests are discarded.
+    pub fn releaseRequest(self: *Module, handle: u64) !void {
+        const i = try self.request_slots.index(handle);
+        defer self.request_slots.release(handle) catch {};
+        try self.selectRequest(i);
+        endLeaseTally(self) catch |e| return self.refuseBoundary(e);
+        self.recordDecodeEnd();
+        if (!self.request_succeeded or self.gate.refused != null or self.gate.phase == .idle) self.dropState();
+        self.sampler.pending = null;
+        self.sampler.active = null;
+    }
+
+    fn selectRequest(self: *Module, i: usize) !void {
+        if (i == self.active_request) return;
+        self.fenceRequest() catch |e| return self.refuseBoundary(e);
+        self.parked_requests[self.active_request].swap(self);
+        self.parked_requests[i].swap(self);
+        self.active_request = i;
+    }
+
+    /// Materialize roots before another request can resize the shared expert banks.
+    fn fenceRequest(self: *Module) !void {
+        defer self.g.reset();
+        try self.fenceContext(if (self.state) |*st| st else null, if (self.dspark) |*d| d else null);
+        try self.synchronizeRequestRoots();
+    }
+
+    fn fenceContext(self: *Module, state: ?*M.State, dspark: ?*Dspark) !void {
+        if (dspark) |d| try d.lp.park();
+        if (state) |st| {
+            var roots: [128]G.T = undefined;
+            var n: usize = 0;
+            for (st.layers) |*layer| if (layer.frontier) |*frontier| {
+                if (n + 2 > roots.len) return error.TooManyLayers;
+                if (try frontier.kv.view(&self.g)) |x| {
+                    roots[n] = x;
+                    n += 1;
+                }
+                if (try frontier.score.view(&self.g)) |x| {
+                    roots[n] = x;
+                    n += 1;
+                }
+            };
+            try M.fence(&self.g, st, roots[0..n]);
+        }
+    }
+
+    /// Parked decode roots may still depend on shared expert arrays. Turn boundaries are already evaluated snapshots.
+    fn fenceParkedRequest(self: *Module, i: usize) !void {
+        if (i == self.active_request) return;
+        const p = &self.parked_requests[i];
+        if (p.state == null and p.dspark == null) return;
+        defer self.g.reset();
+        try self.fenceContext(if (p.state) |*st| st else null, if (p.dspark) |*d| d else null);
+        log.info("NATIVE shared-bank quiescence: parked context {d} roots fenced\n", .{i});
+    }
+
+    fn synchronizeRequestRoots(self: *Module) !void {
+        try mlx.check(mlx.mlx_synchronize(self.g.s));
+        switch (self.arm) {
+            inline else => |t| try t.arm.stream.settleRoutes(),
+        }
+    }
+
+    fn suspendPrefillPredictor(self: *Module, suspended: bool) bool {
+        return switch (self.arm) {
+            inline else => |t| blk: {
+                const prior = t.arm.hook.prefill_predictor_suspended;
+                t.arm.hook.prefill_predictor_suspended = suspended;
+                break :blk prior;
+            },
+        };
+    }
+
+    fn countBorrowedDecode(self: *Module, enabled: bool) bool {
+        return switch (self.arm) {
+            inline else => |t| blk: {
+                const prior = t.arm.stream.count_borrowed_decode;
+                t.arm.stream.count_borrowed_decode = enabled;
+                break :blk prior;
+            },
+        };
+    }
+
     /// A fresh request: the prompt from a new state (the model chunks it by its own rule);
     /// the last row's logits.
     ///
@@ -1236,6 +1442,45 @@ pub const Module = struct {
     /// `prefillContinue`.
     pub fn prefill(self: *Module, ids: []const u32, reserved_tokens: u64) !mlx.mlx_array {
         return self.prefillAt(0, ids, reserved_tokens);
+    }
+
+    /// Capture the visible committed response while retaining the prompt fallback for serialization.
+    pub fn completeRequest(self: *Module, ids: []const u32) !void {
+        try self.gate.request();
+        if (self.gate.phase == .idle) return error.CompletionWithoutPrompt;
+        self.request_completed = false;
+        if (!self.multiturn) {
+            self.request_completed = true;
+            return;
+        }
+        const prompt = (self.turn_boundary orelse return error.CompletionHistoryMismatch).ids;
+        const plan = try completionPlan(prompt, ids, self.position());
+        self.fenceRequest() catch |e| return self.refuseBoundary(e);
+        defer self.g.reset();
+        if (plan.trim > 0) {
+            if (self.dspark) |*d| try d.lp.trimForCompletion(plan.trim) else try self.model.trim(&self.g, &self.state.?, plan.trim);
+        }
+        self.dropCompletedBoundary();
+        if (plan.keep > prompt.len) self.completed_boundary = try self.buildTurnBoundary(ids[0..plan.keep]);
+        self.request_completed = true;
+    }
+
+    pub fn clearCheckpoint(self: *Module) void {
+        self.dropCompletedBoundary();
+        self.request_completed = false;
+    }
+
+    pub fn checkpointBoundary(self: *Module, completed: bool) ?*TurnBoundary {
+        return if (completed) (if (self.completed_boundary) |*b| b else null) else (if (self.turn_boundary) |*b| b else null);
+    }
+
+    /// A disk restore replaces this serial context after compatibility checks.
+    pub fn prepareCheckpointRestore(self: *Module) !void {
+        try self.gate.request();
+        self.fenceRequest() catch |e| return self.refuseBoundary(e);
+        self.dropState();
+        self.resume_at = 0;
+        self.request_completed = false;
     }
 
     /// Multi-turn (the host's prefix cache, `sdk.Arch.restore_prefix`): the host matched `prefix` against its cache and
@@ -1254,19 +1499,28 @@ pub const Module = struct {
     /// 0: a fresh request): `ids` are the positions after them. A continuation from any other position is refused by
     /// name (`PrefixNotRestored`), never run cold.
     pub fn prefillAt(self: *Module, start: u64, ids: []const u32, reserved_tokens: u64) !mlx.mlx_array {
+        self.request_completed = false;
+        if (self.prefill_interleave) return error.PrefillDuringInterleave;
         const kept = self.resume_at;
         self.resume_at = 0;
         if (start > 0 and start != kept) return error.PrefixNotRestored;
         // The request against the context the construction billed, once, before anything of it runs.
         try checkContext(start + ids.len, self.max_context, self.overrides.bill_pinned_prompt);
+        self.dropCompletedBoundary();
         // The previous request's decode end (served path), before this request touches anything.
         self.recordDecodeEnd();
         // The previous request's end (the served path runs it here, never at the request's end): its routes settled and,
         // if it left the prompt configuration, the reverse phase change, on this request's clock before anything of it
         // allocates. The coming request is known here: a fresh one drops the kept boundary and state inside the change
         // (before its settle, which then sees their frees); a continuation keeps them and brings its own call.
-        try self.requestEndFor(if (start > 0) .{ .continuation = .{ .rows = @min(ids.len, self.prefill_sub), .positions = start + ids.len } } else .fresh);
+        try self.gate.request();
+        const retained_decode = try preparePrompt(self, if (start > 0) .{ .continuation = .{ .rows = ids.len, .positions = start + ids.len } } else .fresh, sdk.memory.foreignBytes());
+        if (retained_decode) {
+            self.decode_host = .{};
+            log.info("NATIVE retained warm continuation: {d} tokens, decode-width calls, expert banks unchanged (bill {d} B, target {d} B)\n", .{ ids.len, self.bill.decodeTotal(), self.fill_target });
+        }
         try self.gate.begin(.prefill);
+        if (self.prefill_control) |control| try control.call(control.ctx, 0, ids.len, false);
         // #23: the prompt counts the phase change reads are this request's alone.
         switch (self.arm) {
             inline else => |t| t.arm.stream.resetPromptCounts(),
@@ -1277,7 +1531,7 @@ pub const Module = struct {
         const full: []const u32 = if (start > 0) try std.mem.concat(self.gpa, u32, &.{ self.turn_boundary.?.ids[0..start], ids }) else ids;
         defer if (start > 0) self.gpa.free(full);
         // A continuation restores the boundary and runs only `ids`; a fresh request drops it and runs cold.
-        const logits = if (start > 0) try self.continueTurn(full, start) else blk: {
+        const logits = if (start > 0) try self.continueTurn(full, start, retained_decode) else blk: {
             self.dropTurnBoundary();
             self.dropDspark();
             if (self.state) |*st| st.deinit(&self.g, self.gpa);
@@ -1288,8 +1542,13 @@ pub const Module = struct {
             // A prompt up to the sub-chunk: one call (the standard cell's path); a longer one: sub-chunk calls.
             break :blk if (ids.len <= self.prefill_sub) try self.promptCall(ids) else try self.prefillSubCalls(ids);
         };
+        self.dropCompletedBoundary();
         if (self.multiturn) try self.takeTurnBoundary(full);
         self.gate.completePrefill(self.dspark != null);
+        if (self.prefill_control) |control| control.call(control.ctx, ids.len, ids.len, false) catch |err| {
+            _ = mlx.mlx_array_free(logits);
+            return err;
+        };
         return logits;
     }
 
@@ -1297,7 +1556,7 @@ pub const Module = struct {
     /// trimmed to `keep` (at most one id: inside every ring's margin), the strategy rebuilt over its draft caches there
     /// (the split prompt's seed: the lookup over the kept ids, the windows appended per row), then the rest through the
     /// continuation path.
-    fn continueTurn(self: *Module, ids: []const u32, keep: u64) !mlx.mlx_array {
+    fn continueTurn(self: *Module, ids: []const u32, keep: u64, retained_decode: bool) !mlx.mlx_array {
         var b = self.turn_boundary.?;
         self.turn_boundary = null;
         defer b.deinit(&self.g, self.gpa);
@@ -1332,6 +1591,10 @@ pub const Module = struct {
             lp.lookup_has_primary = false;
         }
         const rest = ids[keep..];
+        if (retained_decode) {
+            var continuation: DecodeContinuation = .{ .module = self };
+            return extendDecode(&continuation, rest);
+        }
         // The continuation's spans at the whole conversation's chunk rule (`ids` is the whole prompt), as a cold prompt's
         // sub-chunk calls pin theirs: a short turn after a long conversation scores every position, so its own length's
         // rule (a 3,952-row span at the knee) would hold an index score of span x positions (33 GB at 1M).
@@ -1347,7 +1610,11 @@ pub const Module = struct {
         while (at < rest.len) {
             const end = @min(rest.len, at + kvc.prefillSubRowsAt(keep + at, 0, self.prefill_sub));
             if (logits) |x| _ = mlx.mlx_array_free(x);
-            if (at > 0) self.g.clearCache();
+            logits = null;
+            if (at > 0) {
+                self.g.clearCache();
+                try self.prefillBoundary(at, rest.len);
+            }
             logits = try self.continueCall(rest[at..end]);
             at = end;
         }
@@ -1358,7 +1625,11 @@ pub const Module = struct {
     /// main row kept, the ids.
     fn takeTurnBoundary(self: *Module, ids: []const u32) !void {
         self.dropTurnBoundary();
-        const st = &(self.state orelse return);
+        if (self.state != null) self.turn_boundary = try self.buildTurnBoundary(ids);
+    }
+
+    fn buildTurnBoundary(self: *Module, ids: []const u32) !TurnBoundary {
+        const st = &(self.state orelse return error.Dsv41NoRequest);
         var sb = try self.model.boundary(&self.g, self.gpa, st);
         errdefer sb.deinit(&self.g, self.gpa);
         const own = try self.gpa.dupe(u32, ids);
@@ -1369,7 +1640,7 @@ pub const Module = struct {
             for (tb.caches, d.caches) |*o, c| o.* = .{ .window = if (c.window) |w| self.g.keep(w) else null, .offset = c.offset };
             if (d.lp.main_h) |x| tb.main_h = self.g.keep(x);
         }
-        self.turn_boundary = tb;
+        return tb;
     }
 
     fn dropTurnBoundary(self: *Module) void {
@@ -1377,8 +1648,17 @@ pub const Module = struct {
         self.turn_boundary = null;
     }
 
+    fn dropCompletedBoundary(self: *Module) void {
+        if (self.completed_boundary) |*b| b.deinit(&self.g, self.gpa);
+        self.completed_boundary = null;
+    }
+
     fn dropState(self: *Module) void {
+        self.dropCompletedBoundary();
+        self.request_completed = false;
+        self.request_succeeded = false;
         self.dropTurnBoundary();
+        self.dropCompletedBoundary();
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, self.gpa);
         self.state = null;
@@ -1408,6 +1688,7 @@ pub const Module = struct {
         for (calls[1..]) |c| {
             _ = mlx.mlx_array_free(logits);
             self.g.clearCache();
+            try self.prefillBoundary(c[0], ids.len);
             logits = try self.continueCall(ids[c[0]..c[1]]);
         }
         return logits;
@@ -1458,6 +1739,27 @@ pub const Module = struct {
             log.err("embedding rows: the host rows differ from the resident table\n", .{});
             return error.EmbeddingRowsDiffer;
         }
+    }
+
+    /// Only suspended prompt state survives this boundary. Decoders keep the prompt banks and scratch;
+    /// the mixed-phase bill retains full context reservations and both phases' allocator allowances.
+    fn prefillBoundary(self: *Module, done: u64, total: u64) !void {
+        const control = self.prefill_control orelse return;
+        const terms = prefillBorrowTerms(self.bill.prefillTerms(), self.bill.decodeTerms());
+        const foreign = sdk.memory.foreignBytes();
+        const allowed = done > 0 and done < total and self.requestCapacity() > 1 and
+            self.prompt_ready and !self.grown() and
+            prefillBorrowFits(terms, self.bill.baseline, self.fill_target, foreign);
+        if (allowed) log.info("NATIVE prefill interleave: {d}/{d} new prompt tokens, borrowed decode bound {d} B, target {d} B\n", .{ done, total, terms.sum() + self.bill.baseline, self.fill_target -| foreign });
+        const before = if (allowed) self.streamStats() else null;
+        try callPrefillControl(self, control, done, total, allowed);
+        if (before) |prior| if (self.prompt_stats0) |*base| {
+            // Another request's routes used the shared stream while this prompt was parked.
+            const borrowed = self.streamStats().since(prior);
+            inline for (@typeInfo(expert_stream.Stats).@"struct".field_names) |name| {
+                @field(base, name) += @field(borrowed, name);
+            }
+        };
     }
 
     /// The prompt pass with the DSpark seed (`Loop.prefill`'s: the main taps of every prompt row seed
@@ -1597,8 +1899,22 @@ pub const Module = struct {
     /// never decodes at the prompt rows.
     pub fn extend(self: *Module, ids: []const u32) !mlx.mlx_array {
         try self.gate.begin(.decode_step);
-        return self.step(ids);
+        var continuation = DecodeContinuation{ .module = self };
+        return extendDecode(&continuation, ids);
     }
+
+    const DecodeContinuation = struct {
+        pub const Logits = mlx.mlx_array;
+        module: *Module,
+
+        fn step(self: *@This(), ids: []const u32) !Logits {
+            return self.module.step(ids);
+        }
+
+        fn release(_: *@This(), logits: Logits) void {
+            _ = mlx.mlx_array_free(logits);
+        }
+    };
 
     /// The prompt's continuation: a split prompt runs `prefill` over its first part, then this over each later part, all
     /// before the decode handover (refused by name after it: the prompt's rows are gone).
@@ -1641,11 +1957,7 @@ pub const Module = struct {
     fn requestEndFor(self: *Module, coming: Coming) !void {
         try self.gate.request();
         const t0 = std.Io.Timestamp.now(self.io, .boot);
-        _ = mlx.mlx_synchronize(self.g.s);
-        // A request cancelled or disconnected mid-forward (prompt or decode) leaves routes live: settled first, always.
-        switch (self.arm) {
-            inline else => |t| t.arm.stream.settleRoutes() catch |e| return self.refuseBoundary(e),
-        }
+        quiesceRequestRoots(self) catch |e| return self.refuseBoundary(e);
         // A request that ended in its prompt phase with nothing released needs nothing more.
         if (self.prompt_ready) return;
         self.recordDecodeEnd();
@@ -1693,7 +2005,10 @@ pub const Module = struct {
             const m = x.m;
             m.dropDspark();
             // Multi-turn: the state stays for a continuation (its boundary kept); a fresh request's is freed here.
-            if (x.coming == .fresh) m.dropTurnBoundary();
+            if (x.coming == .fresh) {
+                m.dropTurnBoundary();
+                m.dropCompletedBoundary();
+            }
             if (m.turn_boundary == null) {
                 if (m.state) |*st| st.deinit(&m.g, m.gpa);
                 m.state = null;
@@ -1730,7 +2045,7 @@ pub const Module = struct {
             // the coming continuation allocates its own call's wave (`turnCallWave`), not a cold prompt's.
             const terms = m.bill.prefillTerms();
             const bound = if (m.turn_boundary != null) switch (x.coming) {
-                .continuation => |c| reverseBoundKept(terms, scratch, if (m.turn_call) |tc| tc.wave(c.rows, c.positions) else terms.waves),
+                .continuation => |c| reverseBoundKept(terms, scratch, if (m.turn_call) |tc| tc.wave(@min(c.rows, m.prefill_sub), c.positions) else terms.waves),
                 .unknown => reverseBoundKept(terms, scratch, terms.waves),
                 .fresh => unreachable,
             } else reverseBound(terms, scratch);
@@ -1770,7 +2085,7 @@ pub const Module = struct {
         try self.gate.begin(.{ .handover = .{ .native_draft = h.native_draft } });
         // The prompt pass is complete (a split prompt's continuations included): its reads, once.
         self.reportPrompt();
-        try self.phaseChange();
+        if (!self.prefill_interleave) try self.phaseChange();
         self.gate.completeHandover();
     }
 
@@ -1788,8 +2103,10 @@ pub const Module = struct {
     /// A refusal is a typed error (upstream's slotFailure reports it; the server stays up) and the Module
     /// refuses every later request by name: no retry grows over what the refused check saw.
     fn phaseChange(self: *Module) !void {
+        if (self.prefill_interleave) return error.PhaseChangeDuringInterleave;
         try self.gate.request();
         if (self.grown()) return;
+        quiesceRequestRoots(self) catch |e| return self.refuseBoundary(e);
         self.prompt_ready = false;
         var marks: [5]?VmMark = @splat(null);
         const v = self.overrides.verify;
@@ -1900,6 +2217,86 @@ pub const Module = struct {
         }
     }
 };
+
+/// Shared bank sizes change only after every context's retained computations and their stream have completed.
+fn quiesceRequestRoots(m: anytype) !void {
+    try m.fenceRequest();
+    for (0..m.requestCapacity()) |i| try m.fenceParkedRequest(i);
+    try m.synchronizeRequestRoots();
+}
+
+/// At a prompt fence, wide execution waves are gone. A borrowed decoder uses the smaller prompt banks,
+/// while the suspended prompt's retained state and all parked contexts remain reserved.
+pub fn prefillBorrowTerms(prompt: bill_mod.PhaseTerms, decode: bill_mod.PhaseTerms) bill_mod.PhaseTerms {
+    var out = prompt;
+    inline for (@typeInfo(bill_mod.PhaseTerms).@"struct".field_names) |name| {
+        if (comptime !std.mem.eql(u8, name, "slot_banks") and !std.mem.eql(u8, name, "waves") and
+            !std.mem.eql(u8, name, "prompt_state") and !std.mem.eql(u8, name, "wire_tables"))
+            @field(out, name) = @max(@field(prompt, name), @field(decode, name));
+    }
+    out.waves = decode.waves;
+    out.prompt_state = prompt.prompt_state + decode.prompt_state;
+    out.wire_tables = bill_mod.wireTables(bill_mod.wiredOf(out));
+    return out;
+}
+
+fn prefillBorrowFits(terms: bill_mod.PhaseTerms, baseline: u64, target: u64, foreign: u64) bool {
+    const budget = target -| foreign;
+    return baseline <= budget and terms.sum() <= budget - baseline;
+}
+
+/// Counts belong to the shared stream, so a lease end folds the interval since the previous flush.
+/// Settle readers before refreshing policy protection; the banks and their phase remain unchanged.
+fn endLeaseTally(m: anytype) !void {
+    if (m.tally_rates.len == 0) return;
+    try m.fenceRequest();
+    m.endTally();
+}
+
+fn callPrefillControl(m: anytype, control: sdk.PrefillControl, done: u64, total: u64, allowed: bool) !void {
+    if (!allowed) return control.call(control.ctx, done, total, false);
+    try m.fenceRequest();
+    // The fence lands all prompt read-ahead before decoder work starts. Keep it suppressed through
+    // the owner's restoration fence, including callback errors; never mutate the configured route or phase.
+    const prior_predictor = m.suspendPrefillPredictor(true);
+    defer _ = m.suspendPrefillPredictor(prior_predictor);
+    const prior_tally = m.countBorrowedDecode(true);
+    defer _ = m.countBorrowedDecode(prior_tally);
+    const owner = m.active_request;
+    m.prefill_interleave = true;
+    const result = control.call(control.ctx, done, total, true);
+    // Restore even when cancellation or the host's decode step failed. A restoration failure latches
+    // the module through selectRequest's fence refusal; do not resume a different request's prompt.
+    const restored = m.selectRequest(owner);
+    m.prefill_interleave = false;
+    try restored;
+    try result;
+}
+
+/// A bounded number of decode-width calls reuses the existing decode peak, including parked contexts.
+/// Larger suffixes keep the wide-prefill path; the cap limits serial work, not the memory proof.
+const warm_continuation_tokens = 8 * mdl.Model(G).scratch_rows;
+
+fn preparePrompt(m: anytype, coming: Coming, foreign: u64) !bool {
+    const keep_decode = switch (coming) {
+        .continuation => |c| c.rows > 0 and c.rows <= warm_continuation_tokens and m.grown() and !m.prompt_ready and
+            m.bill.decodeTotal() <= m.fill_target -| foreign,
+        else => false,
+    };
+    if (keep_decode) {
+        try m.fenceRequest();
+        m.endTally();
+        return true;
+    }
+    try m.requestEndFor(coming);
+    return false;
+}
+
+/// A surviving decode request may resume after a different prompt left the shared cache in prompt mode.
+fn ensureRequestDecode(m: anytype) !void {
+    try m.gate.request();
+    if (m.gate.phase == .decode) try m.phaseChange();
+}
 
 /// The `layer_major_prefill` setting, checked before anything is built. K16 batches each layer's
 /// routed call across chunks (the wide lane): the stock tier's prompt forwards are decode-width.
@@ -2190,7 +2587,6 @@ pub const PhaseGate = struct {
         g.phase = .decode;
     }
 };
-
 
 /// The live boundary reader: MLX's counters and the footprint; waits on the shell's io; a buffer that reached MLX's
 /// cache after the boundary's clear (a late release: a command buffer's temporaries dropped at its completion) is
@@ -3630,4 +4026,561 @@ test "dsv41 module: the arm's options from the shell's rows: native both, forced
     try std.testing.expectEqual(@as(u8, 5), plan.wide_depth);
     try std.testing.expectEqual(@as(u8, 1), armOptions(&.{ .expert_bank_dir = "/b", .numeric_tier = .stock }, ceiling, .host).wide_depth);
     try std.testing.expectEqual(lookahead.budget, plan.lookahead.?.budget);
+}
+
+/// Decode continuations include a forced reasoning close, which can be wider than a
+/// DSpark verify block. The source has already left its prompt phase.
+fn extendDecode(ctx: anytype, ids: []const u32) !@TypeOf(ctx.*).Logits {
+    const width = mdl.Model(G).scratch_rows;
+    if (ids.len <= width) return ctx.step(ids);
+    var logits = try ctx.step(ids[0..width]);
+    errdefer ctx.release(logits);
+    var offset: usize = width;
+    while (offset < ids.len) {
+        const end = @min(offset + width, ids.len);
+        const next = try ctx.step(ids[offset..end]);
+        ctx.release(logits);
+        logits = next;
+        offset = end;
+    }
+    return logits;
+}
+
+const DecodeContinuationFixture = struct {
+    pub const Logits = u32;
+    seen: std.ArrayList(u32) = .empty,
+    live: ?u32 = null,
+    next: u32 = 0,
+    released: u32 = 0,
+    fail_at: ?u32 = null,
+
+    fn step(self: *@This(), ids: []const u32) !Logits {
+        if (ids.len > mdl.Model(G).scratch_rows) return error.NotPrefill;
+        if (self.fail_at == self.next) return error.ForwardFailed;
+        try self.seen.appendSlice(std.testing.allocator, ids);
+        const result = self.next;
+        self.next += 1;
+        // The previous result is still owned until this forward succeeds.
+        self.live = result;
+        return result;
+    }
+
+    fn release(self: *@This(), logits: Logits) void {
+        if (self.live == logits) self.live = null;
+        self.released += 1;
+    }
+};
+
+test "dsv41 decode continuation: forced reasoning close stays in decode width and commits every token" {
+    var f: DecodeContinuationFixture = .{};
+    defer f.seen.deinit(std.testing.allocator);
+    var ids: [25]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast(100 + i);
+    const last = try extendDecode(&f, &ids);
+    defer f.release(last);
+    try std.testing.expectEqualSlices(u32, &ids, f.seen.items);
+    try std.testing.expectEqual(@as(u32, 3), last);
+    try std.testing.expectEqual(@as(?u32, last), f.live);
+    try std.testing.expectEqual(@as(u32, 3), f.released);
+}
+
+test "dsv41 decode continuation: a failed later forward frees the previous logits and does not commit the tail" {
+    var f: DecodeContinuationFixture = .{ .fail_at = 1 };
+    defer f.seen.deinit(std.testing.allocator);
+    const ids: [25]u32 = @splat(1);
+    try std.testing.expectError(error.ForwardFailed, extendDecode(&f, &ids));
+    try std.testing.expectEqual(@as(usize, mdl.Model(G).scratch_rows), f.seen.items.len);
+    try std.testing.expectEqual(@as(?u32, null), f.live);
+    try std.testing.expectEqual(@as(u32, 1), f.released);
+}
+
+test "dsv41 module: non-NAX prefill uses the eager attention and index bill" {
+    const requested: RouteOverrides = .{ .prefill_attn = true, .prefill_index = true, .prefill_oproj = true, .prefill_hc = true };
+    try std.testing.expectEqualDeep(requested, compatibleRoutes(requested, true));
+    const fallback = compatibleRoutes(requested, false);
+    try std.testing.expectEqual(@as(?bool, false), fallback.prefill_attn);
+    try std.testing.expectEqual(@as(?bool, false), fallback.prefill_index);
+    try std.testing.expectEqual(@as(?bool, false), fallback.prefill_oproj);
+    try std.testing.expectEqual(requested.prefill_hc, fallback.prefill_hc);
+    try std.testing.expect(!try prefillIndexRoute(&.{}, fallback));
+    const defaults = compatibleRoutes(.{}, false);
+    try std.testing.expect(!try prefillIndexRoute(&.{}, defaults));
+}
+
+test "dsv41 module: HC post capability dominates explicit settings and keeps the compiled region" {
+    const t = std.testing;
+    const requested: RouteOverrides = .{ .prefill_hcpost = true, .prefill_hc_post = true };
+    const supported = compatibleRoutes(requested, true);
+    const fallback = compatibleRoutes(requested, false);
+    try t.expect(prefillHcpostRoute(&.{}, supported));
+    try t.expect(!prefillHcpostRoute(&.{}, fallback));
+    try t.expect(!prefillHcpostRoute(&.{ .kv16_hcpost = true }, fallback));
+    try t.expect(!prefillHcpostRoute(&.{ .kv16_hcpost = false }, supported));
+    // The established model-setting precedence remains unchanged on supported hardware.
+    try t.expect(prefillHcpostRoute(&.{ .kv16_hcpost = true }, compatibleRoutes(.{ .prefill_hcpost = false }, true)));
+    try t.expectEqual(@as(?bool, true), fallback.prefill_hc_post);
+    try t.expect(!bill_mod.derivedGroupRoute(&.{ .kv16_hcpost = true }, fallback));
+    try t.expect(bill_mod.derivedGroupRoute(&.{ .kv16_hcpost = true }, supported));
+}
+
+test "dsv41 active slots: parked requests retain their phase and sampler without clearing a shared refusal" {
+    const testing = std.testing;
+    var m: Module = undefined;
+    m.state = null;
+    m.dspark = null;
+    m.turn_boundary = null;
+    m.completed_boundary = null;
+    m.request_completed = false;
+    m.request_succeeded = false;
+    m.resume_at = 17;
+    m.decode_host = .{};
+    m.prompt_stats0 = null;
+    m.prompt_tokens = 17;
+    m.gate = .{ .phase = .decode, .seeded = true };
+    m.sampler.pending = null;
+    m.sampler.active = .{ .temperature = 0.7, .seed = 123 };
+    var a: RequestState = .{};
+    var b: RequestState = .{};
+    a.swap(&m);
+    try testing.expectEqual(PhaseGate.Phase.idle, m.gate.phase);
+    m.resume_at = 29;
+    m.prompt_tokens = 29;
+    m.gate.phase = .prompt;
+    m.sampler.active = .{ .temperature = 1.0, .seed = 456 };
+    b.swap(&m);
+    a.swap(&m);
+    try testing.expectEqual(@as(u64, 17), m.resume_at);
+    try testing.expectEqual(@as(u64, 123), m.sampler.active.?.seed);
+    try m.gate.begin(.decode_step);
+    m.gate.refuse(error.SharedCacheFailure);
+    a.swap(&m);
+    b.swap(&m);
+    try testing.expectEqual(@as(u64, 29), m.resume_at);
+    try testing.expectEqual(@as(u64, 456), m.sampler.active.?.seed);
+    try std.testing.expectError(error.PhaseChangeRefused, m.gate.begin(.prefill_continue));
+}
+
+test "dsv41 active slots: moving a draft request rebinds its target state and isolates a failed second prompt" {
+    const testing = std.testing;
+    var m: Module = undefined;
+    m.state = .{ .offset = 100, .layers = &.{} };
+    m.dspark = .{ .lp = .{ .g = &m.g, .model = undefined, .head = undefined, .st = &m.state.?, .caches = &.{}, .cfg = .{ .max_tokens = 6 }, .k_cap = 0, .max_rows = 1 }, .caches = &.{} };
+    m.turn_boundary = null;
+    m.completed_boundary = null;
+    m.request_completed = false;
+    m.request_succeeded = false;
+    m.resume_at = 0;
+    m.decode_host = .{};
+    m.prompt_stats0 = null;
+    m.prompt_tokens = 100;
+    m.gate = .{ .phase = .decode, .seeded = true };
+    m.sampler.pending = null;
+    m.sampler.active = null;
+    var a: RequestState = .{};
+    var b: RequestState = .{};
+    a.swap(&m);
+    try testing.expect(a.dspark.?.lp.st == &a.state.?);
+    // A second request allocates a partial state, then fails before completing its prompt.
+    try m.gate.begin(.prefill);
+    m.state = .{ .offset = 7, .layers = &.{} };
+    b.swap(&m);
+    a.swap(&m);
+    try testing.expect(m.dspark.?.lp.st == &m.state.?);
+    try testing.expectEqual(@as(u32, 100), m.dspark.?.lp.st.offset);
+    try m.gate.begin(.decode_step);
+    m.dspark.?.lp.st.offset += 1;
+    a.swap(&m);
+    b.swap(&m);
+    try testing.expectEqual(@as(u32, 7), m.state.?.offset);
+    try testing.expectEqual(PhaseGate.Phase.idle, m.gate.phase);
+    try testing.expectEqual(@as(u32, 101), a.state.?.offset);
+}
+
+test "dsv41 active slots: a surviving decode regrows shared banks after another prompt fails and propagates restore failures" {
+    const testing = std.testing;
+    const Physical = struct {
+        gate: PhaseGate = .{ .phase = .decode, .seeded = true },
+        prompt_ready: bool = false,
+        grown: bool = true,
+        restores: usize = 0,
+        fail: bool = false,
+        fn phaseChange(m: *@This()) !void {
+            if (m.grown) return;
+            if (m.fail) return error.SettleRefused;
+            m.restores += 1;
+            m.prompt_ready = false;
+            m.grown = true;
+        }
+    };
+    var m: Physical = .{};
+    try ensureRequestDecode(&m);
+    try testing.expectEqual(@as(usize, 0), m.restores);
+    // B's prompt shrinks the shared banks, then fails. A still owns a valid decode state.
+    m.prompt_ready = true;
+    m.grown = false;
+    m.fail = true;
+    try testing.expectError(error.SettleRefused, ensureRequestDecode(&m));
+    try testing.expectEqual(PhaseGate.Phase.decode, m.gate.phase);
+    try testing.expect(m.prompt_ready);
+    m.fail = false;
+    try ensureRequestDecode(&m);
+    try testing.expectEqual(@as(usize, 1), m.restores);
+    try testing.expect(!m.prompt_ready);
+    try ensureRequestDecode(&m);
+    try testing.expectEqual(@as(usize, 1), m.restores);
+    // A failed handover may clear prompt_ready before it actually grows the banks.
+    m.grown = false;
+    m.prompt_ready = false;
+    try ensureRequestDecode(&m);
+    try testing.expectEqual(@as(usize, 2), m.restores);
+    m.gate.refuse(error.SharedCacheFailure);
+    m.prompt_ready = true;
+    m.grown = false;
+    try testing.expectError(error.PhaseChangeRefused, ensureRequestDecode(&m));
+    try testing.expectEqual(@as(usize, 2), m.restores);
+}
+
+const CompletionPlan = struct { keep: usize, trim: u32 };
+
+fn completionPlan(prompt: []const u32, visible: []const u32, position: u64) !CompletionPlan {
+    if (visible.len < prompt.len or position < prompt.len or !std.mem.eql(u32, prompt, visible[0..prompt.len])) return error.CompletionHistoryMismatch;
+    const keep: usize = @intCast(@min(position, visible.len));
+    const trim = std.math.cast(u32, position - keep) orelse return error.CompletionHistoryMismatch;
+    return .{ .keep = keep, .trim = trim };
+}
+
+test "dsv41 completed cache: completion excludes unpublished and uncommitted tails and rejects another prompt" {
+    const testing = std.testing;
+    const prompt = [_]u32{ 1, 2, 3 };
+    const visible = [_]u32{ 1, 2, 3, 4, 5 };
+    try testing.expectEqual(CompletionPlan{ .keep = 4, .trim = 0 }, try completionPlan(&prompt, &visible, 4));
+    try testing.expectEqual(CompletionPlan{ .keep = 5, .trim = 1 }, try completionPlan(&prompt, &visible, 6));
+    try testing.expectError(error.CompletionHistoryMismatch, completionPlan(&prompt, &.{ 1, 9, 3, 4 }, 4));
+    try testing.expectError(error.CompletionHistoryMismatch, completionPlan(&prompt, &.{ 1, 2 }, 4));
+    try testing.expectError(error.CompletionHistoryMismatch, completionPlan(&prompt, &visible, 2));
+}
+
+test "dsv41 active slots: successful leases retain prompt state and cancellation discards it" {
+    const testing = std.testing;
+    for ([_]struct { completed: bool, refused: bool, retain: bool, phase: PhaseGate.Phase = .decode }{
+        .{ .completed = true, .refused = false, .retain = true },
+        .{ .completed = true, .refused = false, .retain = true, .phase = .prompt },
+        .{ .completed = false, .refused = false, .retain = false },
+        .{ .completed = true, .refused = true, .retain = false },
+    }) |case| {
+        var m: Module = undefined;
+        m.gpa = testing.allocator;
+        m.state = .{ .offset = 4, .layers = &.{} };
+        m.dspark = null;
+        m.turn_boundary = .{ .ids = try testing.allocator.dupe(u32, &.{ 1, 2 }), .state = .{ .offset = 2, .layers = &.{}, .hash_len = 0 } };
+        m.completed_boundary = null;
+        defer m.dropState();
+        m.request_completed = false;
+        m.request_succeeded = case.completed;
+        m.gate = .{ .phase = case.phase, .refused = if (case.refused) error.SharedCacheFailure else null };
+        m.decode_host = .{};
+        m.tally_rates = &.{};
+        m.request_slots = .{ .capacity = 2 };
+        m.active_request = 0;
+        m.parked_requests = @splat(.{});
+        m.parked_requests[1].resume_at = 99;
+        m.sampler.pending = null;
+        m.sampler.active = null;
+        const handle = try m.request_slots.acquire(&.{ 0, 0 });
+        const other = try m.request_slots.acquire(&.{ 0, 0 });
+        try m.releaseRequest(handle);
+        try testing.expectEqual(case.retain, m.state != null);
+        try testing.expectEqual(case.retain, m.turn_boundary != null);
+        try testing.expect(m.completed_boundary == null);
+        try testing.expectError(error.InvalidRequestSlot, m.request_slots.index(handle));
+        try testing.expectEqual(@as(usize, 1), try m.request_slots.index(other));
+        try testing.expectEqual(@as(u64, 99), m.parked_requests[1].resume_at);
+    }
+}
+
+test "dsv41 expert tally: lease end fences before folding and skips disabled or failed settles" {
+    const t = std.testing;
+    const Fake = struct {
+        tally_rates: []f32 = &.{},
+        order: [2]u8 = undefined,
+        n: usize = 0,
+        fail: bool = false,
+        fn fenceRequest(f: *@This()) !void {
+            f.order[f.n] = 1;
+            f.n += 1;
+            if (f.fail) return error.SettleFailed;
+        }
+        fn endTally(f: *@This()) void {
+            f.order[f.n] = 2;
+            f.n += 1;
+        }
+    };
+    var rates = [_]f32{0};
+    var f: Fake = .{ .tally_rates = &rates };
+    try endLeaseTally(&f);
+    try t.expectEqualSlices(u8, &.{ 1, 2 }, f.order[0..f.n]);
+    f = .{ .tally_rates = &rates, .fail = true };
+    try t.expectError(error.SettleFailed, endLeaseTally(&f));
+    try t.expectEqualSlices(u8, &.{1}, f.order[0..f.n]);
+    f = .{};
+    try endLeaseTally(&f);
+    try t.expectEqual(@as(usize, 0), f.n);
+}
+
+test "dsv41 warm continuation: decode bill includes parked contexts and warm preparation fences without shrinking" {
+    const testing = std.testing;
+    const Fixture = struct {
+        bill: struct {
+            bytes: u64 = 180,
+            fn decodeTotal(b: @This()) u64 {
+                return b.bytes;
+            }
+        } = .{},
+        fill_target: u64 = 200,
+        prompt_ready: bool = false,
+        is_grown: bool = true,
+        fences: u32 = 0,
+        reverses: u32 = 0,
+        fail_fence: bool = false,
+        fn grown(f: *@This()) bool {
+            return f.is_grown;
+        }
+        fn fenceRequest(f: *@This()) !void {
+            if (f.fail_fence) return error.FenceFailed;
+            f.fences += 1;
+        }
+        fn endTally(_: *@This()) void {}
+        fn requestEndFor(f: *@This(), _: Coming) !void {
+            f.reverses += 1;
+            f.is_grown = false;
+            f.prompt_ready = true;
+        }
+    };
+    const short: Coming = .{ .continuation = .{ .rows = 8, .positions = 131072 } };
+    var f: Fixture = .{};
+    try testing.expect(try preparePrompt(&f, short, 20));
+    try testing.expectEqual(@as(u32, 1), f.fences);
+    try testing.expectEqual(@as(u32, 0), f.reverses);
+    try testing.expect(f.is_grown);
+    for ([_]u64{ 24, warm_continuation_tokens }) |rows| {
+        try testing.expect(try preparePrompt(&f, .{ .continuation = .{ .rows = rows, .positions = 131072 } }, 20));
+    }
+    // Other live contexts remain charged in decodeTotal; foreign bytes consume the same target.
+    f.bill.bytes = 181;
+    try testing.expect(!try preparePrompt(&f, short, 20));
+    try testing.expectEqual(@as(u32, 1), f.reverses);
+    f = .{};
+    f.fail_fence = true;
+    try testing.expectError(error.FenceFailed, preparePrompt(&f, short, 0));
+    try testing.expectEqual(@as(u32, 0), f.reverses);
+    for ([_]Coming{ .fresh, .unknown, .{ .continuation = .{ .rows = warm_continuation_tokens + 1, .positions = 100 } } }) |coming| {
+        f = .{};
+        try testing.expect(!try preparePrompt(&f, coming, 0));
+        try testing.expectEqual(@as(u32, 1), f.reverses);
+    }
+    f = .{ .prompt_ready = true };
+    try testing.expect(!try preparePrompt(&f, short, 0));
+    f = .{ .is_grown = false };
+    try testing.expect(!try preparePrompt(&f, short, 0));
+}
+
+test "dsv41 warm continuation: a 24-token suffix preserves the prompt handover and never issues a wide forward" {
+    var gate: PhaseGate = .{};
+    try gate.begin(.prefill);
+    var f: DecodeContinuationFixture = .{};
+    defer f.seen.deinit(std.testing.allocator);
+    var ids: [24]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast(i + 100);
+    const logits = try extendDecode(&f, &ids);
+    defer f.release(logits);
+    try std.testing.expectEqualSlices(u32, &ids, f.seen.items);
+    try std.testing.expectEqual(@as(u32, 3), f.next);
+    try std.testing.expectEqual(@as(u32, 2), f.released);
+    gate.completePrefill(true);
+    try gate.begin(.{ .handover = .{ .native_draft = true } });
+    gate.completeHandover();
+    try gate.begin(.decode_step);
+}
+
+test "dsv41 prefill interleave: mixed phase retains prompt banks and full parked reservations" {
+    const t = std.testing;
+    const prompt: bill_mod.PhaseTerms = .{ .slot_banks = 100, .waves = 80, .kv = 30, .mlx_cache = 7, .mlx_cache_overshoot = 4, .parked_context = 50, .parked_context_host = 12, .prompt_state = 6, .prompt_buffer_allowance = 9, .wire_tables = 999 };
+    const decode: bill_mod.PhaseTerms = .{ .slot_banks = 200, .waves = 10, .kv = 35, .mlx_cache = 2, .mlx_cache_overshoot = 5, .parked_context = 51, .parked_context_host = 13, .prompt_state = 8, .decode_buffer_allowance = 11 };
+    const borrowed = prefillBorrowTerms(prompt, decode);
+    try t.expectEqual(@as(u64, 100), borrowed.slot_banks);
+    try t.expectEqual(@as(u64, 10), borrowed.waves);
+    try t.expectEqual(@as(u64, 35), borrowed.kv);
+    try t.expectEqual(@as(u64, 7), borrowed.mlx_cache);
+    try t.expectEqual(@as(u64, 5), borrowed.mlx_cache_overshoot);
+    try t.expectEqual(@as(u64, 51), borrowed.parked_context);
+    try t.expectEqual(@as(u64, 13), borrowed.parked_context_host);
+    try t.expectEqual(@as(u64, 14), borrowed.prompt_state);
+    try t.expectEqual(@as(u64, 9), borrowed.prompt_buffer_allowance);
+    try t.expectEqual(@as(u64, 11), borrowed.decode_buffer_allowance);
+    try t.expectEqual(bill_mod.wireTables(bill_mod.wiredOf(borrowed)), borrowed.wire_tables);
+    const target = borrowed.sum() + 20;
+    try t.expect(prefillBorrowFits(borrowed, 20, target, 0));
+    try t.expect(!prefillBorrowFits(borrowed, 20, target, 1));
+    try t.expect(!prefillBorrowFits(borrowed, 20, target, target));
+    try t.expect(!prefillBorrowFits(borrowed, 20, 19, 0));
+}
+
+test "dsv41 shared banks: every retained context is fenced before resize and a parked failure prevents it" {
+    const t = std.testing;
+    const Fake = struct {
+        roots: [2]bool = @splat(false),
+        synchronized: bool = false,
+        fail_parked: bool = false,
+        fail_sync: bool = false,
+        resized: bool = false,
+        fn requestCapacity(_: *const @This()) u32 {
+            return 2;
+        }
+        fn fenceRequest(f: *@This()) !void {
+            f.roots[0] = true;
+        }
+        fn fenceParkedRequest(f: *@This(), i: usize) !void {
+            if (i == 0) return;
+            if (f.fail_parked) return error.ParkedRootFailed;
+            f.roots[i] = true;
+        }
+        fn synchronizeRequestRoots(f: *@This()) !void {
+            try t.expect(f.roots[0] and f.roots[1]);
+            if (f.fail_sync) return error.DeviceCompletionFailed;
+            f.synchronized = true;
+        }
+        fn resize(f: *@This()) !void {
+            try quiesceRequestRoots(f);
+            f.resized = true;
+        }
+    };
+    var ok: Fake = .{};
+    try ok.resize();
+    try t.expect(ok.synchronized and ok.resized);
+    var bad: Fake = .{ .fail_parked = true };
+    try t.expectError(error.ParkedRootFailed, bad.resize());
+    try t.expect(!bad.synchronized and !bad.resized);
+    var failed_completion: Fake = .{ .fail_sync = true };
+    try t.expectError(error.DeviceCompletionFailed, failed_completion.resize());
+    try t.expect(!failed_completion.resized);
+}
+
+test "dsv41 prefill interleave: callback restores owner on success and failure without resize" {
+    const t = std.testing;
+    const Fake = struct {
+        active_request: usize = 0,
+        prefill_interleave: bool = false,
+        predictor_suspended: bool = false,
+        count_borrowed_decode: bool = false,
+        fences: u32 = 0,
+        calls: u32 = 0,
+        fail_callback: bool = false,
+        fail_restore: bool = false,
+        fail_fence: bool = false,
+        fn fenceRequest(f: *@This()) !void {
+            try t.expect(!f.predictor_suspended);
+            try t.expect(!f.count_borrowed_decode);
+            if (f.fail_fence) return error.FenceFailed;
+            f.fences += 1;
+        }
+        fn suspendPrefillPredictor(f: *@This(), suspended: bool) bool {
+            const prior = f.predictor_suspended;
+            f.predictor_suspended = suspended;
+            return prior;
+        }
+        fn countBorrowedDecode(f: *@This(), enabled: bool) bool {
+            const prior = f.count_borrowed_decode;
+            f.count_borrowed_decode = enabled;
+            return prior;
+        }
+        fn selectRequest(f: *@This(), owner: usize) !void {
+            try t.expect(f.predictor_suspended);
+            try t.expect(f.count_borrowed_decode);
+            if (f.fail_restore) return error.RestoreFailed;
+            f.active_request = owner;
+        }
+        fn callback(ctx: *anyopaque, done: u64, total: u64, allow: bool) !void {
+            const f: *@This() = @ptrCast(@alignCast(ctx));
+            try t.expectEqual(@as(u64, 4), done);
+            try t.expectEqual(@as(u64, 9), total);
+            try t.expectEqual(allow, f.prefill_interleave);
+            try t.expectEqual(allow, f.predictor_suspended);
+            try t.expectEqual(allow, f.count_borrowed_decode);
+            f.calls += 1;
+            if (allow) f.active_request = 1;
+            if (f.fail_callback) return error.RequestCancelled;
+        }
+        fn control(f: *@This()) sdk.PrefillControl {
+            return .{ .ctx = f, .call = callback };
+        }
+    };
+    var f: Fake = .{};
+    try callPrefillControl(&f, f.control(), 4, 9, true);
+    try t.expectEqual(@as(usize, 0), f.active_request);
+    try t.expect(!f.prefill_interleave);
+    try t.expect(!f.predictor_suspended);
+    try t.expect(!f.count_borrowed_decode);
+    f.fail_callback = true;
+    try t.expectError(error.RequestCancelled, callPrefillControl(&f, f.control(), 4, 9, true));
+    try t.expectEqual(@as(usize, 0), f.active_request);
+    try t.expect(!f.prefill_interleave);
+    try t.expect(!f.predictor_suspended);
+    try t.expect(!f.count_borrowed_decode);
+    f.fail_callback = false;
+    f.fail_restore = true;
+    try t.expectError(error.RestoreFailed, callPrefillControl(&f, f.control(), 4, 9, true));
+    try t.expect(!f.prefill_interleave);
+    try t.expect(!f.predictor_suspended);
+    try t.expect(!f.count_borrowed_decode);
+    f = .{ .fail_fence = true };
+    try t.expectError(error.FenceFailed, callPrefillControl(&f, f.control(), 4, 9, true));
+    try t.expectEqual(@as(u32, 0), f.calls);
+    try callPrefillControl(&f, f.control(), 4, 9, false);
+    try t.expectEqual(@as(u32, 1), f.calls);
+    try t.expectEqual(@as(u32, 0), f.fences);
+    try t.expect(!f.predictor_suspended);
+    try t.expect(!f.count_borrowed_decode);
+}
+
+test "dsv41 prefill interleave: nested admission refuses and activation does not grow banks" {
+    var m: Module = undefined;
+    m.prefill_interleave = true;
+    try std.testing.expectError(error.PrefillDuringInterleave, m.acquireRequest(&.{}));
+    try std.testing.expectError(error.PrefillDuringInterleave, m.prefillAt(0, &.{1}, 0));
+    try std.testing.expectError(error.PhaseChangeDuringInterleave, m.phaseChange());
+    m.gate = .{ .phase = .decode, .seeded = true };
+    m.active_request = 0;
+    m.request_slots = .{ .capacity = 2 };
+    const lease = try m.request_slots.acquire(&.{ 0, 0 });
+    // Everything related to shared-bank growth remains undefined: activating this lease must not touch it.
+    try m.activateRequest(lease);
+    try std.testing.expectEqual(PhaseGate.Phase.decode, m.gate.phase);
+    m.gate.refuse(error.BoundaryFailure);
+    try std.testing.expectError(error.PhaseChangeRefused, m.activateRequest(lease));
+}
+
+test "dsv41 leased checkpoint: export cleanup preserves the healthy lease and original prompt" {
+    const a = std.testing.allocator;
+    var ids = [_]u32{ 1, 2 };
+    var m: Module = undefined;
+    m.gpa = a;
+    m.turn_boundary = .{ .ids = &ids, .state = undefined };
+    m.completed_boundary = .{ .ids = try a.dupe(u32, &.{ 1, 2, 3 }), .state = .{ .offset = 3, .layers = &.{}, .hash_len = 0 } };
+    m.state = .{ .offset = 3, .layers = &.{} };
+    m.gate = .{ .phase = .decode };
+    m.multiturn = true;
+    m.prefill_interleave = true;
+    m.active_request = 0;
+    m.request_slots = .{};
+    m.request_completed = true;
+    m.request_succeeded = false;
+    const handle = try m.request_slots.acquire(&.{ 0, 0 });
+    try std.testing.expectError(error.CompletionHistoryMismatch, m.markRequestComplete(handle, &.{ 1, 9, 3 }));
+    try std.testing.expect(!m.request_succeeded);
+    try m.markRequestComplete(handle, &.{ 1, 2, 3 });
+    m.clearCheckpoint();
+    try std.testing.expect(!m.request_completed);
+    try std.testing.expect(m.request_succeeded);
+    try std.testing.expect(m.completed_boundary == null);
+    try std.testing.expectEqualSlices(u32, &ids, m.turn_boundary.?.ids);
 }

@@ -110,6 +110,44 @@ test "dsv41 bank contract: a MiMo-shaped MXFP4 bank (6 components, gate/up 4) st
     }
 }
 
+test "dsv41 bank contract: borrowed decode tally counts through real prompt-phase routing" {
+    var layers = [_]MxBank.Layer{MxBank.layerOf(256, 128)};
+    const rec = layers[0].logical_bytes;
+    const image = try testing.allocator.alloc(u8, rec * 8);
+    defer testing.allocator.free(image);
+    for (image, 0..) |*b, i| b.* = @truncate(i *% 7919);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "experts.bin", .data = image });
+    var root: [512]u8 = undefined;
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/experts.bin", .{root[0..try tmp.dir.realPath(testing.io, &root)]}, 0);
+    defer testing.allocator.free(path);
+    const fd = try sdk_ext.expert.openUncached(path.ptr, null);
+    defer fd.close();
+    const bank: MxBank.Bank = .{ .layers = &layers, .n_experts = 8, .sidecar = fd, .record_bytes = rec };
+    const s = try MxStream.init(testing.allocator, &bank, .{ .rows = &.{4}, .max_route_ids = 8, .transient_rows = 8, .pool = .{ .workers = 1, .staging_bytes = 65536, .tickets = 256 }, .tally = .{ .ratio = 0.25, .window = 32 } });
+    defer s.deinit();
+    const ids = [_]u16{ 1, 1, 3, 3 };
+    for ([_]bool{ false, true, false, true }, [_]u32{ 0, 1, 1, 2 }) |borrowed, count| {
+        s.count_borrowed_decode = borrowed;
+        const r = try s.serve(0, &ids);
+        try s.expectServed(r, &ids, image);
+        s.release(r);
+        try s.settleRoutes();
+        const p = &s.layers[0].policy;
+        try testing.expectEqual(sdk_ext.expert.policy.Phase.prefill, s.phase);
+        try testing.expectEqual(@as(u32, 4), p.capacity);
+        try testing.expectEqual(@as(i64, 0), p.epoch);
+        try testing.expectEqual(count, p.request_routes);
+        for (p.request_counts, 0..) |c, e| try testing.expectEqual(if (e == 1 or e == 3) count else 0, c);
+    }
+    s.count_borrowed_decode = false;
+    var rates: [8]f32 = @splat(0);
+    try testing.expectEqual(@as(u32, 1), s.endTally(&rates));
+    try testing.expectEqual(@as(f32, 1), rates[1]);
+    try testing.expectEqual(@as(f32, 1), rates[3]);
+}
+
 test "dsv41 bank contract: a top-8 arch's lookahead measures tau from each row's eighth score, a top-6 arch's from its sixth" {
     const a = testing.allocator;
     // One row over 16 experts, scores 15 - e: the 6th score is 10, the 8th is 8. With tau 1 and k 10, a top-6 selector keeps

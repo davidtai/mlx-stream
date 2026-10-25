@@ -90,7 +90,10 @@ pub fn bill(gpa: std.mem.Allocator, io: std.Io, req: *const sdk.BillRequest) !sd
     c.memory_baseline_bytes = 0;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const b = try bill_mod.billAtFloor(arena.allocator(), io, c, req.prompt_tokens, req.max_tokens, null, req.ceiling, ov.*);
+    const b = if ((c.checkpoint_cache or c.active_slots > 1) and ov.bill_pinned_prompt == null)
+        try bill_mod.servedBillAtFloor(arena.allocator(), io, c, req.max_tokens, null, req.ceiling, ov.*)
+    else
+        try bill_mod.billAtFloor(arena.allocator(), io, c, req.prompt_tokens, req.max_tokens, null, req.ceiling, ov.*);
     return bill_mod.memoryBill(gpa, b);
 }
 
@@ -119,7 +122,45 @@ pub fn deinit(m: *Module) void {
     m.deinit();
 }
 
+pub fn requestCapacity(m: *const Module) u32 {
+    return m.requestCapacity();
+}
+
+pub fn acquireRequest(m: *Module, prefix: []const u32) !u64 {
+    return m.acquireRequest(prefix);
+}
+
+pub fn activateRequest(m: *Module, handle: u64) !void {
+    return m.activateRequest(handle);
+}
+
+pub fn completeRequest(m: *Module, handle: u64, ids: []const u32) !void {
+    return m.markRequestComplete(handle, ids);
+}
+
+pub fn releaseRequest(m: *Module, handle: u64) !void {
+    return m.releaseRequest(handle);
+}
+
 /// The served prompt reserves no positions beyond the module's own bound (the prompt and the generation headroom).
+pub fn saveRequest(m: *Module, directory: []const u8, model_identity: [32]u8, ids: []const u32) !void {
+    defer m.clearCheckpoint();
+    try m.completeRequest(ids);
+    const adapter = @import("checkpoint_adapter.zig");
+    const identity = try adapter.identityOf(m.gpa, m, model_identity);
+    var dir = try std.Io.Dir.openDirAbsolute(m.io, directory, .{});
+    defer dir.close(m.io);
+    try adapter.save(m, dir, identity);
+}
+
+pub fn loadRequest(m: *Module, directory: []const u8, prefix: []const u32, model_identity: [32]u8) !u64 {
+    const adapter = @import("checkpoint_adapter.zig");
+    const identity = try adapter.identityOf(m.gpa, m, model_identity);
+    var dir = try std.Io.Dir.openDirAbsolute(m.io, directory, .{});
+    defer dir.close(m.io);
+    return adapter.load(m, dir, prefix, identity);
+}
+
 pub fn reservedTokens(_: sdk.RequestShape) u64 {
     return 0;
 }
@@ -127,6 +168,9 @@ pub fn reservedTokens(_: sdk.RequestShape) u64 {
 /// The prompt pass: from position 0, or after the positions `restorePrefix` kept (`req.prompt_tokens` counts them).
 /// The prompt pass: the request's sampler bound (`draft_lane.arm`), its last row the plugin's first token when bound.
 pub fn prefill(m: *Module, ids: []const u32, req: sdk.RequestShape) !sdk.mlx.mlx_array {
+    if (m.prefill_interleave) return error.PrefillDuringInterleave;
+    m.prefill_control = req.prefill_control;
+    defer m.prefill_control = null;
     m.sampler.begin(m.decodeLane());
     return m.sampler.chosen(try m.prefillAt(req.prompt_tokens - ids.len, ids, reservedTokens(req)), m.position());
 }
@@ -296,4 +340,11 @@ test "dsv41 plugin: applySettings takes the host's model-settings entry (null: n
         applySettings(&x, try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), w.text, .{}));
         try testing.expectError(w.err, x.checkResidency());
     }
+}
+
+test "dsv41 plugin: request and disk checkpoint hooks compile against the production module without running a device" {
+    std.mem.doNotOptimizeAway(&completeRequest);
+    std.mem.doNotOptimizeAway(&releaseRequest);
+    std.mem.doNotOptimizeAway(&saveRequest);
+    std.mem.doNotOptimizeAway(&loadRequest);
 }

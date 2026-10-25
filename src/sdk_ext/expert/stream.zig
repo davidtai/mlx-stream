@@ -708,6 +708,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             records_per_part: u32,
             wide_depth: u8 = 1,
             phase: Phase = .prefill,
+            /// Scoped borrowed decode usage only; allocation phase and decode-only routes stay unchanged.
+            count_borrowed_decode: bool = false,
             failed: bool = false,
             routes: [route_capacity]Route = @splat(.{}),
             /// Free routes (a stack) and released ones awaiting the next flush, in
@@ -1550,7 +1552,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.copier.waitFor(self.copier.window_seq[window]);
                 r.* = .{ .layer = layer, .window = window };
                 const ls = &self.layers[layer];
-                ls.policy.planWith(ids, self.phase, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held_set.items });
+                ls.policy.planWith(ids, self.phase, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held_set.items, .count_decode_usage = self.count_borrowed_decode });
                 // A persistent load may take a row a promotion of this layer still writes.
                 if (r.plan.n_persistent > 0 and self.copier.thread != null) self.copier.waitFor(self.copier.layer_seq.items[layer]);
                 const plan = &r.plan;

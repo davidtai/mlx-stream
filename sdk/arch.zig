@@ -19,7 +19,7 @@ const Allocator = std.mem.Allocator;
 /// Facts the host copies once at load into its own tables.
 pub const Caps = struct {
     /// G1: per-request decode state lives on the arch's module, not the host's KVCache: no batched decode,
-    /// single-flight admission, no KVCache snapshot or rewind; the prefix cache only through `restore_prefix`.
+    /// single-flight admission unless request_slots is declared, no KVCache snapshot or rewind; the prefix cache only through `restore_prefix`.
     owns_decode_state: bool = false,
     /// The host sends the whole prompt in one forward; the arch chunks it.
     prefill_whole_prompt: bool = false,
@@ -75,13 +75,33 @@ pub const LoadCtx = struct {
 /// A request as the host sees it at its prompt, set once per request before its first forward: each arch derives
 /// its own reservation from it. `prompt_tokens` counts absolute positions; `host_context` is the window the host
 /// serves the model within.
-pub const RequestShape = struct { prompt_tokens: u64, max_tokens: u32, host_context: u64 };
+/// Called on the inference thread at fenced prompt boundaries. Progress counts only the uncached tail.
+/// With allow_decode, the host may advance existing decoders, but must not admit a new prompt.
+pub const PrefillControl = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, done: u64, total: u64, allow_decode: bool) anyerror!void,
+};
+pub const RequestShape = struct {
+    prompt_tokens: u64,
+    max_tokens: u32,
+    host_context: u64,
+    prefill_control: ?PrefillControl = null,
+};
 
 /// The prefill-to-decode handover (G2: the phase change), once per request at its first decode step, serial or
 /// lane: the request's prompt length, the positions it reserved, and whether the host drives draft rounds.
 pub const DecodeHandover = struct { prompt_tokens: u32, reserved_tokens: u64, native_draft: bool };
 
+/// Optional leases for isolated requests sharing one module. All calls run serially on the inference thread.
+pub const RequestSlots = struct {
+    acquire: *const fn (*anyopaque, []const u32) anyerror!u64,
+    activate: *const fn (*anyopaque, u64) anyerror!void,
+    release: *const fn (*anyopaque, u64) anyerror!void,
+    capacity: *const fn (*const anyopaque) u32,
+};
+
 pub const Arch = struct {
+    request_slots: ?RequestSlots = null,
     name: []const u8,
     caps: Caps,
     claims: *const fn (p: *const peek.ConfigPeek) ?peek.Priority,
@@ -129,7 +149,7 @@ pub const Arch = struct {
     /// naming it): name, caps, claims, Config, parse, freeConfig, shell, applySettings, loadBytes, Module, init,
     /// deinit, prefill, step, position; optional (absent when undeclared or `{}`) promptBytes, handover, requestEnd,
     /// restorePrefix (only with `owns_decode_state`), draft_lane, bill, maxOutput, and the pair claimProcess /
-    /// releaseProcess.
+    /// releaseProcess; acquireRequest / activateRequest / releaseRequest / requestCapacity are an optional group.
     pub fn of(comptime T: type) Arch {
         comptime {
             const w = "arch " ++ @typeName(T);
@@ -152,6 +172,16 @@ pub const Arch = struct {
             check.fnDecl(w, T, "position", &.{*const T.Module}, u64);
             if (check.has(T, "handover")) check.fnDecl(w, T, "handover", &.{ *T.Module, DecodeHandover }, void);
             if (check.has(T, "requestEnd")) check.fnDecl(w, T, "requestEnd", &.{*T.Module}, void);
+            const slots = check.has(T, "acquireRequest");
+            if (slots != check.has(T, "activateRequest") or slots != check.has(T, "releaseRequest") or slots != check.has(T, "requestCapacity"))
+                @compileError(w ++ ": request slot hooks must be declared together");
+            if (slots) {
+                if (!T.caps.owns_decode_state) @compileError(w ++ ": request slots require owns_decode_state");
+                check.fnDecl(w, T, "acquireRequest", &.{ *T.Module, []const u32 }, u64);
+                check.fnDecl(w, T, "activateRequest", &.{ *T.Module, u64 }, void);
+                check.fnDecl(w, T, "releaseRequest", &.{ *T.Module, u64 }, void);
+                check.fnDecl(w, T, "requestCapacity", &.{*const T.Module}, u32);
+            }
             if (check.has(T, "restorePrefix")) {
                 if (!T.caps.owns_decode_state) @compileError(w ++ ": restorePrefix without owns_decode_state");
                 check.fnDecl(w, T, "restorePrefix", &.{ *T.Module, []const u32 }, u64);
@@ -213,6 +243,19 @@ pub const Arch = struct {
             fn requestEnd(m: *anyopaque) void {
                 T.requestEnd(mod(m));
             }
+            fn acquireRequest(m: *anyopaque, prefix: []const u32) anyerror!u64 {
+                return T.acquireRequest(mod(m), prefix);
+            }
+            fn activateRequest(m: *anyopaque, handle: u64) anyerror!void {
+                return T.activateRequest(mod(m), handle);
+            }
+            fn releaseRequest(m: *anyopaque, handle: u64) anyerror!void {
+                return T.releaseRequest(mod(m), handle);
+            }
+
+            fn requestCapacity(m: *const anyopaque) u32 {
+                return T.requestCapacity(@ptrCast(@alignCast(m)));
+            }
             fn restorePrefix(m: *anyopaque, prefix: []const u32) u64 {
                 return T.restorePrefix(mod(m), prefix);
             }
@@ -230,6 +273,12 @@ pub const Arch = struct {
             }
         };
         return .{
+            .request_slots = if (check.has(T, "acquireRequest")) .{
+                .acquire = W.acquireRequest,
+                .activate = W.activateRequest,
+                .release = W.releaseRequest,
+                .capacity = W.requestCapacity,
+            } else null,
             .name = T.name,
             .caps = T.caps,
             .claims = T.claims,

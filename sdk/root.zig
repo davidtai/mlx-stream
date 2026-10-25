@@ -57,6 +57,7 @@ pub const Shell = arch.Shell;
 pub const LoadFacts = arch.LoadFacts;
 pub const LoadCtx = arch.LoadCtx;
 pub const RequestShape = arch.RequestShape;
+pub const PrefillControl = arch.PrefillControl;
 pub const DecodeHandover = arch.DecodeHandover;
 
 const spec = @import("spec.zig");

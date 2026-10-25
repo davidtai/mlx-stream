@@ -18,6 +18,49 @@ const boundedParts = policy.boundedParts;
 const testing = std.testing;
 const expert_bank = @import("bank.zig");
 
+test "expert policy: borrowed decode tally counts unique usage without changing allocation or history" {
+    const a = testing.allocator;
+    var p = try LayerPolicy.init(a, 8, 3);
+    defer p.deinit(a);
+    var control = try LayerPolicy.init(a, 8, 3);
+    defer control.deinit(a);
+    p.setTally(2, 0.25);
+    control.setTally(2, 0.25);
+    const ids = [_]u16{ 1, 1, 3, 3 };
+    for ([_]struct { phase: Phase, borrowed: bool, count: u32 }{
+        .{ .phase = .prefill, .borrowed = false, .count = 0 },
+        .{ .phase = .prefill, .borrowed = true, .count = 1 },
+        .{ .phase = .prefill, .borrowed = false, .count = 1 },
+        .{ .phase = .decode, .borrowed = true, .count = 2 },
+        .{ .phase = .decode, .borrowed = false, .count = 3 },
+    }) |step| {
+        var got: Plan = .{};
+        var want: Plan = .{};
+        p.planWith(&ids, step.phase, &got, .{ .count_decode_usage = step.borrowed });
+        control.plan(&ids, step.phase, &want);
+        try testing.expectEqual(step.phase, got.phase);
+        try testing.expectEqualSlices(u32, want.slotsOf(), got.slotsOf());
+        try testing.expectEqualSlices(Load, want.loadsOf(), got.loadsOf());
+        try testing.expectEqualSlices(Eviction, want.evictionsOf(), got.evictionsOf());
+        try testing.expectEqual(control.epoch, p.epoch);
+        try testing.expectEqual(control.window_count, p.window_count);
+        try testing.expectEqualSlices(i64, control.last_used, p.last_used);
+        try testing.expectEqualSlices(f32, control.rate, p.rate);
+        try testing.expectEqual(step.count, p.request_routes);
+        for (p.request_counts, 0..) |count, e| try testing.expectEqual(if (e == 1 or e == 3) step.count else 0, count);
+    }
+    var share: [8]f32 = @splat(0);
+    try testing.expect(p.endRequest(&share));
+    try testing.expectEqual(@as(f32, 1), share[1]);
+    try testing.expectEqual(@as(f32, 1), share[3]);
+    try testing.expectEqual(@as(u32, 0), p.request_routes);
+    var off = try LayerPolicy.init(a, 8, 3);
+    defer off.deinit(a);
+    var plan: Plan = .{};
+    off.planWith(&ids, .prefill, &plan, .{ .count_decode_usage = true });
+    try testing.expectEqual(@as(u32, 0), off.request_routes);
+}
+
 /// Every plan leaves a bijective residency map and serves each id exactly as
 /// its hit or load says.
 fn checkPlan(p: *const LayerPolicy, ids: []const u16, out: *const Plan, transient: u32) !void {

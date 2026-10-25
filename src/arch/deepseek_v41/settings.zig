@@ -14,6 +14,8 @@ const expert_stream = @import("../../expert/stream.zig");
 pub const NumericTier = enum { stock, served };
 
 pub const Config = struct {
+    /// Host enables persistence before load admission.
+    checkpoint_cache: bool = false,
     /// The model directory (config.json, the resident shards, the expert bank) and the exported Engram token map
     /// beside it; owned by the host's config.
     expert_bank_dir: ?[]const u8 = null,
@@ -52,6 +54,14 @@ pub const Config = struct {
     /// Set, the construction bills every prompt length up to it (`bill.billCovering`); a longer request is refused by name
     /// before its prompt pass (`error.ContextOverBill`).
     max_context_tokens: ?u32 = null,
+    /// Approximate rows per layer-major prefill call; span alignment and a merged tail may exceed it.
+    /// Null preserves the existing 16,384-row default; invalid settings refuse the load.
+    prefill_sub: ?u64 = null,
+    prefill_sub_bad: bool = false,
+    /// Independent live request contexts sharing weights and expert banks. Each has its own context bound.
+    active_slots: u32 = 1,
+    active_slots_bad: bool = false,
+
     /// A `ctx_size` above the model's limit (`Config.max_ctx_size`): refused by name at load and construction
     /// (`error.CtxSizeOverModelLimit`), never a silent fall back to the standard request's context.
     ctx_size_over_limit: ?i64 = null,
@@ -101,6 +111,17 @@ pub const Config = struct {
     /// combines read them in f32). Rounding-class against the f32 outputs. null = the tier's: on for served; false: f32.
     kv16_expert_bf16: ?bool = null,
 
+    pub fn checkPrefillSub(c: *const Config) error{Dsv41PrefillSubSetting}!void {
+        if (c.prefill_sub_bad) return error.Dsv41PrefillSubSetting;
+        if (c.prefill_sub) |n| if (n < 4096 or n > @import("cache.zig").prefill_sub)
+            return error.Dsv41PrefillSubSetting;
+    }
+
+    pub fn checkActiveSlots(c: *const Config) !void {
+        if (c.active_slots_bad or c.active_slots < 1 or c.active_slots > 2)
+            return error.Dsv41ActiveSlotsSetting;
+    }
+
     /// The load's refusal of a bad `prompt_residents` or residency value, by name.
     pub fn checkResidency(c: *const Config) !void {
         if (c.prompt_residents_bad) {
@@ -128,11 +149,25 @@ pub const Config = struct {
             else => return,
         };
         var any = false;
-        inline for (.{ "expert_event_gates", "layer_major_prefill", "expert_wide_feed", "expert_wide_seed", "expert_wide_hot_first", "embedding_host_rows", "kv16_oproj_bf16", "kv16_hcpost", "prefill_shared_mid", "prefill_attn_fused", "prefill_attn_bf16mma", "decode_stack4", "kv16_expert_bf16", "expert_prompt_overlap", "expert_prompt_stage" }) |key| {
+        inline for (.{ "expert_event_gates", "layer_major_prefill", "expert_wide_feed", "expert_wide_seed", "expert_wide_hot_first", "expert_wide_read_ahead", "embedding_host_rows", "kv16_oproj_bf16", "kv16_hcpost", "prefill_shared_mid", "prefill_attn_fused", "prefill_attn_bf16mma", "decode_stack4", "kv16_expert_bf16", "expert_prompt_overlap", "expert_prompt_stage" }) |key| {
             if (obj.get(key)) |v| if (v == .bool) {
                 @field(c, key) = v.bool;
                 any = true;
             };
+        }
+        if (obj.get("prefill_sub")) |v| {
+            if (v == .integer and v.integer >= 4096 and v.integer <= @import("cache.zig").prefill_sub)
+                c.prefill_sub = @intCast(v.integer)
+            else
+                c.prefill_sub_bad = true;
+            any = true;
+        }
+        if (obj.get("active_slots")) |v| {
+            if (v == .integer and v.integer >= 1 and v.integer <= 2)
+                c.active_slots = @intCast(v.integer)
+            else
+                c.active_slots_bad = true;
+            any = true;
         }
         if (obj.get("numeric_tier")) |v| if (v == .string) {
             if (std.meta.stringToEnum(NumericTier, v.string)) |t| {
@@ -162,15 +197,17 @@ pub const Config = struct {
             if (v.integer <= max_ctx_size) c.max_context_tokens = @intCast(v.integer) else c.ctx_size_over_limit = v.integer;
             any = true;
         };
-        if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s} kv16_oproj_bf16={s} kv16_hcpost={s} prefill_shared_mid={s} decode_stack4={s} kv16_expert_bf16={s} prompt_overlap={s} prompt_stage={s} billed_context={d}\n", .{
-            onOff(c.expert_event_gates),  if (c.numeric_tier) |t| @tagName(t) else "default",
-            onOff(c.layer_major_prefill), onOff(c.expert_wide_feed),
-            onOff(c.expert_wide_seed),    onOff(c.expert_wide_hot_first),
-            c.expert_wide_depth orelse 0, c.expert_wide_cold_rows orelse 0,
-            onOff(c.embedding_host_rows),     onOff(c.kv16_oproj_bf16),     onOff(c.kv16_hcpost),
-            onOff(c.prefill_shared_mid),  onOff(c.decode_stack4),
-            onOff(c.kv16_expert_bf16),    onOff(c.expert_prompt_overlap), onOff(c.expert_prompt_stage),
-            c.max_context_tokens orelse 0,
+        if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s} kv16_oproj_bf16={s} kv16_hcpost={s} prefill_shared_mid={s} decode_stack4={s} kv16_expert_bf16={s} prompt_overlap={s} prompt_stage={s} billed_context={d} active_slots={d} prefill_sub={d}\n", .{
+            onOff(c.expert_event_gates),    if (c.numeric_tier) |t| @tagName(t) else "default",
+            onOff(c.layer_major_prefill),   onOff(c.expert_wide_feed),
+            onOff(c.expert_wide_seed),      onOff(c.expert_wide_hot_first),
+            c.expert_wide_depth orelse 0,   c.expert_wide_cold_rows orelse 0,
+            onOff(c.embedding_host_rows),   onOff(c.kv16_oproj_bf16),
+            onOff(c.kv16_hcpost),           onOff(c.prefill_shared_mid),
+            onOff(c.decode_stack4),         onOff(c.kv16_expert_bf16),
+            onOff(c.expert_prompt_overlap), onOff(c.expert_prompt_stage),
+            c.max_context_tokens orelse 0,  c.active_slots,
+            c.prefill_sub orelse 0,
         });
     }
 
@@ -274,6 +311,20 @@ test "dsv41 settings: expert_event_gates and embedding_host_rows are bools, anyt
     try testing.expectEqual(@as(?bool, false), (try settingsOf("{\"embedding_host_rows\": false}")).embedding_host_rows);
 }
 
+test "dsv41 settings: prompt read-ahead can be disabled without disabling the seed" {
+    const defaults = try settingsOf("{}");
+    try testing.expectEqual(defaults.dsv41WideSeed(), defaults.dsv41WideReadAhead());
+    const disabled = try settingsOf("{\"expert_wide_seed\":true,\"expert_wide_read_ahead\":false}");
+    try testing.expect(disabled.dsv41WideSeed());
+    try testing.expect(!disabled.dsv41WideReadAhead());
+    const loaded = disabled.withFacts(&.{ .wired_margin_bytes = 0 });
+    try testing.expect(!loaded.dsv41WideReadAhead());
+    const enabled = try settingsOf("{\"expert_wide_read_ahead\":true}");
+    try testing.expect(enabled.dsv41WideReadAhead());
+    const invalid = try settingsOf("{\"expert_wide_read_ahead\":0}");
+    try testing.expectEqual(@as(?bool, null), invalid.expert_wide_read_ahead);
+}
+
 test "dsv41 settings: the prefill routes are a bool, a bool and a depth of 1 to the stream's 8; cold rows 1 to 8; anything else is unset" {
     const a = try settingsOf("{\"layer_major_prefill\": true, \"expert_wide_feed\": false, \"expert_wide_depth\": 2, \"expert_wide_cold_rows\": 8}");
     try testing.expectEqual(@as(?bool, true), a.layer_major_prefill);
@@ -354,4 +405,35 @@ test "dsv41 settings: prompt_residents: keep unless named; forget (the control) 
     try std.testing.expectError(error.ResidentSeedSetting, (try parse("{\"resident_seed\":\"all\"}")).checkResidency());
     try std.testing.expectError(error.ExpertUsageRecordNotInstalled, (try parse("{\"expert_usage_record\":\"/tmp/u.json\"}")).checkResidency());
     try std.testing.expectEqualStrings("deepseek_v41 prompt residents: keep (decode's residents stay for the next prompt)", usage.promptResidentsLine("deepseek_v41", .keep));
+}
+
+test "dsv41 active slots: one by default, two supported, invalid values refused" {
+    const one = try settingsOf("{}");
+    try testing.expectEqual(@as(u32, 1), one.active_slots);
+    const two = try settingsOf("{\"active_slots\":2}");
+    try two.checkActiveSlots();
+    try testing.expectEqual(@as(u32, 2), two.active_slots);
+    for ([_][]const u8{ "0", "3", "-1", "true", "\"2\"", "null" }) |value| {
+        var buf: [64]u8 = undefined;
+        const bad = try settingsOf(try std.fmt.bufPrint(&buf, "{{\"active_slots\":{s}}}", .{value}));
+        try testing.expectError(error.Dsv41ActiveSlotsSetting, bad.checkActiveSlots());
+    }
+    try testing.expectError(error.Dsv41ActiveSlotsSetting, (Config{ .active_slots = 3 }).checkActiveSlots());
+}
+
+test "dsv41 settings: prefill_sub accepts bounded integers and rejects invalid values" {
+    const defaults = try settingsOf("{}");
+    try defaults.checkPrefillSub();
+    try testing.expectEqual(@as(?u64, null), defaults.prefill_sub);
+    for ([_]u64{ 4096, 8192, 16384 }) |n| {
+        var buf: [64]u8 = undefined;
+        const c = try settingsOf(try std.fmt.bufPrint(&buf, "{{\"prefill_sub\":{d}}}", .{n}));
+        try c.checkPrefillSub();
+        try testing.expectEqual(@as(?u64, n), c.prefill_sub);
+    }
+    for ([_][]const u8{ "0", "-1", "1", "953", "1024", "2048", "4095", "16385", "1.5", "true", "null", "\"4096\"" }) |value| {
+        var buf: [64]u8 = undefined;
+        const c = try settingsOf(try std.fmt.bufPrint(&buf, "{{\"prefill_sub\":{s}}}", .{value}));
+        try testing.expectError(error.Dsv41PrefillSubSetting, c.checkPrefillSub());
+    }
 }

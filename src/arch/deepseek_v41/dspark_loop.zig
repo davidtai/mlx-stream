@@ -137,6 +137,49 @@ pub fn Loop(comptime G: type) type {
 
         /// The draft depth and the widest verify a request under `cfg` reaches with `head`.
         pub const Shapes = struct { k_cap: u32, max_rows: u32 };
+        /// A context switch commits retained roots and discards only the optional speculative next block.
+        /// No token is emitted and the committed target/draft positions remain unchanged.
+        pub fn park(self: *Self) !void {
+            self.dropAhead();
+            var roots: [9]T = undefined;
+            var n: usize = 0;
+            if (self.main_h) |h| {
+                roots[n] = h;
+                n += 1;
+            }
+            for (self.caches) |c| if (c.window) |w| {
+                if (n == roots.len) return error.TooManyStages;
+                roots[n] = w;
+                n += 1;
+            };
+            if (n > 0) try self.g.evalAll(roots[0..n]);
+        }
+
+        /// Trim committed state to the visible response before checkpoint capture.
+        pub fn trimForCompletion(self: *Self, n: u32) !void {
+            if (n == 0) return;
+            const g = self.g;
+            for (self.caches) |c| {
+                if (c.offset < n) return error.CompletionDraftTrim;
+                if (c.window) |w| if (g.shapeOf(w).d[1] < n) return error.CompletionDraftTrim;
+            }
+            try self.model.trim(g, self.st, n);
+            for (self.caches) |*c| {
+                if (c.window) |w| {
+                    const sh = g.shapeOf(w);
+                    c.window = g.keep(try g.slice(w, &.{ 0, 0, 0 }, &.{ sh.d[0], sh.d[1] - @as(c_int, @intCast(n)), sh.d[2] }, &.{ 1, 1, 1 }));
+                    g.release(w);
+                }
+                c.offset -= n;
+            }
+            self.dropAhead();
+            if (self.main_h) |h| g.release(h);
+            self.main_h = null;
+            if (self.lookup) |*l| l.deinit();
+            self.lookup = null;
+            self.lookup_has_primary = false;
+        }
+
         pub fn shapesOf(head: *const H, cfg: Config) Shapes {
             const k_cap = @min(cfg.k_request, head.blockSize());
             const extra: u32 = if (cfg.lookup) |l| (if (k_cap == ds.Lookup.key_len) l.extra_tokens else 0) else 0;
@@ -3120,4 +3163,113 @@ test "dsv41 acceptance characterization: the lane's traced rounds (exact, typica
     for (char_rules, 0..) |rule, ri| for (char_requests, 0..) |req, qi| {
         try testing.expectEqual(want[ri][qi], try charTrace(a, rule, req, req == null));
     };
+}
+
+test "dsv41 active slots: two draft loops sharing weights and experts preserve isolated committed histories when interleaved and parked" {
+    const L = Loop(TraceOps);
+    const Result = struct { tokens: [2][6]u32, offsets: [2]u32, draft_offsets: [2]u32 };
+    const Run = struct {
+        fn run(interleave: bool) !Result {
+            const a = testing.allocator;
+            var rig: Rig = undefined;
+            try rig.init();
+            defer rig.deinit();
+            var other = try rig.model.newState();
+            defer other.deinit(&rig.g, a);
+            var caches: [4]L.H.Cache = @splat(.{});
+            defer for (caches[0..rig.head.nStages()]) |*c| c.deinit(&rig.g);
+            var loops = [2]L{
+                L.init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..rig.head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = 6 }),
+                L.init(&rig.g, rig.model, rig.head, &other, caches[0..rig.head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = 6 }),
+            };
+            defer for (&loops) |*lp| lp.deinit();
+            var scripts = [2]Script{
+                .{ .n_experts = @intCast(rig.m.c.n_routed_experts), .pick = 3,
+                    .u32s = &.{ &.{ 5, 6 }, &.{ 5, 9, 7 }, &.{ 10, 11 }, &.{ 10, 12 }, &.{ 13, 14 }, &.{ 20, 21 }, &.{ 30, 31 }, &.{ 30, 31, 40 } },
+                    .f32s = &.{ &.{ 0.9, 0.8 }, &.{ 0.9, 0.3 }, &.{ 0.2, 0.9 }, &.{ 0.9, 0.9 } } },
+                .{ .n_experts = @intCast(rig.m.c.n_routed_experts), .pick = 13,
+                    .u32s = &.{ &.{ 7, 8 }, &.{ 7, 11, 9 }, &.{ 12, 13 }, &.{ 12, 14 }, &.{ 15, 16 }, &.{ 22, 23 }, &.{ 32, 33 }, &.{ 32, 33, 42 } },
+                    .f32s = &.{ &.{ 0.9, 0.8 }, &.{ 0.9, 0.3 }, &.{ 0.2, 0.9 }, &.{ 0.9, 0.9 } } },
+            };
+            var outputs: [2]std.ArrayList(u32) = @splat(.empty);
+            defer for (&outputs) |*out| out.deinit(a);
+            const prompts = [_][]const u32{ &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 }, &.{ 31, 29, 27, 25, 23, 21, 19, 17, 15, 13, 11, 9, 7 } };
+            for (&loops, 0..) |*lp, i| {
+                rig.g.host_values = scripts[i].values();
+                _ = try lp.prefill(a, &rig.ex, prompts[i]);
+                if (interleave) try lp.park();
+            }
+            for (0..8) |tick| {
+                const i = if (interleave) tick % 2 else tick / 4;
+                const untouched = &loops[1 - i];
+                const before_offset = untouched.st.offset;
+                const before_draft_offset = untouched.caches[0].offset;
+                const before_window = untouched.caches[0].window;
+                const before_main = untouched.main_h;
+                const before_stats = untouched.stats;
+                rig.g.host_values = scripts[i].values();
+                _ = try loops[i].cycle(&rig.ex, &outputs[i], a, null);
+                if (interleave) {
+                    const committed = loops[i].st.offset;
+                    const emitted = outputs[i].items.len;
+                    try loops[i].park();
+                    try testing.expectEqual(committed, loops[i].st.offset);
+                    try testing.expectEqual(emitted, outputs[i].items.len);
+                }
+                try testing.expectEqual(before_offset, untouched.st.offset);
+                try testing.expectEqual(before_draft_offset, untouched.caches[0].offset);
+                try testing.expectEqual(before_window, untouched.caches[0].window);
+                try testing.expectEqual(before_main, untouched.main_h);
+                try testing.expectEqualDeep(before_stats, untouched.stats);
+            }
+            var result: Result = undefined;
+            for (&loops, 0..) |*lp, i| {
+                try testing.expectEqual(@as(usize, 6), outputs[i].items.len);
+                @memcpy(&result.tokens[i], outputs[i].items);
+                result.offsets[i] = lp.st.offset;
+                result.draft_offsets[i] = lp.caches[0].offset;
+            }
+            return result;
+        }
+    };
+    const isolated = try Run.run(false);
+    const interleaved = try Run.run(true);
+    try testing.expectEqualDeep(isolated, interleaved);
+    try testing.expectEqualSlices(u32, &.{ 5, 9, 10, 12, 20, 30 }, &interleaved.tokens[0]);
+    try testing.expectEqualSlices(u32, &.{ 7, 11, 12, 14, 22, 32 }, &interleaved.tokens[1]);
+    try testing.expectEqualSlices(u32, &.{ 28, 21 }, &interleaved.offsets);
+}
+
+test "dsv41 completed cache: unpublished committed tail trims target draft and hash together before boundary capture" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var script: Script = .{ .n_experts = @intCast(rig.m.c.n_routed_experts), .pick = 3, .u32s = &.{}, .f32s = &.{} };
+    rig.g.host_values = script.values();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..rig.head.nStages()], .{ .max_tokens = 64 });
+    defer lp.deinit();
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 };
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    var original = try rig.model.boundary(&rig.g, a, &rig.st);
+    defer original.deinit(&rig.g, a);
+    _ = try lp.extendLogits(a, &rig.ex, &.{ 21, 22, 23 });
+    try testing.expectEqual(@as(u32, 23), rig.st.offset);
+    try testing.expectError(error.CompletionDraftTrim, lp.trimForCompletion(100));
+    try testing.expectEqual(@as(u32, 23), rig.st.offset);
+    try lp.trimForCompletion(1);
+    try lp.park();
+    try testing.expectEqual(@as(u32, 22), rig.st.offset);
+    for (lp.caches) |c| try testing.expectEqual(@as(u32, 22), c.offset);
+    if (rig.st.hash) |h| try testing.expectEqual(@as(usize, 22), h.hist.items.len);
+    try testing.expect(lp.main_h == null);
+    var completed = try rig.model.boundary(&rig.g, a, &rig.st);
+    defer completed.deinit(&rig.g, a);
+    try testing.expectEqual(@as(u32, 20), original.offset);
+    try testing.expectEqual(@as(u32, 22), completed.offset);
+    // A continued prompt rebuilds the draft main row before any next speculative round.
+    _ = try lp.extendLogits(a, &rig.ex, &.{ 24, 25 });
+    try testing.expect(lp.main_h != null);
+    try testing.expectEqual(@as(u32, 24), rig.st.offset);
+    for (lp.caches) |c| try testing.expectEqual(@as(u32, 24), c.offset);
 }

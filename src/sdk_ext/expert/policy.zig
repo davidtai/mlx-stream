@@ -139,7 +139,7 @@ pub const LayerPolicy = struct {
     /// over another staged record forgets that record's row.
     pub const Adopt = struct { slot_of: []u32, owner: []u8, staged_of_row: []u16, width: u32, depth: u8 };
     pub const no_owner: u8 = std.math.maxInt(u8);
-    pub const PlanOpts = struct { transient_base: u32 = 0, held: []const u32 = &.{}, adopt: ?*const Adopt = null, group: u8 = 0 };
+    pub const PlanOpts = struct { transient_base: u32 = 0, held: []const u32 = &.{}, adopt: ?*const Adopt = null, group: u8 = 0, count_decode_usage: bool = false };
 
     pub fn init(a: std.mem.Allocator, n_experts: u32, capacity: u32) !LayerPolicy {
         if (n_experts == 0 or n_experts >= no_expert or capacity > n_experts) return error.InvalidCapacity;
@@ -524,8 +524,8 @@ pub const LayerPolicy = struct {
             p.epoch += 1;
             for (ids) |e| p.last_used[e] = p.epoch;
             p.observe(unique);
-            p.tallyRoute(unique);
         }
+        if (phase == .decode or opts.count_decode_usage) p.tallyRoute(unique);
         for (unique) |e| {
             if (p.expert_to_slot[e] != no_slot) {
                 out.hits[out.n_hits] = e;

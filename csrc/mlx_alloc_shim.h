@@ -16,6 +16,9 @@ extern "C" {
 int dsv41_alloc_uninit(mlx_array *out, const int *shape, size_t ndim, mlx_dtype dtype);
 const char *dsv41_alloc_last_error(void);
 
+/* The pinned MLX device capability, including the OS requirement. */
+int dsv41_nax_available(void);
+
 #ifdef __cplusplus
 }
 #endif

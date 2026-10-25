@@ -881,6 +881,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         wide: WideScratch = .{},
         /// The wide lane's read schedule (`Options.wide`).
         wide_route: Wide = .{},
+        /// A fenced borrowed decode keeps prompt banks but must use only its billed decode wave.
+        prefill_predictor_suspended: bool = false,
         /// The parts' combine's source bound (`runWideParts`: outputs above it merge into one source); `joinless_sources`
         /// unless the arch installs a combine that reads every source in place (`setJoinlessBound`).
         joinless_bound: usize = joinless_sources,
@@ -1249,9 +1251,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 return if (comptime wide_profile.enabled) h.ex.last_merge else .{};
             }
 
-            /// P1 (`Wide.read_ahead`, fixed at construction): the model runs its predictor pass for this layer.
+            /// P1's effective permission. The configured wide route stays fixed while a fenced borrowed decode
+            /// temporarily suppresses the prompt predictor without changing the source's residency phase.
             pub fn readAhead(h: Hook) bool {
-                return h.ex.wide_route.read_ahead;
+                return h.ex.wide_route.read_ahead and !h.ex.prefill_predictor_suspended;
             }
 
             /// The source is in its prompt phase (before its one phase change): the forward is a prompt's, so its predictor

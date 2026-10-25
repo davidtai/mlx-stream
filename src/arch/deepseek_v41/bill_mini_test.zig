@@ -276,3 +276,30 @@ test "dsv41 memory mini: the served bill keeps multi-turn's prompt boundary in t
     try testing.expectEqual(@as(u64, 0), pinned.turn_boundary);
     try testing.expectEqual(exact.decodeTotal(), pinned.decodeTotal());
 }
+
+test "dsv41 memory mini: two leases share banks and keep checkpoint storage opt-in" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tm = try miniBank(a);
+    defer tm.destroy();
+    var config = configOf(tm);
+    config.max_context_tokens = 2048;
+    config.expert_rows = bill.min_fill_rows;
+    config.expert_prefill_rows = bill.min_fill_rows;
+    const one = try bill.servedBillAt(a, io, &config, max_tokens, null, ceiling, ov);
+    config.active_slots = 2;
+    const two = try bill.servedBillAt(a, io, &config, max_tokens, null, ceiling, ov);
+    try testing.expect(two.parked_context > 0 and two.parked_context_host > 0);
+    try testing.expectEqual(one.slot_prefill, two.slot_prefill);
+    try testing.expectEqual(one.slot_decode, two.slot_decode);
+    try testing.expectEqual(@as(u64, 0), two.checkpoint_staging);
+    try testing.expectEqual(@as(u64, 0), two.checkpoint_index_host);
+    config.checkpoint_cache = true;
+    const persistent = try bill.servedBillAt(a, io, &config, max_tokens, null, ceiling, ov);
+    try testing.expectEqual(2 * two.turn_boundary, persistent.turn_boundary);
+    try testing.expectEqual(@import("checkpoint_adapter.zig").staging_bytes, persistent.checkpoint_staging);
+    try testing.expect(persistent.checkpoint_index_host > 0);
+    try testing.expect(persistent.prefillTotal() > two.prefillTotal());
+    try testing.expect(persistent.decodeTotal() > two.decodeTotal());
+}
