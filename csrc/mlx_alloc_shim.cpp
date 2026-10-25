@@ -7,6 +7,7 @@
 
 #include "mlx/allocator.h"
 #include "mlx/array.h"
+#include "mlx/backend/metal/device.h"
 #include "mlx/c/private/array.h"
 #include "mlx/c/private/enums.h"
 #include "mlx_alloc_shim.h"
@@ -18,6 +19,16 @@ thread_local std::string g_error;
 }  // namespace
 
 extern "C" {
+
+int dsv41_nax_available(void) {
+  // The pinned MLX 0.32.3 device gate; is_nax_available itself is not exported.
+  if (__builtin_available(macOS 26.2, *)) {
+    auto& d = mx::metal::device(mx::Device::gpu);
+    const auto& arch = d.get_architecture();
+    return !arch.empty() && d.get_architecture_gen() >= (arch.back() == 'p' ? 18 : 17);
+  }
+  return 0;
+}
 
 const char* dsv41_alloc_last_error(void) {
   return g_error.c_str();

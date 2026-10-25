@@ -87,6 +87,8 @@ pub const Bill = struct {
     draft_wave: u64,
     /// The admission's host reserve (pools, tables, the token map, the process).
     host_reserve: u64,
+    checkpoint_staging: u64 = 0,
+    checkpoint_index_host: u64 = 0,
     /// The wide read schedule's depth window (the admission's `wide_window_bytes`: process lifetime).
     wide_window: u64 = 0,
     /// The process overhead no term above names (`unbilled_process_overhead_bytes`), in the prompt phase.
@@ -124,7 +126,7 @@ pub const Bill = struct {
 
     /// The prompt phase's process terms (the prompt pass's peak: every term live at once).
     pub fn prefillTerms(b: Bill) PhaseTerms {
-        var t = withWireTables(.{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv + b.lane_copy, .mlx_cache = b.prefill_cache, .mlx_cache_overshoot = b.cache_overshoot_prompt, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .engram_posted = b.engram_posted, .prompt_state = b.turn_boundary });
+        var t = withWireTables(.{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv + b.lane_copy, .mlx_cache = b.prefill_cache, .mlx_cache_overshoot = b.cache_overshoot_prompt, .host_reserve = b.host_reserve, .checkpoint_staging = b.checkpoint_staging, .checkpoint_index_host = b.checkpoint_index_host, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .engram_posted = b.engram_posted, .prompt_state = b.turn_boundary });
         t.prompt_buffer_allowance = prompt_buffer_allowance_bytes;
         return t;
     }
@@ -132,7 +134,7 @@ pub const Bill = struct {
     /// The decode phase's process terms (the embedding off at the fence; the larger of the verify and draft waves:
     /// a round drafts, then verifies, so the two never hold their transients at once).
     pub fn decodeTerms(b: Bill) PhaseTerms {
-        var t = withWireTables(.{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = @max(b.decode_wave, b.draft_wave), .kv = b.kv_decode, .mlx_cache = b.decode_cache, .mlx_cache_overshoot = b.cache_overshoot_decode, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .prompt_state = b.prompt_state + b.turn_boundary });
+        var t = withWireTables(.{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = @max(b.decode_wave, b.draft_wave), .kv = b.kv_decode, .mlx_cache = b.decode_cache, .mlx_cache_overshoot = b.cache_overshoot_decode, .host_reserve = b.host_reserve, .checkpoint_staging = b.checkpoint_staging, .checkpoint_index_host = b.checkpoint_index_host, .wide_window = b.wide_window, .prompt_state = b.prompt_state + b.turn_boundary });
         t.decode_buffer_allowance = decode_buffer_allowance_bytes;
         return t;
     }
@@ -146,6 +148,8 @@ pub const Bill = struct {
         t.kv = 0;
         t.mlx_cache = 0;
         t.engram_posted = 0;
+        t.checkpoint_staging = 0;
+        t.checkpoint_index_host = 0;
         // Outside the footprint the construction check compares.
         t.wire_tables = 0;
         t.decode_buffer_allowance = 0;
@@ -169,6 +173,8 @@ pub const PhaseTerms = struct {
     kv: u64 = 0,
     mlx_cache: u64 = 0,
     host_reserve: u64 = 0,
+    checkpoint_staging: u64 = 0,
+    checkpoint_index_host: u64 = 0,
     wide_window: u64 = 0,
     unbilled_overhead: u64 = 0,
     /// The retained prompt state (decode phase).
@@ -201,7 +207,7 @@ fn withWireTables(t: PhaseTerms) PhaseTerms {
 
 /// A phase's wired bytes: its terms less the host ones and the wiring terms themselves.
 pub fn wiredOf(t: PhaseTerms) u64 {
-    return t.sum() - t.wire_tables - t.decode_buffer_allowance - t.prompt_buffer_allowance - t.host_reserve - t.lookahead_staging - t.wide_window - t.unbilled_overhead - t.engram_posted;
+    return t.sum() - t.wire_tables - t.decode_buffer_allowance - t.prompt_buffer_allowance - t.host_reserve - t.checkpoint_index_host - t.lookahead_staging - t.wide_window - t.unbilled_overhead - t.engram_posted;
 }
 
 /// The page granule and the page tables of a phase's wired bytes (`phase_memory.wireTables`, shared with GLM-5.3's bill).
@@ -510,7 +516,7 @@ pub fn prefillBillAt(config: *const settings.Config, ov: module.RouteOverrides, 
 /// the shared chain's f32 intermediates, a tap's held stream).
 pub fn derivedGroupRoute(config: *const settings.Config, ov: module.RouteOverrides) bool {
     const routes = module.numericTier(config.numeric_tier orelse .served).routes;
-    const hcpost = config.kv16_hcpost orelse ov.prefill_hcpost orelse routes.prefill_hcpost;
+    const hcpost = module.prefillHcpostRoute(config, ov);
     const shared_mid = config.prefill_shared_mid orelse ov.prefill_shared_mid orelse routes.prefill_shared_mid;
     return model_taps_fenced and joinlessRoute(ov) and config.dsv41ExpertBf16() and hcpost and shared_mid;
 }
@@ -714,6 +720,8 @@ pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
         .{ .name = "MLX allocator cache", .bytes = .{ p.mlx_cache, d.mlx_cache }, .at_construction = false },
         .{ .name = "MLX cache overshoot", .bytes = .{ p.mlx_cache_overshoot, d.mlx_cache_overshoot }, .at_construction = true },
         .{ .name = "host side", .bytes = .{ p.host_reserve, d.host_reserve }, .at_construction = true, .measured = true, .construction = c.host_reserve },
+        .{ .name = "checkpoint index (host)", .bytes = .{ p.checkpoint_index_host, d.checkpoint_index_host }, .at_construction = false },
+        .{ .name = "checkpoint staging", .bytes = .{ p.checkpoint_staging, d.checkpoint_staging }, .at_construction = false },
         .{ .name = "wide read windows", .bytes = .{ p.wide_window, d.wide_window }, .at_construction = true },
         // Created at the prompt's end, never held from construction (0 in the prompt phase today).
         .{ .name = "retained prompt state", .bytes = .{ p.prompt_state, d.prompt_state }, .at_construction = false },
@@ -777,7 +785,11 @@ pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: settings.C
     // The server's load preflight: the served routes, no harness override. The standard request's bill at the floor
     // rows (the host's contract: the term-wise `bill` of that request bounds the process as this does); the construction's
     // admission then bills every prompt up to the context (`servedBill`) and refuses by name before any allocation.
-    const b = try billAtFloor(a, io, c, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
+    const b = if (c.checkpoint_cache) blk: {
+        c.expert_rows = min_fill_rows;
+        c.expert_prefill_rows = min_fill_rows;
+        break :blk try servedBillAt(a, io, &c, fill_max_tokens, null, ceiling_bytes, .{});
+    } else try billAtFloor(a, io, c, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
     return b.processBound();
 }
 
@@ -918,6 +930,11 @@ pub fn servedBillAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Co
         const lm = config.dsv41LayerMajor();
         const joinless = joinlessRoute(ov);
         b.turn_boundary = turnBoundaryCovering(pb, &c, ctx);
+        if (config.checkpoint_cache) {
+            b.turn_boundary *= 2;
+            b.checkpoint_staging = @import("checkpoint_adapter.zig").staging_bytes;
+            b.checkpoint_index_host = 192 << 20;
+        }
         b.prefill_wave = @max(b.prefill_wave, reusedTurnWave(pb, lm, joinless, ctx));
         b.prefill_wave_tight = @max(b.prefill_wave_tight, reusedTurnWave(pb.withGroupStreams(tight), lm, joinless, ctx));
     }
@@ -2459,4 +2476,19 @@ test "dsv41 bill: the served indexer chain is its block's peak, both copies; the
         // (2 B a row and position, 8.4 GB at its deepest call); the bill keeps the unattributed 3 B. The lever cell (pass3f1)
         // measures it on this tree.
     }) |m| try testing.expect(m.billed >= m.peak);
+}
+
+test "dsv41 checkpoint bill: staging is wired and bounded host index is not, both phases reserve them" {
+    const original = cell4Bill();
+    var b = original;
+    b.checkpoint_staging = @import("checkpoint_adapter.zig").staging_bytes;
+    b.checkpoint_index_host = 192 << 20;
+    inline for (.{ "prefillTerms", "decodeTerms" }) |method| {
+        const before = @field(Bill, method)(original);
+        const after = @field(Bill, method)(b);
+        try testing.expectEqual(b.checkpoint_staging, wiredOf(after) - wiredOf(before));
+        try testing.expectEqual(b.checkpoint_staging + b.checkpoint_index_host + after.wire_tables - before.wire_tables, after.sum() - before.sum());
+    }
+    try testing.expectEqual(original.constructionTerms(), b.constructionTerms());
+    try expectSdkView(b, @max(b.prefillTotal(), b.decodeTotal()));
 }

@@ -14,6 +14,8 @@ const expert_stream = @import("../../expert/stream.zig");
 pub const NumericTier = enum { stock, served };
 
 pub const Config = struct {
+    /// Host enables persistence before load admission.
+    checkpoint_cache: bool = false,
     /// The model directory (config.json, the resident shards, the expert bank) and the exported Engram token map
     /// beside it; owned by the host's config.
     expert_bank_dir: ?[]const u8 = null,

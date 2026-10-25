@@ -90,7 +90,11 @@ pub fn bill(gpa: std.mem.Allocator, io: std.Io, req: *const sdk.BillRequest) !sd
     c.memory_baseline_bytes = 0;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const b = try bill_mod.billAtFloor(arena.allocator(), io, c, req.prompt_tokens, req.max_tokens, null, req.ceiling, ov.*);
+    const b = if (c.checkpoint_cache) blk: {
+        c.expert_rows = bill_mod.min_fill_rows;
+        c.expert_prefill_rows = bill_mod.min_fill_rows;
+        break :blk try bill_mod.servedBillAt(arena.allocator(), io, &c, req.max_tokens, null, req.ceiling, ov.*);
+    } else try bill_mod.billAtFloor(arena.allocator(), io, c, req.prompt_tokens, req.max_tokens, null, req.ceiling, ov.*);
     return bill_mod.memoryBill(gpa, b);
 }
 
@@ -120,6 +124,24 @@ pub fn deinit(m: *Module) void {
 }
 
 /// The served prompt reserves no positions beyond the module's own bound (the prompt and the generation headroom).
+pub fn saveRequest(m: *Module, directory: []const u8, model_identity: [32]u8, ids: []const u32) !void {
+    defer m.clearCheckpoint();
+    try m.completeRequest(ids);
+    const adapter = @import("checkpoint_adapter.zig");
+    const identity = try adapter.identityOf(m.gpa, m, model_identity);
+    var dir = try std.Io.Dir.openDirAbsolute(m.io, directory, .{});
+    defer dir.close(m.io);
+    try adapter.save(m, dir, identity);
+}
+
+pub fn loadRequest(m: *Module, directory: []const u8, prefix: []const u32, model_identity: [32]u8) !u64 {
+    const adapter = @import("checkpoint_adapter.zig");
+    const identity = try adapter.identityOf(m.gpa, m, model_identity);
+    var dir = try std.Io.Dir.openDirAbsolute(m.io, directory, .{});
+    defer dir.close(m.io);
+    return adapter.load(m, dir, prefix, identity);
+}
+
 pub fn reservedTokens(_: sdk.RequestShape) u64 {
     return 0;
 }

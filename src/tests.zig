@@ -79,6 +79,8 @@ comptime {
     _ = @import("arch/deepseek_v41/dspark_serve.zig");
     _ = @import("arch/deepseek_v41/module.zig");
     _ = @import("arch/deepseek_v41/settings.zig");
+    _ = @import("arch/deepseek_v41/snapshot.zig");
+    _ = @import("arch/deepseek_v41/checkpoint_adapter.zig");
     _ = @import("arch/deepseek_v41/plugin.zig");
     _ = @import("root.zig");
     _ = @import("exl3/source.zig");

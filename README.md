@@ -38,6 +38,12 @@ No weights are included in this repository.
 
 ## How mlx-serve consumes it
 
+The DeepSeek host can opt into SSD checkpoints by setting `Config.checkpoint_cache` before load admission.
+On its serial inference thread, `saveRequest` exports a successful committed response and its original prompt
+fallback; `loadRequest` restores a compatible prefix. The host owns directory publication and the disk budget.
+Checkpoint staging, metadata and the temporary second boundary are included in cache-enabled admission.
+
+
 - A pinned git submodule at `lib/mlx-stream`; `-Dmlx-stream-dir=/abs/path` builds the host against a checkout instead.
 - Two modules: `sdk` (rooted at `sdk/root.zig`: the arch contract's types, the weight loader, the reads past the page
   cache) and `mlx_stream` (rooted at `src/root.zig`, importing `sdk`). Both reach the host through one import,
