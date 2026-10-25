@@ -3,6 +3,17 @@
 //! test block: the root adds no test of its own.
 
 comptime {
+    _ = @import("arch/minimax_m3/root.zig");
+    _ = @import("arch/minimax_m3/config.zig");
+    _ = @import("arch/minimax_m3/reference.zig");
+    _ = @import("arch/minimax_m3/sparse_decode.zig");
+    _ = @import("arch/minimax_m3/cache.zig");
+    _ = @import("arch/minimax_m3/bank.zig");
+    _ = @import("arch/minimax_m3/attention.zig");
+    _ = @import("arch/minimax_m3/experts.zig");
+    _ = @import("arch/minimax_m3/module.zig");
+    _ = @import("arch/minimax_m3/q8_cache.zig");
+
     _ = @import("arch/mimo_v2/root.zig");
     _ = @import("arch/mimo_v2/config.zig");
     _ = @import("arch/mimo_v2/settings.zig");
@@ -79,6 +90,8 @@ comptime {
     _ = @import("arch/deepseek_v41/dspark_serve.zig");
     _ = @import("arch/deepseek_v41/module.zig");
     _ = @import("arch/deepseek_v41/settings.zig");
+    _ = @import("arch/deepseek_v41/snapshot.zig");
+    _ = @import("arch/deepseek_v41/checkpoint_adapter.zig");
     _ = @import("arch/deepseek_v41/plugin.zig");
     _ = @import("root.zig");
     _ = @import("exl3/source.zig");

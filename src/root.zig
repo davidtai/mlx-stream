@@ -49,11 +49,17 @@ pub const glm5_next = struct {
     pub const generation_headroom: u64 = 0;
 };
 
+pub const minimax_m3 = struct {
+    pub const arch = @import("arch/minimax_m3/root.zig");
+    pub const default_context: u64 = 4096;
+    pub const generation_headroom: u64 = 0;
+};
+
 /// What the host's glue (mlx-serve `src/arch/mlx_stream.zig`) calls: the arch's entry points and their contract types.
 pub const arch = @import("arch/deepseek_v41/plugin.zig");
 /// Every arch the package serves through the SDK's table (`sdk.Arch.of`), in claim order: DeepSeek-V4.1 and GLM-5.3
 /// (the conformance suite's list; the host's glue binds each arch by its own entry: the root's, `mimo` and `glm`).
-pub const archs = .{ @import("arch/deepseek_v41/plugin.zig"), @import("arch/glm_moe_dsa/plugin.zig") };
+pub const archs = .{ @import("arch/deepseek_v41/plugin.zig"), @import("arch/glm_moe_dsa/plugin.zig"), minimax_m3.arch };
 pub const sdk = @import("sdk");
 /// The context a construction bills when the model sets none (`ctx_size`): the standard request.
 pub const default_context: u64 = @import("arch/deepseek_v41/bill.zig").fill_prompt_tokens;

@@ -15,6 +15,13 @@ pub const selfcheck = @import("selfcheck.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
+extern fn dsv41_nax_available() callconv(.c) c_int;
+
+/// Query only while constructing a GPU-backed model or kernel set.
+pub fn naxAvailable() bool {
+    return dsv41_nax_available() != 0;
+}
+
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
 pub const manifest_sha256 = "c6d53222f6bf3438b7af6a1fd08d0ed14d39cb19b41e0b7e93e95338e88b674f";
 

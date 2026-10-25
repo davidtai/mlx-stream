@@ -6,6 +6,18 @@ incorporates or is derived from third-party material that remains under its own
 license, listed below. Those licenses continue to apply to those portions.
 The source comments at each site name their upstream too.
 
+The selected-block MiniMax attention kernels
+src/arch/minimax_m3/kernels/minimax_q8_partials.metal,
+src/arch/minimax_m3/kernels/minimax_sparse_partials.metal and
+src/arch/minimax_m3/kernels/minimax_sparse_combine.metal adapt oMLX's
+omlx/patches/mlx_vlm_minimax_m3_compat/vendor/mlx_vlm/models/minimax_m3_vl/msa.py
+(https://github.com/jundot/omlx, Copyright 2025 oMLX contributors), under the
+Apache License, Version 2.0. They retain its attention reduction arithmetic
+with a single-request, single-query launch wrapper; the Q8 partial kernel
+adds signed-code and F32 group-scale loads in registers. The complete upstream license is
+src/arch/minimax_m3/licenses/OMLX-APACHE-2.0.txt. These portions remain under
+Apache-2.0; the repository's overall MIT license does not replace that license.
+
 mlx-stream is a plugin for mlx-serve (https://github.com/ddalcu/mlx-serve,
 Copyright (c) 2026 David Dalcu, MIT). It was split out of a fork of mlx-serve;
 the files it shares with the host's SDK seams (sdk/check.zig, the

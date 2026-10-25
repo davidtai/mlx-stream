@@ -30,6 +30,11 @@ fn residentName(name: []const u8) bool {
 /// Validates the actual files selected by the host loader, not just the index's tensor list.
 /// No tensor payload is read. All header metadata is bounded and rejected before MLX sees it.
 pub fn residentBytes(a: std.mem.Allocator, io: std.Io, model_dir: []const u8) !u64 {
+    return residentBytesBound(a, io, model_dir, resident_limit);
+}
+
+/// Shared resident-header check with an architecture-specific payload ceiling.
+pub fn residentBytesBound(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, payload_limit: u64) !u64 {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
     defer dir.close(io);
     const raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(header_limit)) catch return error.MimoResidentIndexInvalid;
@@ -59,8 +64,9 @@ pub fn residentBytes(a: std.mem.Allocator, io: std.Io, model_dir: []const u8) !u
         const fd = try io_util.openNoCache(path.ptr, .{});
         defer _ = std.c.close(fd);
         const size_i = std.c.lseek(fd, 0, std.c.SEEK.END);
-        if (size_i < 8 or size_i > resident_limit + header_limit + 8) return error.MimoResidentShardInvalid;
+        if (size_i < 8) return error.MimoResidentShardInvalid;
         const size: u64 = @intCast(size_i);
+        if (size > payload_limit +| (header_limit + 8)) return error.MimoResidentShardInvalid;
         var prefix: [8]u8 = undefined;
         try readAt(fd, &prefix, 0);
         const len = std.mem.readInt(u64, &prefix, .little);
@@ -101,7 +107,7 @@ pub fn residentBytes(a: std.mem.Allocator, io: std.Io, model_dir: []const u8) !u
         }
         if (payload != size - 8 - len) return error.MimoResidentShardInvalid;
         total = std.math.add(u64, total, payload) catch return error.MimoResidentShardInvalid;
-        if (total > resident_limit) return error.MimoResidentShardInvalid;
+        if (total > payload_limit) return error.MimoResidentShardInvalid;
     }
     if (found != wm.object.count()) return error.MimoResidentIndexInvalid;
     return total;
@@ -184,4 +190,22 @@ fn writeShard(io: std.Io, dir: std.Io.Dir, header: []const u8) !void {
     std.mem.writeInt(u64, bytes[0..8], header.len, .little);
     @memcpy(bytes[8..][0..header.len], header);
     try dir.writeFile(io, .{ .sub_path = "resident.safetensors", .data = bytes[0 .. 8 + header.len + 4] });
+}
+
+test "shared resident header admission preserves default and applies caller payload ceiling" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{"model.norm.weight":"resident.safetensors"}}
+    });
+    try writeShard(io, tmp.dir,
+        \\{"model.norm.weight":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}
+    );
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    try std.testing.expectEqual(@as(u64, 4), try residentBytes(a, io, path));
+    try std.testing.expectEqual(@as(u64, 4), try residentBytesBound(a, io, path, 4));
+    try std.testing.expectError(error.MimoResidentShardInvalid, residentBytesBound(a, io, path, 3));
 }

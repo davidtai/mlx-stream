@@ -36,7 +36,19 @@ The supported models:
 
 No weights are included in this repository.
 
+An experimental MiniMax M3.1 Flash text implementation streams prepared NVFP4 or
+affine-Q3 expert banks with bounded residency and optional Q8 KV/index caches.
+See [preparation and limitations](docs/minimax-m3.md). Source activation-quantization
+parity, representative quality and long-context validation remain pending.
+
+
 ## How mlx-serve consumes it
+
+The DeepSeek host can opt into SSD checkpoints by setting `Config.checkpoint_cache` before load admission.
+On its serial inference thread, `saveRequest` exports a successful committed response and its original prompt
+fallback; `loadRequest` restores a compatible prefix. The host owns directory publication and the disk budget.
+Checkpoint staging, metadata and the temporary second boundary are included in cache-enabled admission.
+
 
 - A pinned git submodule at `lib/mlx-stream`; `-Dmlx-stream-dir=/abs/path` builds the host against a checkout instead.
 - Two modules: `sdk` (rooted at `sdk/root.zig`: the arch contract's types, the weight loader, the reads past the page

@@ -1835,6 +1835,27 @@ pub const TraceOps = struct {
         return g.push(.qmm, g.dtypeOf(x), out);
     }
 
+    pub fn quantizedMatmul(g: *TraceOps, x: T, w: T, sc: T, biases: ?T, transpose_w: bool, bits: u32, group: u32, mode: sdk.QuantMode) !T {
+        const sw = g.shapeOf(w);
+        var out = g.shapeOf(x);
+        if (sw.n != 2 or bits == 0 or group == 0) return error.QmmShape;
+        const unpacked = @divExact(sw.dim(-1) * 32, @as(c_int, @intCast(bits)));
+        const inputs = if (transpose_w) unpacked else sw.dim(-2);
+        if (out.dim(-1) != inputs or g.shapeOf(sc).dim(-1) * @as(c_int, @intCast(group)) != unpacked or g.shapeOf(sc).dim(-2) != sw.dim(-2)) return error.QmmShape;
+        if (biases) |bias| if (!g.shapeOf(bias).eql(g.shapeOf(sc))) return error.QmmShape;
+        out.d[out.n - 1] = if (transpose_w) sw.dim(-2) else unpacked;
+        return g.push(.qmm, if (mode == .affine) promote(g.dtypeOf(x), g.dtypeOf(sc)) else g.dtypeOf(x), out);
+    }
+
+    pub fn dequantizeWith(g: *TraceOps, w: T, sc: T, biases: ?T, bits: u32, group: u32, mode: sdk.QuantMode) !T {
+        var out = g.shapeOf(w);
+        if (bits == 0 or group == 0) return error.QmmShape;
+        out.d[out.n - 1] = @divExact(out.dim(-1) * 32, @as(c_int, @intCast(bits)));
+        if (g.shapeOf(sc).dim(-1) * @as(c_int, @intCast(group)) != out.dim(-1)) return error.QmmShape;
+        if (biases) |bias| if (!g.shapeOf(bias).eql(g.shapeOf(sc))) return error.QmmShape;
+        return g.push(.dequantize, if (mode == .affine) g.dtypeOf(sc) else .bfloat16, out);
+    }
+
     pub fn dequantize(g: *TraceOps, w: T, _: T, mode: sdk.QuantMode) !T {
         var out = g.shapeOf(w);
         out.d[out.n - 1] = @divExact(out.d[out.n - 1] * 32, @as(c_int, @intCast(quantBits(mode))));
