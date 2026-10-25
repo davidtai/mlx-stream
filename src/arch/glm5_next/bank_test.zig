@@ -323,10 +323,13 @@ test "glm5_next nvfp4 bank (window): the stream's MLX slot arrays dequantize in 
     try readRecords(&b, &refs, &slots);
     const arrays = bank.bankArraysOf(slots.arrays);
     try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(arrays.gate.global_scale));
-    // Line-isolated: [32, 32] f32 (3 slots floored at one page), each slot's word at column 0 of its row.
+    // Line-isolated: [rows, 32] f32, each slot's word at column 0 of its row. The 3 slots are floored at the larger of
+    // the scale arrays' page and the stream's slot-array floor (`S.slot_array_min_bytes`, one VM page since 1f3a3c0:
+    // 16 KiB, 128 rows, on Apple silicon).
     try testing.expectEqual(@as(usize, 2), mlx.mlx_array_ndim(arrays.gate.global_scale));
     try testing.expectEqual(@as(c_int, bank.scale_line_floats), mlx.mlx_array_shape(arrays.gate.global_scale)[1]);
-    try testing.expectEqual(@as(c_int, bank.scale_array_min_bytes / bank.scale_line_bytes), mlx.mlx_array_shape(arrays.gate.global_scale)[0]);
+    const floor_bytes = @max(bank.scale_array_min_bytes, S.slot_array_min_bytes);
+    try testing.expectEqual(@as(c_int, @intCast(floor_bytes / bank.scale_line_bytes)), mlx.mlx_array_shape(arrays.gate.global_scale)[0]);
     for ([_]mlx.mlx_stream{ cpu, gpu }) |s| for (refs, 0..) |r, i| {
         const rec = synth.record(synth.geom.first_moe_layer + r[0], r[1]);
         for (projections, [_]bank.Arrays(mlx.mlx_array){ arrays.gate, arrays.up, arrays.down }) |p, pa| {
