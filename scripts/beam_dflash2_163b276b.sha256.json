@@ -1,0 +1,19 @@
+{
+  "files": {
+    "README.md": {
+      "sha256": "30a8b17949dbe90e2939cf4a0bbb55610b1aa609e71727d123c30a2cdceef241",
+      "size": 20325
+    },
+    "config.json": {
+      "sha256": "baf609fba9dd9c8c42b5dd49deff50ee52d515ff8a25758ba166607b1385648b",
+      "size": 1296
+    },
+    "model.safetensors": {
+      "sha256": "34b99ca539b1d595d0db0edf072158173d89411eca0e6b1dd2c2601437352bf4",
+      "size": 3854978296
+    }
+  },
+  "repository": "reflection/Beam-1.0-501B-A23B-DFlash2",
+  "revision": "163b276be744c8ce2b8385ea85de54edb3088211",
+  "source": "sha256 and size of each release file the drafter sidecar is built from: the Hub LFS oid at the revision for model.safetensors, and for the small files the sha256 of the bytes whose git blob id equals the Hub tree's oid"
+}

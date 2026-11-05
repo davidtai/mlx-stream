@@ -2,7 +2,7 @@
 
 mlx-stream's fourth arch serves Z.ai's GLM-5.3-Flash from its NVFP4 pack: the 12,096 routed experts (42 routed layers x
 288) stream from the SSD as NVFP4 records through MiMo's expert route; the trunk (17.84 GB of BF16) is resident.
-Preparing a pack is in `docs/glm5-next-pack.md` (the converter's page).
+How to make an NVFP4 pack is in [nvfp4-pack.md](nvfp4-pack.md).
 
 Terms as in [mimo.md](mimo.md): **pack**, **residents**, **rows** (prompt rows, decode rows), **bill**, **fill**,
 **prompt pass**, **route** (a choice made once at construction), **control**.
